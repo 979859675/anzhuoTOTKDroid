@@ -52,8 +52,32 @@ jobs:
         run: bash android/deps/build_deps.sh
 
       - name: Build the APK
+        id: gradle
         working-directory: android/totkrecompandroid
-        run: ./gradlew assembleDebug -PtotkLsfg=false --no-daemon
+        run: |
+          LOG="$RUNNER_TEMP/gradle.log"
+          set +e
+          ./gradlew assembleDebug -PtotkLsfg=false --no-daemon > "$LOG" 2>&1
+          status=$?
+          set -e
+          tail -n 60 "$LOG"
+          if [ "$status" -ne 0 ]; then
+            # the failing lines as annotations (readable through the API when the logs are not)
+            grep -E "^e: |error|FAILED|What went wrong|Execution failed|Could not|Caused by" "$LOG" | head -n 25 \
+              | while IFS= read -r l; do echo "::error title=build::$(echo "$l" | cut -c1-900)"; done
+            exit "$status"
+          fi
+
+      - name: Keep the Gradle log
+        if: always()
+        run: cp "$RUNNER_TEMP/gradle.log" "$RUNNER_TEMP/gradle-log.txt" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gradle-log
+          path: ${{ runner.temp }}/gradle-log.txt
+          if-no-files-found: ignore
 
       - name: Find the APK
         id: apk
