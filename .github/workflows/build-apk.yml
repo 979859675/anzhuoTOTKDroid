@@ -1,0 +1,66 @@
+# Builds the debug APK (arm64-v8a) on GitHub's runner and uploads it as the "totkdroid-debug-apk" artifact.
+# The APK is built without the GPL LSFG folder (-PtotkLsfg=false, MIT as a whole; see NOTICE.md). The game's files
+# are not in the APK: they are pushed to the phone separately (README: push_game.sh).
+name: Build debug APK
+
+on:
+  push:
+    branches: ["arena/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install the NDK and CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;30.0.16248370" "cmake;3.30.4"
+
+      # The native dependencies (SDL3, shaderc, the headers, the font): android/deps/build_deps.sh. Cached by its
+      # script and patch, so a rebuild with unchanged deps skips the long shaderc build.
+      - name: Cache the native dependencies
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: android/deps/out
+          key: deps-${{ hashFiles('android/deps/build_deps.sh', 'android/deps/sdl-aaudio-resume.patch') }}
+
+      - name: Build the native dependencies
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+        run: bash android/deps/build_deps.sh
+
+      - name: Build the APK
+        working-directory: android/totkrecompandroid
+        run: ./gradlew assembleDebug -PtotkLsfg=false --no-daemon
+
+      - name: Find the APK
+        id: apk
+        run: echo "path=$(ls android/totkrecompandroid/app/build/outputs/apk/debug/*.apk | head -n 1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: totkdroid-debug-apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
