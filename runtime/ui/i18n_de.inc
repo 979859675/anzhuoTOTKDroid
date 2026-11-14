@@ -662,3 +662,7 @@
  "Sobald das Spiel eingerichtet ist, startet der Startbildschirm nach einem kurzen Countdown von selbst. Tippe währenddessen auf den Bildschirm oder drücke eine Taste, um auf dem Startbildschirm zu bleiben."},
 {"Starting the game in %d s - touch the screen to stay here",
  "Spiel startet in %d s - tippe auf den Bildschirm, um hier zu bleiben"},
+{"Vibration",
+ "Vibration"},
+{"The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off.",
+ "Die Vibration des Spiels: in den Motoren des Controllers oder ohne Controller im Vibrationsmotor des Handys. 0 %: aus."},

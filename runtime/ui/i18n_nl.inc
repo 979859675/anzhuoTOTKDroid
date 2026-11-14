@@ -662,3 +662,7 @@
  "Zodra het spel is ingesteld, start het beginscherm na een korte aftelling vanzelf. Tik op het scherm of druk op een knop tijdens het aftellen om op het beginscherm te blijven."},
 {"Starting the game in %d s - touch the screen to stay here",
  "Spel start over %d s - tik op het scherm om hier te blijven"},
+{"Vibration",
+ "Trilling"},
+{"The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off.",
+ "De trillingen van het spel: in de motoren van de controller, of zonder controller in de trilmotor van de telefoon. 0%: uit."},

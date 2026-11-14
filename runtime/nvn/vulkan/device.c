@@ -558,6 +558,17 @@ static void create_device(void) {
     // (a dma-buf, the other file type: where the opaque one takes no memory the CPU can use - Xclipse 530, #234)
     g_vk.mem_dmabuf = g_vk.mem_fd && has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
     if (g_vk.mem_dmabuf) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+    // (an Android hardware buffer: the heap allocated by gralloc and imported, for the drivers that export none of their
+    // own memory - the Mali-G720's stock driver, "not exportable" as fd or dma-buf; exec.c heap_ahb_place)
+    // Only when asked for (LARECOMP_VK_MEMFD_AHB, LARECOMP_MEMFD_PROBE), as the heap through it is (exec.c
+    // heap_ahb_place): a device the game doesn't need it on stays as before
+    g_vk.mem_ahb = (getenv("LARECOMP_VK_MEMFD_AHB") || getenv("LARECOMP_MEMFD_PROBE")) && g_vk.api >= VK_API_VERSION_1_1 &&
+                   has_ext(ep, ne, VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME) &&
+                   has_ext(ep, ne, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+    if (g_vk.mem_ahb) {
+        ext[n_ext++] = VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME;
+        ext[n_ext++] = VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME;
+    }
     // (which ways this driver could export memory at all: a report from a Mali or an Xclipse says what to try next -
     // the option did nothing on a Mali-G720 r49p1 with no word in the log, #249)
     LOG("[vk-cap] memory export: fd %s, dma-buf %s, Android hardware buffer %s, placed maps %s, host import %s\n",
@@ -1946,6 +1957,7 @@ void ui_window_init(void) {
     }
 #endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());
+    if (!SDL_InitSubSystem(SDL_INIT_HAPTIC)) LOG("[rumble] no haptics: %s\n", SDL_GetError());  // (the phone's vibrator: hle/input.c)
     int win_w = 1280, win_h = 720;
     if (getenv("LARECOMP_WINDOW")) sscanf(getenv("LARECOMP_WINDOW"), "%dx%d", &win_w, &win_h);
     SDL_WindowFlags wflags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
@@ -2136,6 +2148,8 @@ int ui_run(void) {
         }
         extern void motion_open(void);  // (runtime/hle/motion.c: the phone's sensors, once the setting is on)
         motion_open();
+        extern void input_rumble_tick(void);  // (runtime/hle/input.c: the game's vibration on the motors)
+        input_rumble_tick();
         menu_apply_window_requests(window);
 #ifdef __ANDROID__
         {   // the pipeline cache to disk now and then while it grows: an app is killed rather than exited, so

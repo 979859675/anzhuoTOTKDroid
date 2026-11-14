@@ -29,6 +29,7 @@ Settings g_settings = {
     .movie_audio = true,
     .autoplay = true,
     .motion = true,
+    .rumble = 100,
     .lsfg_mult = 2,
     .lsfg_flow = 75,
 #ifdef __ANDROID__
@@ -205,6 +206,7 @@ void settings_reset_defaults(void) {
     g_settings.lsfg_mult = d->lsfg_mult;
     g_settings.lsfg_flow = d->lsfg_flow;
     g_settings.motion = d->motion;
+    g_settings.rumble = d->rumble;
     g_settings.motion_source = d->motion_source;
     g_settings.motion_flat = d->motion_flat;
 #ifdef __ANDROID__
@@ -253,6 +255,7 @@ void settings_load(void) {
         else if (!strcmp(key, "lsfg_mult")) g_settings.lsfg_mult = atoi(val) < 2 ? 2 : atoi(val) > 4 ? 4 : atoi(val);
         else if (!strcmp(key, "lsfg_flow")) g_settings.lsfg_flow = atoi(val) <= 0 ? 0 : atoi(val) < 25 ? 25 : atoi(val) > 100 ? 100 : atoi(val);
         else if (!strcmp(key, "motion")) g_settings.motion = atoi(val) != 0;
+        else if (!strcmp(key, "rumble")) g_settings.rumble = atoi(val) >= 0 && atoi(val) <= 300 ? atoi(val) : 100;
         else if (!strcmp(key, "motion_source")) g_settings.motion_source = atoi(val) >= 0 && atoi(val) <= 2 ? atoi(val) : 0;
         else if (!strcmp(key, "motion_flat")) g_settings.motion_flat = atoi(val) != 0;
 #ifdef __ANDROID__
@@ -365,6 +368,7 @@ void settings_save(void) {
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
     fprintf(f, "lsfg = %d\nlsfg_mult = %d\nlsfg_flow = %d\n", g_settings.lsfg, g_settings.lsfg_mult, g_settings.lsfg_flow);
+    fprintf(f, "rumble = %d\n", g_settings.rumble);
     fprintf(f, "motion = %d\nmotion_source = %d\nmotion_flat = %d\n", g_settings.motion, g_settings.motion_source,
             g_settings.motion_flat);
 #ifdef __ANDROID__

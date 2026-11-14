@@ -203,9 +203,157 @@ done:
     }
 }
 
+// ---- the heap as an Android hardware buffer (exec.c heap_ahb_place). Some drivers export none of their own memory -
+// the Mali-G720's stock one says "not exportable" for an opaque file and for a dma-buf, and won't move its map (#45,
+// the POCO X7 Pro's log of 2026-11-13) - but every Android driver imports a gralloc buffer: a BLOB is a dma-buf
+// underneath. Its file is taken out of the buffer's handle (AHardwareBuffer_sendHandleToUnixSocket: the public NDK has
+// no getter for it) and mapped where the CPU wants it, and the buffer is imported into Vulkan for the GPU.
+#include <android/hardware_buffer.h>
+#include <sys/socket.h>
+
+// A BLOB of size bytes the CPU and the GPU both use, and its file (the handle's first fd, a dma-buf): -1 if not (why)
+int vk_ahb_alloc(uint64_t size, AHardwareBuffer **out, const char **why) {
+    *out = NULL;
+    if (size > 0xFFFFFFFFull) { *why = "too big for a BLOB"; return -1; }
+    AHardwareBuffer_Desc d = {.width = (uint32_t)size, .height = 1, .layers = 1, .format = AHARDWAREBUFFER_FORMAT_BLOB,
+                              .usage = AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |
+                                       AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER};
+    AHardwareBuffer *ahb = NULL;
+    int e = AHardwareBuffer_allocate(&d, &ahb);
+    if (e || !ahb) { errno = -e; *why = "AHardwareBuffer_allocate"; return -1; }
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv)) { AHardwareBuffer_release(ahb); *why = "socketpair"; return -1; }
+    int fd = -1;
+    e = AHardwareBuffer_sendHandleToUnixSocket(ahb, sv[0]);
+    if (!e) {  // (the handle's ints in the data, its fds as SCM_RIGHTS: the first is the buffer's memory)
+        char data[1024], ctl[CMSG_SPACE(16 * sizeof(int))];
+        struct iovec iov = {data, sizeof data};
+        struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl};
+        if (recvmsg(sv[1], &m, MSG_CMSG_CLOEXEC) >= 0) {
+            for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
+                if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
+                int n = (int)((c->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+                int *fds = (int *)CMSG_DATA(c);
+                for (int i = 0; i < n; i++) {
+                    if (fd < 0) fd = fds[i];
+                    else close(fds[i]);
+                }
+            }
+        }
+    } else errno = -e;
+    close(sv[0]);
+    close(sv[1]);
+    if (fd < 0) { AHardwareBuffer_release(ahb); *why = e ? "AHardwareBuffer_sendHandleToUnixSocket" : "no file in its handle"; return -1; }
+    *out = ahb;
+    return fd;
+}
+
+// The buffer imported into Vulkan as a VkBuffer of size bytes over all its memory: false if not (why)
+bool vk_ahb_import(AHardwareBuffer *ahb, uint64_t size, VkBufferUsageFlags usage, bool bda, VkBuffer *pbuf,
+                   VkDeviceMemory *pmem, int *ptype, const char **why) {
+    *pbuf = VK_NULL_HANDLE, *pmem = VK_NULL_HANDLE, *ptype = -1;
+    if (!g_vk.mem_ahb) { *why = "no VK_ANDROID_external_memory_android_hardware_buffer"; return false; }
+    VkAndroidHardwareBufferPropertiesANDROID hp = {.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
+    if (vkGetAndroidHardwareBufferPropertiesANDROID(g_vk.dev, ahb, &hp) != VK_SUCCESS) { *why = "its properties"; return false; }
+    if (hp.allocationSize < size) { *why = "smaller than asked"; return false; }
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                           .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = size, .usage = usage};
+    VkBuffer buf;
+    if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { *why = "the buffer"; return false; }
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(g_vk.dev, buf, &mr);
+    uint32_t bits = hp.memoryTypeBits & mr.memoryTypeBits;
+    int type = -1;
+    for (int i = 0; i < 32 && type < 0; i++) if (bits & (1u << i)) type = i;
+    if (type < 0) { vkDestroyBuffer(g_vk.dev, buf, NULL); *why = "no memory type for the buffer"; return false; }
+    VkMemoryAllocateFlagsInfo af = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkImportAndroidHardwareBufferInfoANDROID imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
+                                                    .pNext = bda ? &af : NULL, .buffer = ahb};
+    VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &imp, .buffer = buf};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &ded, .allocationSize = hp.allocationSize,
+                               .memoryTypeIndex = (uint32_t)type};
+    VkDeviceMemory mem;
+    VkResult r = vkAllocateMemory(g_vk.dev, &ai, NULL, &mem);
+    if (r != VK_SUCCESS) { vkDestroyBuffer(g_vk.dev, buf, NULL); *why = "the import"; errno = -r; return false; }
+    if (vkBindBufferMemory(g_vk.dev, buf, mem, 0) != VK_SUCCESS) {
+        vkDestroyBuffer(g_vk.dev, buf, NULL);
+        vkFreeMemory(g_vk.dev, mem, NULL);
+        *why = "binding it";
+        return false;
+    }
+    *pbuf = buf, *pmem = mem, *ptype = type;
+    return true;
+}
+
+// Whether the GPU sees what the CPU wrote through map p (over buf's memory mem, from its start) and the CPU what the GPU
+// wrote: 8 KB at off scribbled and cleared again (vk_heap_place before the game writes there; the probe)
+bool vk_ahb_coherent(uint8_t *p, VkBuffer buf, VkDeviceMemory mem, uint64_t off, VkBufferUsageFlags usage, const char **why) {
+    VkBufferCreateInfo vbi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 1u << 20, .usage = usage};
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                           .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
+    vbi.pNext = &eb;
+    VkBuffer out = VK_NULL_HANDLE;
+    bool ok = false;
+    for (int i = 0; i < 4096; i++) p[i] = (uint8_t)(i * 7 + 3);
+    if (vkCreateBuffer(g_vk.dev, &vbi, NULL, &out) != VK_SUCCESS || vkBindBufferMemory(g_vk.dev, out, mem, off) != VK_SUCCESS)
+        *why = "a second buffer on its memory";
+    else if (!gpu_round(buf, out)) *why = "the GPU's round (submission)";
+    else {
+        bool gpu_sees = true, cpu_sees = true;
+        for (int i = 0; i < 4096 && gpu_sees; i++) gpu_sees = p[off + i] == (uint8_t)(i * 7 + 3);
+        for (int i = 0; i < 4096 && cpu_sees; i++) cpu_sees = p[off + 4096 + i] == 0x5a;
+        ok = gpu_sees && cpu_sees;
+        if (!ok) *why = !gpu_sees ? "the GPU doesn't see the CPU's bytes" : "the CPU doesn't see the GPU's bytes";
+    }
+    if (out) vkDestroyBuffer(g_vk.dev, out, NULL);
+    memset(p, 0, 4096);
+    memset(p + off, 0, 8192);
+    return ok;
+}
+
+static void probe_ahb(void) {
+    // (64 MB only: asking gralloc for BLOBs of 256 MB to 2 GB one after another restarted the POCO's system_server,
+    // 2026-11-14)
+    AHardwareBuffer *ahb = NULL;
+    const char *why = NULL;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    uint8_t *p = MAP_FAILED;
+    int type = -1;
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    int fd = vk_ahb_alloc(PROBE_SIZE, &ahb, &why);
+    if (fd < 0) goto done;
+    p = mmap(NULL, PROBE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) { why = "mmap of its file"; goto done; }
+    if (!vk_ahb_import(ahb, PROBE_SIZE, usage, false, &buf, &mem, &type, &why)) goto done;
+    uint8_t *tmp = malloc(PROBE_SIZE);
+    if (!tmp) { why = "memory"; goto done; }
+    memset(tmp, 0x11, PROBE_SIZE);
+    double t0 = now_s();
+    for (int i = 0; i < 4; i++) memcpy(p, tmp, PROBE_SIZE);
+    double t1 = now_s();
+    for (int i = 0; i < 4; i++) memcpy(tmp, p, PROBE_SIZE);
+    double t2 = now_s();
+    free(tmp);
+    bool ok = vk_ahb_coherent(p, buf, mem, 8u << 20, usage, &why);
+    LOG("[memfd] Android hardware buffer, type %d: allocated, its file mapped, imported; CPU writes %.1f GB/s, reads %.1f GB/s; "
+        "%s\n", type, 4.0 * PROBE_SIZE / (t1 - t0) / 1e9, 4.0 * PROBE_SIZE / (t2 - t1) / 1e9,
+        ok ? "the GPU sees the CPU's bytes, the CPU sees the GPU's" : why);
+    why = NULL;
+done:
+    if (why) LOG("[memfd] Android hardware buffer: failed at %s (errno %d)\n", why, errno);
+    if (buf) vkDestroyBuffer(g_vk.dev, buf, NULL);
+    if (mem) vkFreeMemory(g_vk.dev, mem, NULL);
+    if (p != MAP_FAILED) munmap(p, PROBE_SIZE);
+    if (fd >= 0) close(fd);
+    if (ahb) AHardwareBuffer_release(ahb);
+}
+
 void vk_memfd_probe(void) {
     extern bool vk_heap_file_asked(void);  // (and whenever the heap goes through the file: its memory types in the log)
     if (!getenv("LARECOMP_MEMFD_PROBE") && !vk_heap_file_asked()) return;
+    if (g_vk.mem_ahb) probe_ahb();
     if (!g_vk.mem_fd) { LOG("[memfd] no VK_KHR_external_memory_fd on this driver\n"); return; }
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);

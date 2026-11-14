@@ -4706,6 +4706,50 @@ static bool gaddr_write(uint64_t a);
 // unmaps it; runtime/main.c then remaps the whole window). LARECOMP_VK_NO_PLACED=1: off (CPU copies).
 bool vk_heap_file_possible(void) { return g_vk.mem_fd; }  // (the start screen's Driver compatibility)
 
+// The heap as an Android hardware buffer (memfd_probe.c: a gralloc BLOB, its dma-buf mapped at the heap's address by
+// mmap and the buffer imported into Vulkan), after the driver's own memory: the Mali-G720's stock driver exports none
+// of it ("not exportable" as an opaque file and as a dma-buf) and won't move its map (EINVAL), so the setting did
+// nothing there (POCO X7 Pro, 2026-11-13). Taken only when the GPU and the CPU see each other's bytes through it.
+// Opt-in for now (LARECOMP_VK_MEMFD_AHB=1: after the other ways; 2: only it): the POCO's gralloc refused the 2,144 MB
+// BLOB, and asking it for such sizes again and again restarted its system_server (2026-11-14) - untried on a Mali yet.
+#include <android/hardware_buffer.h>
+int vk_ahb_alloc(uint64_t size, AHardwareBuffer **out, const char **why);
+bool vk_ahb_import(AHardwareBuffer *ahb, uint64_t size, VkBufferUsageFlags usage, bool bda, VkBuffer *pbuf,
+                   VkDeviceMemory *pmem, int *ptype, const char **why);
+bool vk_ahb_coherent(uint8_t *p, VkBuffer buf, VkDeviceMemory mem, uint64_t off, VkBufferUsageFlags usage, const char **why);
+static int heap_ahb_mode(void) {
+    const char *e = getenv("LARECOMP_VK_MEMFD_AHB");
+    return e ? atoi(e) : 0;
+}
+static bool heap_ahb_place(uint64_t size, VkBufferUsageFlags usage, bool bda, VkBuffer *pbuf, VkDeviceMemory *pmem, int *ptype) {
+    if (!g_vk.mem_ahb || !heap_ahb_mode()) return false;
+    AHardwareBuffer *ahb = NULL;
+    const char *why = NULL;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    int type = -1;
+    int fd = vk_ahb_alloc(size, &ahb, &why);
+    if (fd >= 0) {
+        void *p = mmap((void *)(uintptr_t)HEAP_BASE, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+        close(fd);
+        const VkBufferUsageFlags check = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        if (p != (void *)(uintptr_t)HEAP_BASE) why = "mmap of its file at the heap's address";
+        else if (!vk_ahb_import(ahb, size, usage, bda, &buf, &mem, &type, &why)) {}
+        else if (!vk_ahb_coherent((uint8_t *)(uintptr_t)HEAP_BASE, buf, mem, 8u << 20, check, &why)) {
+            vkDestroyBuffer(g_vk.dev, buf, NULL);
+            vkFreeMemory(g_vk.dev, mem, NULL);
+        } else {
+            AHardwareBuffer_release(ahb);  // (the import and the map hold it)
+            *pbuf = buf, *pmem = mem, *ptype = type;
+            return true;
+        }
+        plat_reset_guest(HEAP_BASE, HEAP_BASE + size);  // (the window's own pages back)
+        AHardwareBuffer_release(ahb);
+    }
+    LOG("[vk] game memory through an Android hardware buffer: failed at %s (errno %d)\n", why ? why : "?", errno);
+    return false;
+}
+
 // The heap through an exported file asked for (the setting, or LARECOMP_VK_MEMFD) and possible here (vk_heap_place)
 bool vk_heap_file_asked(void) {
     const char *e = getenv("LARECOMP_VK_MEMFD");
@@ -4788,6 +4832,14 @@ bool vk_heap_place(uint64_t size) {
     VkBuffer buf;
     VkMemoryRequirements mr;
     int type;
+    // (the driver's own memory refused every way: an Android hardware buffer, heap_ahb_place)
+#define MEMFD_FAILED()                                                                                                  \
+    do {                                                                                                               \
+        if (memfd && heap_ahb_place(size, bi.usage, bda, &buf, &mem, &type)) goto placed_ahb;                         \
+        return NOT_PLACED();                                                                                           \
+    } while (0)
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (memfd && heap_ahb_mode() == 2) MEMFD_FAILED();
     bool dedicated = false;  // (the driver exports this kind of memory only as a buffer's own allocation)
     const VkMemoryPropertyFlags need = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     for (;;) {
@@ -4796,7 +4848,7 @@ bool vk_heap_place(uint64_t size) {
         if (memfd && ht && !heap_export_ok(&bi, ht, &dedicated)) {  // (the driver says it can't export it: the next kind)
             ht = next_heap_kind(ht, can_move);
             if (ht || can_move) continue;
-            return NOT_PLACED();
+            MEMFD_FAILED();
         }
         VkResult cr = vkCreateBuffer(g_vk.dev, &bi, NULL, &buf);
         if (cr != VK_SUCCESS) {
@@ -4814,7 +4866,7 @@ bool vk_heap_place(uint64_t size) {
                 ht = next_heap_kind(ht, can_move);
                 if (ht || can_move) continue;
             }
-            return NOT_PLACED();
+            MEMFD_FAILED();
         }
         vkGetBufferMemoryRequirements(g_vk.dev, buf, &mr);
         type = -1;  // host-visible and coherent (the CPU writes, the GPU reads and writes); cached when there is one
@@ -4837,7 +4889,7 @@ bool vk_heap_place(uint64_t size) {
         const char *e = getenv("LARECOMP_VK_MEMFD_TYPE");
         if (memfd && e && atoi(e) >= 0 && (uint32_t)atoi(e) < mp.memoryTypeCount && (mr.memoryTypeBits & (1u << atoi(e)))) type = atoi(e);
     }
-    VkDeviceMemory mem = VK_NULL_HANDLE;
+    mem = VK_NULL_HANDLE;
     VkMemoryAllocateFlagsInfo af = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
     VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = bda ? &af : NULL,
                                          .buffer = buf};
@@ -4887,7 +4939,12 @@ bool vk_heap_place(uint64_t size) {
         vkDestroyBuffer(g_vk.dev, buf, NULL);
         if (mem) vkFreeMemory(g_vk.dev, mem, NULL);  // destroy the bound buffer first; freeing a placed map unmaps it
         if (p == (void *)(uintptr_t)HEAP_BASE) plat_reset_guest(HEAP_BASE, HEAP_BASE + size);
-        return NOT_PLACED();
+        MEMFD_FAILED();
+    }
+    const char *how = !memfd ? "placed" : !ht ? "the driver's map moved" : ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? "a dma-buf mapped" : "an exported file mapped";
+    if (0) {
+placed_ahb:  // (MEMFD_FAILED: the heap as an Android hardware buffer)
+        how = "an Android hardware buffer mapped";
     }
     gmem_buf = buf;
     gmem_mem = mem;
@@ -4904,7 +4961,7 @@ bool vk_heap_place(uint64_t size) {
     // which reaches only the storage buffers bound to the draw; by pointer every access reaches the whole heap)
     gwin_mode = !gmem_bda && size > g_vk.props.limits.maxStorageBufferRange && !getenv("LARECOMP_VK_NO_GWIN");
     LOG("[vk] guest heap %llu MB is GPU memory (%s at %llx, memory type %d, flags 0x%x): shaders reach it %s "
-        "(storage range %llu MB)\n", (unsigned long long)(size >> 20), !memfd ? "placed" : !ht ? "the driver's map moved" : ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? "a dma-buf mapped" : "an exported file mapped",
+        "(storage range %llu MB)\n", (unsigned long long)(size >> 20), how,
         (unsigned long long)HEAP_BASE, type,
         (unsigned)mp.memoryTypes[type].propertyFlags,
         gmem_bda ? "by pointer" : gwin_mode ? "through windows of a storage buffer" : "through a storage buffer",
@@ -4912,6 +4969,7 @@ bool vk_heap_place(uint64_t size) {
     return true;
 }
 #undef NOT_PLACED
+#undef MEMFD_FAILED
 
 // Shaders reach the placed heap by pointer (translate.c maxwell_gmem_bda) where one storage buffer can't cover it: the
 // descriptor reaches maxStorageBufferRange from the heap's start, and Turnip on Adreno 7xx caps that at 128 MB - the

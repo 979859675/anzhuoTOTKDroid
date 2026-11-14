@@ -662,3 +662,7 @@
  "游戏设置完成后，开始画面会在短暂倒计时后自动开始游戏。倒计时期间触摸屏幕或按任意按钮即可留在开始画面。"},
 {"Starting the game in %d s - touch the screen to stay here",
  "%d 秒后开始游戏 - 触摸屏幕以留在此处"},
+{"Vibration",
+ "振动"},
+{"The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off.",
+ "游戏的振动：在手柄的马达上；没有手柄时使用手机自身的振动器。0%：关闭。"},

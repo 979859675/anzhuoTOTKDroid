@@ -552,3 +552,109 @@ HLE_FUNC("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21
     info[0] = 1;        // VibrationDeviceType_LinearResonantActuator
     info[1] = h & 1;    // position: left / right
 }
+
+// ---- HD rumble: the game's vibration values (services/hid_set.c, IPC SendVibrationValue / SendVibrationValues) on
+// the controllers' motors, or the phone's vibrator when none is connected. Inert until 2026-11-14: the game sent its
+// rumble and nothing moved. As in totk-android (AurelioB, MIT: runtime/hid_feedback.c, rumble_mix.h,
+// feedback_android.c): a value {low band amplitude, frequency, high band amplitude, frequency} becomes one strength,
+// sqrt(low^2 + high^2) x the setting, silence under 2 % and for a side the game hasn't repeated in 250 ms (a paused or
+// frozen game never leaves a motor on); a change of 8 / 255 or more, or every 200 ms while it lasts, goes to the
+// motors. Left Joy-Con -> the controller's low-frequency (left) motor, right -> the high-frequency one. Driven from the
+// main thread's loop (input_rumble_tick), which owns the open controllers. Settings > Controls > Vibration
+// (g_settings.rumble, %); LARECOMP_RUMBLE_LOG=1: each strength sent. Scripted test runs (LARECOMP_INPUT) don't move
+// the motors unless LARECOMP_RUMBLE=1.
+#include <pthread.h>
+static pthread_mutex_t rum_mu = PTHREAD_MUTEX_INITIALIZER;
+static float rum_v[2][4];
+static uint64_t rum_at[2];
+void input_rumble_value(unsigned side, const float v[4]) {
+    if (side > 1) return;
+    pthread_mutex_lock(&rum_mu);
+    memcpy(rum_v[side], v, sizeof rum_v[side]);
+    rum_at[side] = SDL_GetTicksNS();
+    pthread_mutex_unlock(&rum_mu);
+    static _Atomic int first;
+    if (!atomic_exchange(&first, 1))
+        LOG("[rumble] the game's first vibration: %s %.2f@%.0f Hz %.2f@%.0f Hz\n", side ? "right" : "left", v[0], v[1], v[2], v[3]);
+}
+static int rum_amp(const float v[4], uint64_t at, uint64_t now, float gain) {
+    if (!at || now - at >= 250000000ull) return 0;
+    float lo = v[0], hi = v[2];
+    if (!(lo == lo) || !(hi == hi)) return 0;
+    float a = sqrtf(lo * lo + hi * hi) * gain;
+    if (!(a >= 0.02f)) return 0;
+    if (a > 1.0f) a = 1.0f;
+    int r = (int)lroundf(a * 255.0f);
+    return r < 1 ? 1 : r;
+}
+#ifdef __ANDROID__
+// The phone's own vibrator through the activity (TOTKRecompAndroidActivity.rumble): amplitude 1..255 for ms, 0 stops.
+// SDL's haptic path vibrates with no attributes, and the POCO's HyperOS let none of them through - SDL said "sent" for a
+// full-strength second and nothing moved (2026-11-14); ours marks them as a game's (media) vibration.
+#include <jni.h>
+static void phone_rumble(int amplitude, int ms) {
+    JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
+    jobject act = (jobject)SDL_GetAndroidActivity();
+    if (!env || !act) return;
+    jclass c = (*env)->GetObjectClass(env, act);
+    jmethodID m = c ? (*env)->GetStaticMethodID(env, c, "rumble", "(II)V") : NULL;
+    if (m) (*env)->CallStaticVoidMethod(env, c, m, (jint)amplitude, (jint)ms);
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (c) (*env)->DeleteLocalRef(env, c);
+    (*env)->DeleteLocalRef(env, act);
+}
+#endif
+void input_rumble_tick(void) {
+    static int sent[2], on = -1, log = -1;
+    static uint64_t sent_at;
+    if (on < 0) on = !getenv("LARECOMP_INPUT") || (getenv("LARECOMP_RUMBLE") && atoi(getenv("LARECOMP_RUMBLE")));
+    if (log < 0) log = getenv("LARECOMP_RUMBLE_LOG") != NULL;
+    uint64_t now = SDL_GetTicksNS();
+#ifdef __ANDROID__
+    static int test = -1;  // LARECOMP_RUMBLE_TEST=1: one second at full strength on the phone at the start (is the motor reached?)
+    if (test < 0) test = getenv("LARECOMP_RUMBLE_TEST") != NULL;
+    if (test == 1) {
+        test = 2;
+        phone_rumble(255, 1000);
+        LOG("[rumble] test: one second at full strength on the phone's vibrator\n");
+    }
+#endif
+    float gain = (g_settings.rumble < 0 ? 0 : g_settings.rumble > 300 ? 300 : g_settings.rumble) / 100.0f;  // (up to 3x: the game's rumble is soft, 4-10 % on the POCO, weak on a phone's motor)
+    int amp[2];
+    pthread_mutex_lock(&rum_mu);
+    for (int s = 0; s < 2; s++) amp[s] = rum_amp(rum_v[s], rum_at[s], now, gain);
+    pthread_mutex_unlock(&rum_mu);
+    bool changed = false;
+    for (int s = 0; s < 2; s++) changed |= (!amp[s] != !sent[s]) || abs(amp[s] - sent[s]) >= 8;
+    bool renew = (amp[0] || amp[1]) && now - sent_at >= 200000000ull;
+    if (!changed && !renew) return;
+    sent[0] = amp[0], sent[1] = amp[1], sent_at = now;
+    if (log) LOG("[rumble] left %d right %d of 255 (%s)\n", amp[0], amp[1], npads ? "controller" : "phone");
+    if (!on) return;
+    uint32_t ms = amp[0] || amp[1] ? 300 : 0;
+    if (npads) {
+        for (int p = 0; p < npads; p++) SDL_RumbleGamepad(pads[p], (uint16_t)(amp[0] * 257), (uint16_t)(amp[1] * 257), ms);
+        return;
+    }
+    int m = amp[0] > amp[1] ? amp[0] : amp[1];
+#ifdef __ANDROID__
+    phone_rumble(m, (int)ms);
+#else
+    static SDL_Haptic *haptic;  // (a computer's own haptic device, if SDL lists one)
+    static bool tried;
+    if (!tried) {
+        tried = true;
+        int n = 0;
+        SDL_HapticID *ids = SDL_GetHaptics(&n);
+        for (int i = 0; ids && i < n && !haptic; i++) {
+            SDL_Haptic *h = SDL_OpenHaptic(ids[i]);
+            if (h && SDL_InitHapticRumble(h)) haptic = h;
+            else if (h) SDL_CloseHaptic(h);
+        }
+        SDL_free(ids);
+    }
+    if (!haptic) return;
+    if (m) SDL_PlayHapticRumble(haptic, m / 255.0f, ms);
+    else SDL_StopHapticRumble(haptic);
+#endif
+}

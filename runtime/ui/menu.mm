@@ -815,6 +815,10 @@ static void tab_about(void) {
     if (toggle("Phone motion like the Switch's screen", &g_settings.motion_flat)) settings_save();  // (hle/motion.c, #211 #247)
     hint("Off: the phone moves the aim as a controller would. On: as the Switch's own screen in handheld mode - try it if "
          "tilting the phone turns the aim, and turning it tilts.");
+    if (g_settings.rumble < 0 || g_settings.rumble > 300) g_settings.rumble = 100;
+    if (opt_int("Vibration", &g_settings.rumble, 0, 300, 25, 100, "%d%%",
+                "The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off."))
+        settings_save();
     ImGui::Spacing();
     controls_bindings_draw(ImGui::GetFontSize() / 34);
     ImGui::Spacing();

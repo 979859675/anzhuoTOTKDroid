@@ -18,3 +18,6 @@
   The app looks for it in `LSFG/`, `Download/`, `Documents/Emulation/bios/`, `Switch2/` and the root of the phone's
   storage, and in the app's data folder.
 - **Third-party code** keeps its own license, listed in [README.md](README.md#credits).
+- **Ideas and layouts from [totk-android](https://github.com/AurelioB/totk-android)** (AurelioB, MIT): the HD rumble
+  mixing in `runtime/hle/input.c` (two bands to one strength, the silence threshold, the 250 ms stale value) follows its
+  `runtime/rumble_mix.h` and `runtime/hid_feedback.c`.

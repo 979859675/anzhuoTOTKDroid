@@ -336,6 +336,35 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
         }
     }
 
+    // The game's rumble on the phone's own vibrator (runtime/hle/input.c input_rumble_tick): amplitude 1..255 for ms
+    // milliseconds, 0 stops it. Marked as a game's (media) vibration: SDL's haptic path vibrates with no attributes, and
+    // the POCO's HyperOS let none of those through (2026-11-14) - a full-strength second through SDL did nothing.
+    private static android.os.Vibrator vibrator;
+    public static void rumble(int amplitude, int ms) {
+        try {
+            if (vibrator == null) {
+                if (android.os.Build.VERSION.SDK_INT >= 31) {
+                    android.os.VibratorManager vm = (android.os.VibratorManager) self.getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
+                    vibrator = vm != null ? vm.getDefaultVibrator() : null;
+                } else {
+                    vibrator = (android.os.Vibrator) self.getSystemService(Context.VIBRATOR_SERVICE);
+                }
+                if (vibrator == null || !vibrator.hasVibrator()) { vibrator = null; return; }
+            }
+            if (amplitude <= 0 || ms <= 0) { vibrator.cancel(); return; }
+            int a = vibrator.hasAmplitudeControl() ? Math.min(255, amplitude) : android.os.VibrationEffect.DEFAULT_AMPLITUDE;
+            android.os.VibrationEffect e = android.os.VibrationEffect.createOneShot(ms, a);
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                vibrator.vibrate(e, android.os.VibrationAttributes.createForUsage(android.os.VibrationAttributes.USAGE_MEDIA));
+            } else {
+                vibrator.vibrate(e, new android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_GAME).build());
+            }
+        } catch (Exception ex) {
+            Log.w("TOTKRecompAndroid", "rumble: " + ex);
+        }
+    }
+
     // a new process: the driver is loaded once, at start
     public static void restartApp() {
         self.runOnUiThread(() -> {

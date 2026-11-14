@@ -662,3 +662,7 @@
  "Una volta configurato il gioco, la schermata iniziale avvia la partita da sola dopo un breve conto alla rovescia. Tocca lo schermo o premi un pulsante durante il conto per restare nella schermata iniziale."},
 {"Starting the game in %d s - touch the screen to stay here",
  "Avvio del gioco tra %d s - tocca lo schermo per restare qui"},
+{"Vibration",
+ "Vibrazione"},
+{"The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off.",
+ "La vibrazione del gioco: nei motori del controller, o nel vibratore del telefono senza controller. 0%: spenta."},

@@ -662,3 +662,7 @@
  "Une fois le jeu installé, l'écran d'accueil lance la partie tout seul après un court décompte. Touchez l'écran ou appuyez sur un bouton pendant celui-ci pour rester sur l'écran d'accueil."},
 {"Starting the game in %d s - touch the screen to stay here",
  "Lancement du jeu dans %d s - touchez l'écran pour rester ici"},
+{"Vibration",
+ "Vibration"},
+{"The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off.",
+ "Les vibrations du jeu : dans les moteurs de la manette, ou le vibreur du téléphone sans manette. 0 % : désactivées."},

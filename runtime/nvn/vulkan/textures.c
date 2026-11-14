@@ -1214,9 +1214,86 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     }
 }
 
+// ---- CPU writes into a texture the GPU owns. A texture drawn into (or copied into) on the GPU is no longer uploaded
+// from memory: its image holds what the GPU made. But the game also writes texels into some of those with the CPU
+// (nvnTextureWriteTexels): TOTK's Game Over title came out "I DE" for "FIM DE JOGO" - only the letters already in
+// its glyph texture showed, the new ones never reached the image (2026-11-14). objects.c texels_region tells the
+// rectangle it wrote (game thread); its next use on the render thread (vk_tex) sends that rectangle up from memory -
+// only it, so what the GPU drew elsewhere stays. Texels that need a decode (ASTC, BC on Mali, RGB8) or several levels
+// written: the whole texture from memory. LARECOMP_NO_TEXEL_WRITES=1: off, as before.
+static pthread_mutex_t cw_mu = PTHREAD_MUTEX_INITIALIZER;
+void renderer_texels_written(NvnTexture *t, uint32_t level, uint32_t layer0, uint32_t nlayers, uint32_t xb, uint32_t yb,
+                             uint32_t wb, uint32_t hb) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_NO_TEXEL_WRITES") != NULL;
+    TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+    if (off || !b || !b->gpu_owned || !b->image || !wb || !hb || !nlayers) return;  // (not drawn: the memory checks find it)
+    pthread_mutex_lock(&cw_mu);
+    if (!b->cw) {
+        b->cw = 1, b->cw_lv = level, b->cw_l0 = layer0, b->cw_l1 = layer0 + nlayers - 1;
+        b->cw_x0 = xb, b->cw_y0 = yb, b->cw_x1 = xb + wb, b->cw_y1 = yb + hb;
+    } else if (b->cw == 1 && b->cw_lv == level) {
+        if (layer0 < b->cw_l0) b->cw_l0 = layer0;
+        if (layer0 + nlayers - 1 > b->cw_l1) b->cw_l1 = layer0 + nlayers - 1;
+        if (xb < b->cw_x0) b->cw_x0 = xb;
+        if (yb < b->cw_y0) b->cw_y0 = yb;
+        if (xb + wb > b->cw_x1) b->cw_x1 = xb + wb;
+        if (yb + hb > b->cw_y1) b->cw_y1 = yb + hb;
+    } else b->cw = 2;
+    pthread_mutex_unlock(&cw_mu);
+    static int nlog;
+    if (nlog++ < 12)
+        LOG("[tex] texels written into a GPU-drawn %ux%u fmt %#x: level %u, %ux%u blocks at %u,%u - sent up on its next use\n",
+            t->width, t->height, t->format, level, wb, hb, xb, yb);
+}
+static void upload_texels_written(NvnTexture *t, TexBackend *b) {
+    pthread_mutex_lock(&cw_mu);
+    uint8_t cw = b->cw;
+    uint32_t lv = b->cw_lv, l0 = b->cw_l0, l1 = b->cw_l1, x0 = b->cw_x0, y0 = b->cw_y0, x1 = b->cw_x1, y1 = b->cw_y1;
+    b->cw = 0;
+    pthread_mutex_unlock(&cw_mu);
+    const FormatInfo *fi = t->layout.fmt;
+    VkFmt mf = fmt_of(t->format);
+    bool plain = cw == 1 && fi && fi->bpb && fi->bpb != 3 && !b->astc_bw && b->format == mf.vf &&
+#ifdef __ANDROID__
+                 !b->bc_vf &&
+#endif
+                 !(t->flags & 0x50) && b->depth == 1 && lv >= b->skip && lv < t->layout.levels &&
+                 b->aspect != (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) &&
+                 !(b->scalable && (b->width != t->width || b->height != t->height));
+    if (!plain) {  // (the whole texture from memory, as a first upload)
+        b->uploaded = false;
+        upload_texture(t, b);
+        return;
+    }
+    LevelLayout l = tegra_level(&t->layout, lv);
+    if (x1 > l.wb) x1 = l.wb;
+    if (y1 > l.hb) y1 = l.hb;
+    if (x0 >= x1 || y0 >= y1) return;
+    uint32_t wb = x1 - x0, hb = y1 - y0, il = lv - b->skip;
+    uint64_t row = (uint64_t)wb * fi->bpb, layer_size = tegra_layer_size(&t->layout);
+    uint32_t layers = b->layers ? b->layers : 1;
+    VkCommandBuffer cb = vk_upload_cmd();
+    for (uint32_t layer = l0; layer <= l1 && layer < layers; layer++) {
+        VkSpan s = vk_transient(row * hb, 16);
+        uint8_t *surface = (uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
+        tegra_copy_region(surface, s.ptr, row, row * hb, &l, fi->bpb, x0, y0, 0, wb, hb, 1, true);
+        uint32_t px = x0 * fi->bw, py = y0 * fi->bh, w = wb * fi->bw, h = hb * fi->bh;
+        if (px + w > level_w(b, il)) w = level_w(b, il) > px ? level_w(b, il) - px : 0;
+        if (py + h > level_h(b, il)) h = level_h(b, il) > py ? level_h(b, il) - py : 0;
+        if (!w || !h) continue;
+        VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = wb * fi->bw, .bufferImageHeight = hb * fi->bh,
+                                .imageSubresource = {b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : b->aspect,
+                                                     il, layer, 1},
+                                .imageOffset = {(int32_t)px, (int32_t)py, 0}, .imageExtent = {w, h, 1}};
+        vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+    }
+}
+
 TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     TexBackend *b = tex_backend(t);
     if (b->pending_rgba) upload_pending(b);
+    if (b->cw && b->gpu_owned) upload_texels_written(t, b);
     if (for_render && !b->gpu_owned && t->addr) {  // (LARECOMP_LOG_STALE_UPLOAD: textures uploaded before, over it)
         static int on = -1, n;
         if (on < 0) on = getenv("LARECOMP_LOG_STALE_UPLOAD") != NULL;

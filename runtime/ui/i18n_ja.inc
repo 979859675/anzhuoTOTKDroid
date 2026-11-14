@@ -662,3 +662,7 @@
  "ゲームの準備が済んでいれば、スタート画面は短いカウントダウンの後に自動でゲームを始めます。カウントダウン中に画面をタッチするかボタンを押すと、スタート画面に留まります。"},
 {"Starting the game in %d s - touch the screen to stay here",
  "%d 秒後にゲームを開始 - 画面をタッチするとここに留まります"},
+{"Vibration",
+ "振動"},
+{"The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off.",
+ "ゲームの振動: コントローラーのモーター、コントローラーがないときは本体のバイブレーター。0%: オフ。"},

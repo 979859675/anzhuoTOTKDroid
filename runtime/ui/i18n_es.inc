@@ -665,3 +665,7 @@
  "Con el juego configurado, la pantalla de inicio empieza a jugar sola tras una cuenta atrás corta. Toca la pantalla o pulsa un botón durante ella para quedarte en la pantalla de inicio."},
 {"Starting the game in %d s - touch the screen to stay here",
  "Iniciando el juego en %d s - toca la pantalla para quedarte aquí"},
+{"Vibration",
+ "Vibración"},
+{"The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off.",
+ "La vibración del juego: en los motores del mando, o en el vibrador del propio teléfono sin mando. 0%: apagada."},

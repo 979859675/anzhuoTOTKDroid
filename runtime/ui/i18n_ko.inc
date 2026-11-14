@@ -662,3 +662,7 @@
  "게임이 설정되어 있으면 시작 화면이 짧은 카운트다운 후 자동으로 게임을 시작합니다. 카운트다운 중에 화면을 터치하거나 버튼을 누르면 시작 화면에 머뭅니다."},
 {"Starting the game in %d s - touch the screen to stay here",
  "%d초 후 게임 시작 - 여기 머무르려면 화면을 터치하세요"},
+{"Vibration",
+ "진동"},
+{"The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off.",
+ "게임의 진동: 컨트롤러의 모터, 컨트롤러가 없으면 휴대폰의 진동 모터. 0%: 끄기."},

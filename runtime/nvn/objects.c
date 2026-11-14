@@ -1119,6 +1119,11 @@ static void texels_region(Cpu *c, bool to_linear, bool strided) {
                           wb, hb, layers ? 1 : d, to_linear);
     }
     if (!to_linear) backend_pool_written(t->addr, tegra_total_size(&t->layout));
+    if (!to_linear) {  // (into a texture the GPU drew in: its image gets the rectangle on its next use - vulkan/textures.c)
+        extern void renderer_texels_written(NvnTexture *t, uint32_t level, uint32_t layer0, uint32_t nlayers, uint32_t xb,
+                                            uint32_t yb, uint32_t wb, uint32_t hb);
+        renderer_texels_written(t, level, layers ? layer0 + (uint32_t)r[2] : 0, layers ? d : 1, x0, y0, wb, hb);
+    }
     if (nvn_watch_texaddr() && t->addr <= nvn_watch_texaddr() && nvn_watch_texaddr() < t->addr + tegra_total_size(&t->layout))
         LOG("[watch] %s %ux%u fmt %#x level %u region %d,%d,%d %dx%dx%d, first bytes %02x %02x %02x %02x\n",
             to_linear ? "ReadTexels" : "WriteTexels", t->width, t->height, t->format, level, r[0], r[1], r[2], r[3], r[4],
