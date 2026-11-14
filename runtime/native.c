@@ -291,7 +291,32 @@ void rt_cutscene_tick(int which);  // nvn/objects.c: a cutscene function's entry
 static int fix_cutscene0(Cpu *c) { (void)c; rt_cutscene_tick(0); return 0; }
 static int fix_cutscene1(Cpu *c) { (void)c; rt_cutscene_tick(1); return 0; }
 static int fix_cutscene2(Cpu *c) { (void)c; rt_cutscene_tick(2); return 0; }
-static int fix_cutscene3(Cpu *c) { (void)c; rt_cutscene_tick(3); return 0; }
+// Mark 3 is the update of the scripted camera animation action (ExecuteCameraMoveCameraAnimationInstructions, x0):
+// it counts only while the action has instructions ([x0 + 0x20]) and isn't done yet ([x0 + 0x18] bit 31), and the
+// store that marks it done (main+0xa5a670, str w10, [x19, #0x18]) ends the 30 fps hold right away instead of 200 ms
+// later - totk-android's admission and completion rule (MacNativeGames' FPS60 hardening, MIT).
+// LARECOMP_CUTSCENE_EXIT=0: every mark 3 call counts, and the hold ends 200 ms after the last, as before.
+void rt_cutscene_done(void);  // nvn/objects.c
+static int cutscene_exit_on(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("LARECOMP_CUTSCENE_EXIT") || atoi(getenv("LARECOMP_CUTSCENE_EXIT"));
+    return on;
+}
+static int fix_cutscene3(Cpu *c) {  // ldr x8, [x0, #0x20]
+    if (cutscene_exit_on()) {
+        uint64_t a = c->x[0], instr;
+        uint32_t flags;
+        memcpy(&instr, (const void *)(uintptr_t)(a + 0x20), 8);
+        memcpy(&flags, (const void *)(uintptr_t)(a + 0x18), 4);
+        if (!instr || (flags & 0x80000000u)) return 0;
+    }
+    rt_cutscene_tick(3);
+    return 0;
+}
+static int fix_camera_done(Cpu *c) {  // str w10, [x19, #0x18] (bit 31 set: the action is over)
+    if (cutscene_exit_on() && ((uint32_t)c->x[10] & 0x80000000u)) rt_cutscene_done();
+    return 0;
+}
 uint32_t rt_interval_pick(uint32_t game);
 static int fix_interval_pick(Cpu *c) { c->x[21] = rt_interval_pick((uint32_t)c->x[21]); return 0; }  // mov w8, #0x3c
 // Free aspect: the four places 1.4.3 hands an aspect ratio to a camera's perspective projection (sead's +0xb0), the
@@ -342,6 +367,7 @@ static const Fix fixes[] = {  // (canonical addresses, 0x7000000000 + the offset
     {143, 0x7002b23c7c, 0, 0xd100c3ff, fix_cutscene1, "cutscene mark"},
     {143, 0x700042c3bc, 0, 0xd10283ff, fix_cutscene2, "cutscene mark"},
     {143, 0x7000a5a188, 0, 0xf9401008, fix_cutscene3, "cutscene mark"},
+    {143, 0x7000a5a670, 0, 0xb9001a6a, fix_camera_done, "camera animation done"},
     {143, 0x70002db238, 0, 0x52800788, fix_interval_pick, "the interval picked (2 in cutscenes)"},
     {143, 0x7000628c74, 0, 0xbd414260, fix_aspect_cam, "camera aspect (update)"},
     {143, 0x7000b43460, 0, 0xbd406ac0, fix_aspect_setup, "camera aspect (setup)"},

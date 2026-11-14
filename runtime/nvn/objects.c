@@ -1679,6 +1679,15 @@ void rt_cutscene_tick(int which) {
 // A movie's video frame handed to the game (hle/movie.c): pre-rendered scenes (TOTK's DmT_OP_GanonWakeUp_PreRender)
 // call none of the marks, and at 60 fps the picture ran ahead of the sound.
 void rt_movie_frame(void) { atomic_store_explicit(&cutscene_ns, plat_now_ns(), memory_order_relaxed); }
+// The scripted camera animation finished (native.c fix_camera_done): no 200 ms tail. Another mark still running
+// once or twice a frame sets the hold again at the next present.
+void rt_cutscene_done(void) {
+    atomic_store_explicit(&cutscene_frame_hits[3], 0, memory_order_relaxed);
+    atomic_store_explicit(&cutscene_ns, 0, memory_order_relaxed);
+    static _Atomic uint32_t n;
+    uint32_t k = atomic_fetch_add_explicit(&n, 1, memory_order_relaxed);
+    if (k < 8 || getenv("LARECOMP_LOG_CUTSCENE")) LOG("[totk] cutscene: camera animation done\n");
+}
 static void rt_cutscene_present(void) {  // (each present: the marks of the frame it ends)
     for (int i = 0; i < 4; i++) {
         uint32_t n = atomic_exchange_explicit(&cutscene_frame_hits[i], 0, memory_order_relaxed);
