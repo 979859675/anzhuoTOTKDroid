@@ -20,4 +20,7 @@
 - **Third-party code** keeps its own license, listed in [README.md](README.md#credits).
 - **Ideas and layouts from [totk-android](https://github.com/AurelioB/totk-android)** (AurelioB, MIT): the HD rumble
   mixing in `runtime/hle/input.c` (two bands to one strength, the silence threshold, the 250 ms stale value) follows its
-  `runtime/rumble_mix.h` and `runtime/hid_feedback.c`.
+  `runtime/rumble_mix.h` and `runtime/hid_feedback.c`. The 3D reverb and the auxiliary buffer in
+  `runtime/services/audio_reverb3d.inc` are adapted from its `games/totk/runtime/audio_reverb.c` and
+  `audio_mixer.c` (Copyright (c) 2026 MacNativeGames contributors, MIT), whose reverb network is based on
+  Ryujinx.Audio's Reverb3d (Copyright (c) Ryujinx Team and Contributors, MIT).
