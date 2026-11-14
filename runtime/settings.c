@@ -29,7 +29,9 @@ Settings g_settings = {
     .movie_audio = true,
     .autoplay = true,
     .motion = true,
-    .lsfg_mult = 2,
+    .fg_engine = FG_OFF,
+    .fg_mult = 2,
+    .fg_perf = 1,
     .lsfg_flow = 75,
 #ifdef __ANDROID__
     .show_fps = true,  // (the performance overlay, ui/perf_overlay.mm: on until turned off in the menu)
@@ -201,8 +203,9 @@ void settings_reset_defaults(void) {
     g_settings.reverb = d->reverb;
     g_settings.movie_audio = d->movie_audio;
     g_settings.show_fps = d->show_fps;
-    g_settings.lsfg = d->lsfg;
-    g_settings.lsfg_mult = d->lsfg_mult;
+    g_settings.fg_engine = d->fg_engine;
+    g_settings.fg_mult = d->fg_mult;
+    g_settings.fg_perf = d->fg_perf;
     g_settings.lsfg_flow = d->lsfg_flow;
     g_settings.motion = d->motion;
     g_settings.motion_source = d->motion_source;
@@ -240,8 +243,12 @@ void settings_load(void) {
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
         else if (!strcmp(key, "movie_audio")) g_settings.movie_audio = atoi(val) != 0;
         else if (!strcmp(key, "show_fps")) g_settings.show_fps = atoi(val) != 0;
-        else if (!strcmp(key, "lsfg")) g_settings.lsfg = atoi(val) != 0;
-        else if (!strcmp(key, "lsfg_mult")) g_settings.lsfg_mult = atoi(val) < 2 ? 2 : atoi(val) > 4 ? 4 : atoi(val);
+        else if (!strcmp(key, "fg_engine")) g_settings.fg_engine = atoi(val) < 0 ? 0 : atoi(val) > 2 ? 2 : atoi(val);
+        else if (!strcmp(key, "fg_mult")) g_settings.fg_mult = atoi(val) < 2 ? 2 : atoi(val) > 4 ? 4 : atoi(val);
+        else if (!strcmp(key, "fg_perf")) g_settings.fg_perf = atoi(val) < 0 ? 0 : atoi(val) > 2 ? 2 : atoi(val);
+        // (the keys before Win-FG: lsfg = 1 was LSFG on, lsfg_mult the images per game frame)
+        else if (!strcmp(key, "lsfg")) g_settings.fg_engine = atoi(val) != 0 ? FG_LSFG : FG_OFF;
+        else if (!strcmp(key, "lsfg_mult")) g_settings.fg_mult = atoi(val) < 2 ? 2 : atoi(val) > 4 ? 4 : atoi(val);
         else if (!strcmp(key, "lsfg_flow")) g_settings.lsfg_flow = atoi(val) <= 0 ? 0 : atoi(val) < 25 ? 25 : atoi(val) > 100 ? 100 : atoi(val);
         else if (!strcmp(key, "motion")) g_settings.motion = atoi(val) != 0;
         else if (!strcmp(key, "motion_source")) g_settings.motion_source = atoi(val) >= 0 && atoi(val) <= 2 ? atoi(val) : 0;
@@ -356,7 +363,8 @@ void settings_save(void) {
     fprintf(f, "reverb = %d\n", g_settings.reverb);
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
-    fprintf(f, "lsfg = %d\nlsfg_mult = %d\nlsfg_flow = %d\n", g_settings.lsfg, g_settings.lsfg_mult, g_settings.lsfg_flow);
+    fprintf(f, "fg_engine = %d\nfg_mult = %d\nfg_perf = %d\nlsfg_flow = %d\n", g_settings.fg_engine, g_settings.fg_mult,
+            g_settings.fg_perf, g_settings.lsfg_flow);
     fprintf(f, "motion = %d\nmotion_source = %d\nmotion_flat = %d\n", g_settings.motion, g_settings.motion_source,
             g_settings.motion_flat);
 #ifdef __ANDROID__

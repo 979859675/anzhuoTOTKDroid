@@ -5,6 +5,7 @@ enum { OVERLAY_FPS = 1, OVERLAY_THROTTLE = 2, OVERLAY_GPU = 4, OVERLAY_CPU = 8, 
        OVERLAY_ALL = 63 };
 #include <stdbool.h>
 
+enum { FG_OFF = 0, FG_WINFG = 1, FG_LSFG = 2 };  // (Settings.fg_engine: Win-FG is built in, LSFG needs Lossless.dll)
 enum { ASPECT_UNLOCKED = 0, ASPECT_ORIGINAL = 1 };
 enum { RES_MATCH = 0, /* 1..8 = 1x..8x */ RES_DYNAMIC = 9, RES_Q75 = 10, RES_Q25 = 11, RES_Q50 = 12 };
 // (11 was 67% of the display: larecomp.ini "67%" now loads as RES_Q75)
@@ -37,10 +38,9 @@ typedef struct {
     bool reverb;         // room reverb effect
     bool movie_audio;
     bool show_fps;
-    // Frame generation (Lossless Scaling's LSFG, the player's own Lossless.dll: nvn/vulkan/framegen.c): on, images per
-    // game frame (2-4), the motion estimation's resolution (0 the game's own, or 25-100 %)
-    bool lsfg;
-    int lsfg_mult, lsfg_flow;
+    // Frame generation (nvn/vulkan/framegen.c): the engine (FG_*), images per game frame (2-4), Win-FG's quality (0
+    // quality, 1 balanced, 2 performance), LSFG's motion estimation resolution (0 the game's own, or 25-100 %)
+    int fg_engine, fg_mult, fg_perf, lsfg_flow;
     bool motion;          // the phone's (or a controller's) gyroscope as the controller's motion sensor (hle/motion.c)
     int motion_source;    // whose: 0 automatic (a controller's once its gyroscope is alive), 1 the phone's, 2 a controller's
     bool motion_flat;     // the phone's sensors as the Switch's screen in handheld mode, not a flat controller (hle/motion.c)

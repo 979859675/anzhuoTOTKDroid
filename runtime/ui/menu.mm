@@ -608,17 +608,25 @@ static void tab_display(void) {
 
 #ifdef __ANDROID__
     if (g_settings.fps_mode == 4) ImGui::TextWrapped("%s", tr("40 fps on a 120 Hz display, 45 on 90 Hz, 30 on 60 Hz."));
-    {   // Frame generation (Lossless Scaling's LSFG with the player's own Lossless.dll: nvn/vulkan/framegen.c)
-        static const char *fg[] = {"Off", "2x", "3x", "4x"};
-        int v = g_settings.lsfg ? g_settings.lsfg_mult - 1 : 0;
-        if (opt_choice("Frame generation (LSFG)", &v, fg, 4, 0,
-                       "Shows frames made between the game's own, for smoother motion (Lossless Scaling's frame "
-                       "generation). Needs your own Lossless.dll from Lossless Scaling: put it in the LSFG or Download folder "
-                       "of the phone's storage. Adds a little delay and needs a spare GPU; 2x on 30 fps shows 60.")) {
-            g_settings.lsfg = v > 0;
-            if (v > 0) g_settings.lsfg_mult = v + 1;
+    {   // Frame generation (nvn/vulkan/framegen.c): Win-FG (built in) or LSFG (the player's own Lossless.dll)
+        static const char *engines[] = {"Off", "Win-FG", "LSFG"};
+        opt_choice("Frame generation", &g_settings.fg_engine, engines, 3, FG_OFF,
+                   "Shows frames made between the game's own, for smoother motion. Win-FG: built in (win-fg, MIT), "
+                   "needs a spare GPU. LSFG: Lossless Scaling's frame generation, with your own Lossless.dll in the LSFG or "
+                   "Download folder of the phone's storage. Both add a little delay; 2x on 30 fps shows 60.");
+        if (g_settings.fg_engine) {
+            static const char *mults[] = {"2x", "3x", "4x"};
+            int m = g_settings.fg_mult - 2;
+            if (opt_choice("Images per game frame", &m, mults, 3, 0,
+                           "How many images are shown per game frame: 2x shows one made frame between the game's own."))
+                g_settings.fg_mult = m + 2;
         }
-        if (g_settings.lsfg) {
+        if (g_settings.fg_engine == FG_WINFG) {
+            static const char *perfs[] = {"Quality", "Balanced", "Performance"};
+            opt_choice("Quality", &g_settings.fg_perf, perfs, 3, 1,
+                       "Win-FG's motion estimation: quality solves the finest level of the motion, performance a coarser one (faster, less exact).");
+        }
+        if (g_settings.fg_engine == FG_LSFG) {
             static const char *fl[] = {"Auto", "25%", "50%", "75%", "100%"};
             static const int flv[] = {0, 25, 50, 75, 100};
             int k = 0;
@@ -627,8 +635,8 @@ static void tab_display(void) {
                            "The resolution the motion between frames is measured at: lower is faster, higher looks cleaner. "
                            "Auto: the game's own."))
                 g_settings.lsfg_flow = flv[k];
-            ImGui::TextWrapped("%s", vk_fg_built() ? vk_fg_status() : tr("Not in this build."));
         }
+        if (g_settings.fg_engine) ImGui::TextWrapped("%s", vk_fg_built() ? vk_fg_status() : tr("Not in this build."));
     }
 #endif
     opt_section("Rendering");
