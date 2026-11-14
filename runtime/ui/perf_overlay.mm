@@ -163,6 +163,12 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         plat_device_stats(&ds);
         read_caps();
         fg = vk_fg_state();
+        static bool said;
+        if (!said) {  // (the overlay's items and style in the log: a readout is "--" when its item is off)
+            said = true;
+            fprintf(stderr, "[overlay] items %d (FPS %s) style %s\n", items, items & OVERLAY_FPS ? "on" : "off",
+                    g_settings.overlay_style == 0 ? "detailed" : "compact");
+        }
         bool gen = fg == 1 || fg == 2;
         float fps = gen ? game_fps : shown;
         if (last_sample && now - last_sample > 2000000000ull) hcount = hnext = 0;  // (hidden a while: a new history)

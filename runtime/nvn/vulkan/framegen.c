@@ -14,6 +14,7 @@
 // LARECOMP_FG_MULT=2..4, LARECOMP_LSFG_FLOW=0 (auto) / 25..100, LARECOMP_LSFG_DLL.
 #ifdef __ANDROID__
 #include <SDL3/SDL.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,7 +68,9 @@ static struct {
     VkImageView out_view[WINFG_MAX_GEN];
     uint64_t count, last_ns;
     double interval;                 // the game's frame interval, smoothed (s)
+    int ng_cur, ng_pend;             // the generated frames per game frame in use, and the frames a new count has held
 } W;
+#define WINFG_MAX_OUT 120.0          // the output rate Win-FG fills up to (a second), and no more than the display's refresh
 
 static uint64_t w_pending(void) { return vk_pending_seq(); }
 static uint64_t w_completed(void) { return vk_completed_seq(); }
@@ -117,6 +120,7 @@ static void winfg_drop(void) {
     W.count = 0;
     W.last_ns = 0;
     W.interval = 0;
+    W.ng_cur = W.ng_pend = 0;
 }
 
 static void winfg_release(void) {  // (Win-FG off: its memory goes back)
@@ -205,12 +209,21 @@ static int winfg_frame(TexBackend *b, double *hold, TexBackend *gen[3]) {
     vk_full_barrier(cb);
     // the first game frame has no previous one: nothing between
     double r = refresh_s(), period = W.interval > 0 ? W.interval : 1.0 / 30;
-    size_t ng = count >= 1 ? (size_t)(mult - 1) : 0;
-    if (ng && r > 0) {  // (one image a refresh: no more generated frames than the refreshes a game frame leaves room for)
-        double n = period / r;  // (30 fps on 120 Hz: 4; on 60 Hz: 2)
-        size_t fit = n < 1.9 ? 0 : (size_t)(n + 0.1) - 1;
-        if (ng > fit) ng = fit;
+    // The generated frames per game frame: the setting, at most what fits the output cap at the game's rate (the
+    // images (ng+1) a game frame: (ng+1)/period <= cap, one a refresh at most). The game switches between 30 and 60
+    // by itself, which would flip that every few frames, and each flip respaces the frames (the ghosting): a new count
+    // is taken only once it has held for half a second.
+    double cap = WINFG_MAX_OUT;
+    if (r > 0 && 1.0 / r < cap) cap = 1.0 / r;
+    int fits = (int)floor(cap * period + 0.001) - 1;
+    int want = mult - 1;
+    if (want > fits) want = fits < 0 ? 0 : fits;
+    if (want == W.ng_cur) {
+        W.ng_pend = 0;
+    } else if (++W.ng_pend >= 30) {
+        W.ng_cur = want, W.ng_pend = 0;
     }
+    size_t ng = count >= 1 && W.ng_cur > 0 ? (size_t)W.ng_cur : 0;
     // (every frame from the second on, even with no generated frame to show: the motion estimate keeps its history)
     if (count >= 1) winfg_record(cb, count, (int)ng);
     vk_full_barrier(cb);  // (the outputs, for the window's draws after this)
