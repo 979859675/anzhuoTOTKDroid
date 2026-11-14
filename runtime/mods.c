@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <sys/stat.h>
 
 #include "hle.h"
@@ -27,6 +28,50 @@ static bool is_off(const char *name) {  // (mods_off: names separated by '|')
 
 static int by_name(const void *a, const void *b) { return strcmp(((const ModInfo *)a)->name, ((const ModInfo *)b)->name); }
 
+// A mod's cheats folder (cheats.c): cheats/ in the mod, or the Atmosphere place of a download unpacked into it
+// (atmosphere/contents/0100F2C0115B6000/cheats, contents/0100F2C0115B6000/cheats, 0100F2C0115B6000/cheats), the names'
+// case not mattering. Each entry is {the name of each folder down, then the last one}.
+static const char *const cheat_places[][4] = {
+    {"cheats", NULL, NULL, NULL},
+    {"atmosphere", "contents", "0100F2C0115B6000", "cheats"},
+    {"contents", "0100F2C0115B6000", "cheats", NULL},
+    {"0100F2C0115B6000", "cheats", NULL, NULL},
+};
+
+// the folder of dir named name (any case) into out; false if there is none
+static bool sub_dir(const char *dir, const char *name, char *out, size_t cap) {
+    DIR *d = opendir(dir);
+    if (!d) return false;
+    bool found = false;
+    for (struct dirent *e; !found && (e = readdir(d));) {
+        if (e->d_name[0] == '.' || strcasecmp(e->d_name, name)) continue;
+        struct stat sb;
+        snprintf(out, cap, "%s/%s", dir, e->d_name);
+        found = !stat(out, &sb) && S_ISDIR(sb.st_mode);
+    }
+    closedir(d);
+    return found;
+}
+
+// the cheats folder under base (into out when given)
+static bool cheats_dir_in(const char *base, char *out, size_t cap) {
+    for (unsigned p = 0; p < sizeof cheat_places / sizeof *cheat_places; p++) {
+        char dir[1200];
+        snprintf(dir, sizeof dir, "%s", base);
+        bool ok = true;
+        for (int k = 0; k < 4 && cheat_places[p][k] && ok; k++) {
+            char next[1200];
+            ok = sub_dir(dir, cheat_places[p][k], next, sizeof next);
+            snprintf(dir, sizeof dir, "%s", next);
+        }
+        if (ok) {
+            if (out) snprintf(out, cap, "%s", dir);
+            return true;
+        }
+    }
+    return false;
+}
+
 // A mod's folder: mods/<name>, or the folder mods/<name>.link names (a mod used in place - Mods > Import a mod folder
 // with Game Files > Game files: Use them in place; TOTKRecompAndroidActivity.importMod). false: neither is there.
 static bool mod_base(const char *name, char *out, size_t cap) {
@@ -35,6 +80,7 @@ static bool mod_base(const char *name, char *out, size_t cap) {
     char p[1200];
     snprintf(p, sizeof p, "%s/romfs", out);
     if (!stat(p, &sb) && S_ISDIR(sb.st_mode)) return true;
+    if (cheats_dir_in(out, NULL, 0)) return true;   // (a mod of cheats only)
     snprintf(p, sizeof p, "mods/%s.link", name);
     FILE *f = fopen(p, "rb");
     if (!f) return false;
@@ -43,7 +89,13 @@ static bool mod_base(const char *name, char *out, size_t cap) {
     out[n] = 0;
     while (n && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = 0;
     snprintf(p, sizeof p, "%s/romfs", out);
-    return n && !stat(p, &sb) && S_ISDIR(sb.st_mode);
+    if (n && !stat(p, &sb) && S_ISDIR(sb.st_mode)) return true;
+    return n && cheats_dir_in(out, NULL, 0);
+}
+
+bool mods_cheats_dir(const char *name, char *out, size_t cap) {
+    char base[1024];
+    return mod_base(name, base, sizeof base) && cheats_dir_in(base, out, cap);
 }
 
 int mods_list(ModInfo *out, int max) {
@@ -214,6 +266,7 @@ const char *mods_note(const char *name, char *buf, size_t cap) {
     return buf;
 }
 #else
+bool mods_cheats_dir(const char *name, char *out, size_t cap) { (void)name, (void)out, (void)cap; return false; }
 int mods_list(ModInfo *out, int max) { (void)out, (void)max; return 0; }
 void mods_set(const char *name, bool on) { (void)name, (void)on; }
 void mods_scan(void) {}

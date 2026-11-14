@@ -15,6 +15,7 @@
 #include "option_rows.h"
 
 extern "C" {
+#include "../cheats.h"
 #include "../mods.h"
 #include "../paths.h"
 #include "../settings.h"
@@ -57,6 +58,51 @@ static void import_mod(void) {
     g_busy = called;
     g_msg = called ? "" : "0|Could not open the folder picker.";
     pthread_mutex_unlock(&g_lock);
+}
+
+// The cheats of the mods that are on (runtime/cheats.c): the data cheats switch at once, while the game runs too; the
+// others are listed and greyed out (they change the game's code: not run yet).
+static void draw_cheats(void) {
+    static double at = -2;
+    double now = SDL_GetTicks() / 1000.0;
+    if (now - at > 1) cheats_refresh(), at = now;   // (once a second, as the mods; not while the game runs)
+    opt_section("Cheats");
+    ImGui::PushTextWrapPos(0);
+    ImGui::TextDisabled("%s", tr("Cheats of the mods that are on: a cheat file named 277178B7DBA1B6D4.txt in a cheats folder of the mod. Switch a cheat on or off here; it applies at once. A mod that is turned on or off applies when the game starts again."));
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    int n = cheats_count();
+    if (!n) ImGui::TextDisabled("%s", tr("No cheats yet."));
+    char group[96] = "";
+    for (int i = 0; i < n; i++) {
+        CheatInfo c;
+        if (!cheats_get(i, &c)) continue;
+        ImGui::PushID(i);
+        if (strcmp(group, c.mod)) {
+            snprintf(group, sizeof group, "%s", c.mod);
+            ImGui::Spacing();
+            ImGui::TextUnformatted(c.mod);
+        }
+        if (c.kind == CHEAT_HEADING) {
+            ImGui::TextDisabled("%s", c.name);
+        } else if (c.kind == CHEAT_DATA) {
+            bool on = c.on;
+            if (opt_toggle(c.name, &on, false, tr("Changes the game's memory every frame while it is on."))) {
+                cheats_set(i, on);
+                settings_save();
+            }
+        } else if (c.kind == CHEAT_MASTER) {
+            opt_disable_next();
+            bool on = true;
+            opt_toggle(c.name, &on, true, tr("The file's master code: always on."));
+        } else {
+            opt_disable_next();
+            bool off = false;
+            opt_toggle(c.name, &off, false,
+                       c.kind == CHEAT_CODE ? tr("Changes the game's code: not supported yet.") : c.note);
+        }
+        ImGui::PopID();
+    }
 }
 
 extern "C" void mods_tab_draw(float scale) {
@@ -109,6 +155,7 @@ extern "C" void mods_tab_draw(float scale) {
         ImGui::TextUnformatted(line);
         ImGui::PopTextWrapPos();
     }
+    draw_cheats();
     opt_end();
 }
 #endif

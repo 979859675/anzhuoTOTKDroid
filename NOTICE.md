@@ -17,4 +17,8 @@
   `Lossless.dll` (Lossless Scaling, proprietary, sold on Steam). The DLL is not part of this repository or of any APK.
   The app looks for it in `LSFG/`, `Download/`, `Documents/Emulation/bios/`, `Switch2/` and the root of the phone's
   storage, and in the app's data folder.
+- **Ported from PC TotK Recomp (MIT):** the Atmosphère cheat VM and cheat-file parser, `runtime/cheat_vm.c` and
+  `runtime/cheat_vm.h`, are ported from [valentderah/totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp)
+  (`runtime/cheats.c` there, MIT). Its MIT License notice: Copyright (c) 2026 Valiantsin Dzerakh (the full text is in that repository's LICENSE). `runtime/cheats.c`
+  and `runtime/cheats.h` here are TOTKDroid's glue to the phone's memory, and are MIT as well. See [docs/CHEATS.md](docs/CHEATS.md).
 - **Third-party code** keeps its own license, listed in [README.md](README.md#credits).

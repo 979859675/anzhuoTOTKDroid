@@ -172,6 +172,20 @@ bool kernel_range_unmapped(uint64_t addr, uint64_t size) {
     pthread_mutex_unlock(&g_rlock);
     return free_range;
 }
+// The mapped region that holds addr: its base, size and permission (1 read, 2 write; cheats.c's guest_ok). false when
+// addr is in none.
+bool kernel_region_of(uint64_t addr, uint64_t *base, uint64_t *size, uint32_t *perm) {
+    bool found = false;
+    pthread_mutex_lock(&g_rlock);
+    for (int i = 0; i < nregions && !found; i++) {
+        if (addr >= regions[i].addr && addr - regions[i].addr < regions[i].size) {
+            *base = regions[i].addr, *size = regions[i].size, *perm = regions[i].perm;
+            found = true;
+        }
+    }
+    pthread_mutex_unlock(&g_rlock);
+    return found;
+}
 #define PHYSICAL 0x7  // MapPhysicalMemory's regions' type: merged with their neighbours, unmapped by range
 static uint64_t heap_size;
 #ifdef __ANDROID__

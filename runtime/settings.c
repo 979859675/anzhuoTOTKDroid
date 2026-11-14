@@ -228,21 +228,12 @@ void settings_load(void) {
     loaded = true;
     FILE *f = fopen(SETTINGS_FILE, "r");
     if (!f) return;
-#ifdef __ANDROID__
-    char line[640];  // (touch_layout: 24 numbers)
-#else
-    char line[256];
-#endif
+    char line[1200];  // (touch_layout: 24 numbers; cheats_on: up to 1024)
     bool tip_key = false, aspect_key = false, output_key = false;
     while (fgets(line, sizeof line, f)) {
         char key[64];
-#ifdef __ANDROID__
-        char val[512] = "";  // (a key with nothing after "=": mods_off when every mod is on)
-        if (sscanf(line, " %63[^= ] = %511[^\r\n]", key, val) < 1) continue; val[strcspn(val, "\r\n")] = 0;
-#else
-        char val[128] = "";
-        if (sscanf(line, " %63[^= ] = %127[^\r\n]", key, val) < 1) continue; val[strcspn(val, "\r\n")] = 0;
-#endif
+        char val[1100] = "";  // (a key with nothing after "=": mods_off when every mod is on)
+        if (sscanf(line, " %63[^= ] = %1099[^\r\n]", key, val) < 1) continue; val[strcspn(val, "\r\n")] = 0;
         if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : ASPECT_UNLOCKED;
         else if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
@@ -343,6 +334,7 @@ void settings_load(void) {
         else if (!strcmp(key, "autoplay")) g_settings.autoplay = atoi(val) != 0;
         else if (!strcmp(key, "menu_tip_seen")) g_settings.menu_tip_seen = atoi(val) != 0, tip_key = true;
         else if (!strcmp(key, "mods_off")) snprintf(g_settings.mods_off, sizeof g_settings.mods_off, "%s", val);
+        else if (!strcmp(key, "cheats_on")) snprintf(g_settings.cheats_on, sizeof g_settings.cheats_on, "%s", val);
         else if (!strcmp(key, "aspect_asked")) g_settings.aspect_asked = atoi(val) != 0, aspect_key = true;
         else bind_settings_load(key, val);  // bind_pad_* / bind_key_*: runtime/hle/bindings.c
     }
@@ -420,6 +412,7 @@ void settings_save(void) {
     fprintf(f, "menu_tip_seen = %d\n", g_settings.menu_tip_seen);
     fprintf(f, "autoplay = %d\n", g_settings.autoplay);
     fprintf(f, "mods_off = %s\n", g_settings.mods_off);
+    fprintf(f, "cheats_on = %s\n", g_settings.cheats_on);
     bind_settings_save(f);
     fclose(f);
 }

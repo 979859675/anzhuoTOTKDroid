@@ -95,6 +95,7 @@ typedef struct {
     bool autoplay;       // the start screen plays by itself after a short countdown once the game is set up (a touch or
                          // a key during it stays on the start screen; ui/launcher.mm)
     char mods_off[512];  // game mods turned off (runtime/mods.c: their folder names, separated by '|')
+    char cheats_on[1024];  // data cheats switched on (runtime/cheats.c: their keys, separated by '|')
 } Settings;
 
 extern Settings g_settings;

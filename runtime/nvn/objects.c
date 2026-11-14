@@ -7,6 +7,7 @@
 #include "../kernel.h"
 #include "../settings.h"
 #include "../framepace.h"
+#include "../cheats.h"
 #include "nvn.h"
 #include "vulkan/writeback_policy.h"
 
@@ -1926,6 +1927,7 @@ uint64_t g_present_vsync_wait_ns;  // (the last present's wait for the vsync gri
 NVN(nvnQueuePresentTexture) {
     NvnWindow *w = HOST(NvnWindow, A(1));
     int i = (int)A(2);
+    cheats_frame();   // the data cheats that are on (cheats.c; nothing before the game runs)
     {   // (which guest thread presents: LARECOMP_PROF_SVC_TID, kernel.c)
         static uint64_t last_id = ~0ull;
         KThread *kt = kernel_current_thread();

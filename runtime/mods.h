@@ -30,6 +30,8 @@ bool mods_file(int i, const char **path, const char **host);
 // Which image the lookups above are for: the game's (false, the default) or the DLC's - mod folders named for the
 // DLC's title (01007EF00011F001), whose files are the DLC's own (services/fs.c)
 void mods_select_dlc(bool dlc);
+// The cheats folder of the mod (cheats.c: its <build id>.txt): out, false when it has none
+bool mods_cheats_dir(const char *name, char *out, size_t cap);
 // The mod's own note - a .txt in its folder (Sobre.txt, README.txt...) - its first `cap` bytes, in the menu font's
 // characters (ASCII and accented Latin letters; symbols and emoji left out). "" if it has none.
 const char *mods_note(const char *name, char *buf, size_t cap);

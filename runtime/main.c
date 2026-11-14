@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "cheats.h"
 #include "gamelib.h"
 #include "paths.h"
 #include "settings.h"
@@ -204,6 +205,7 @@ static void boot(const char *root) {
     native_begin_boot();  // (Native game code: the game's own code runs, no totkgame.so - runtime/native.c)
     if (!native_on() && !gamelib_load(root, why, sizeof why)) FATAL("%s\n", why);
     loader_load(exefs);
+    cheats_boot(exefs);   // the mods' cheats for this build (cheats.c; the game's modules are loaded)
     kernel_init();
     if (!native_on()) dispatch_init();
     native_prepare();
