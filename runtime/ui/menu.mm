@@ -149,7 +149,7 @@ static ImGuiKey key_from_pad(Uint8 b) {
 // they last used a controller.
 static std::atomic<int> g_kbd{0};  // 1 open, 2 confirmed, 3 cancelled
 static std::atomic<bool> g_last_pad{false};
-static char g_kbd_text[96];
+static char g_kbd_text[260], g_kbd_prompt[260];  // (UTF-8: up to 64 characters; the prompt is the game's header)
 static int g_kbd_max = 8;
 static bool capturing() { return g_open.load() || g_kbd.load() == 1; }
 // The game gets no input while this is true (runtime/hle/input.c): menu or name entry up.
@@ -845,6 +845,13 @@ RT_ON_RESET(menu_reset) {
 }
 
 static int name_filter(ImGuiInputTextCallbackData *d) { return d->EventChar < 0x20 ? 1 : 0; }
+// The name's length in characters, not bytes (UTF-8: an accented letter is two), and cut to max of them
+static int u8_len(const char *s) { int n = 0; for (; *s; s++) n += ((unsigned char)*s & 0xc0) != 0x80; return n; }
+static void u8_cut(char *s, int max) {
+    for (int n = 0; *s; s++)
+        if (((unsigned char)*s & 0xc0) != 0x80 && n++ == max) { *s = 0; return; }
+}
+static const char *kbd_title(void) { return g_kbd_prompt[0] ? g_kbd_prompt : tr("Enter your name"); }
 
 #ifdef __ANDROID__
 // Touch (no controller): typed with Android's keyboard, which covers the lower half - so at the top, in the menu's
@@ -862,13 +869,13 @@ static void keyboard_draw_touch(ImGuiIO &io, float scale, bool appearing) {
                                     ImGuiWindowFlags_AlwaysAutoResize);
     ImFont *big = g_menu_font_big ? g_menu_font_big : g_font_big, *small = g_menu_font ? g_menu_font : g_font;
     ImGui::PushFont(big);
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr("Enter your name"));
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", kbd_title());
     if (appearing) ImGui::SetKeyboardFocusHere();
     ImGui::SetNextItemWidth(-1);
     ImGui::InputText("##name", g_kbd_text, (size_t)(g_kbd_max * 4 + 1 < (int)sizeof g_kbd_text ? g_kbd_max * 4 + 1 : sizeof g_kbd_text),
                      ImGuiInputTextFlags_CallbackCharFilter, name_filter);
     ImGui::PopFont();
-    if ((int)strlen(g_kbd_text) > g_kbd_max) g_kbd_text[g_kbd_max] = 0;
+    u8_cut(g_kbd_text, g_kbd_max);
     float bw = 340 * scale, bh = 120 * scale, sp = ImGui::GetStyle().ItemSpacing.x;
     // one row: the count at the left, the buttons at the right (placed, not SameLine: the same top for both)
     float y = ImGui::GetCursorPosY(), x0 = ImGui::GetCursorPosX(), xr = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
@@ -880,7 +887,7 @@ static void keyboard_draw_touch(ImGuiIO &io, float scale, bool appearing) {
     ImGui::PopFont();
     ImGui::PushFont(small);
     ImGui::SetCursorPos(ImVec2(x0, y + (bh - ImGui::GetTextLineHeight()) * 0.5f));
-    ImGui::TextDisabled("%d / %d", (int)strlen(g_kbd_text), g_kbd_max);
+    ImGui::TextDisabled("%d / %d", u8_len(g_kbd_text), g_kbd_max);
     ImGui::PopFont();
     ImGui::End();
     ImGui::PopStyleVar(5);
@@ -905,7 +912,7 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
     ImGui::Begin("##kbd", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                                     ImGuiWindowFlags_AlwaysAutoResize);
     ImGui::PushFont(g_font_big);
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr("Enter your name"));
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", kbd_title());
     ImGui::PopFont();
     if (!pad) {  // keyboard: type straight into the field
         if (appearing) ImGui::SetKeyboardFocusHere();
@@ -914,8 +921,8 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
         ImGui::InputText("##name", g_kbd_text, (size_t)(g_kbd_max * 4 + 1 < (int)sizeof g_kbd_text ? g_kbd_max * 4 + 1 : sizeof g_kbd_text),
                          ImGuiInputTextFlags_CallbackCharFilter, name_filter);
         ImGui::PopFont();
-        if ((int)strlen(g_kbd_text) > g_kbd_max) g_kbd_text[g_kbd_max] = 0;
-        ImGui::TextDisabled("Enter  confirm      Esc  cancel      (%d / %d)", (int)strlen(g_kbd_text), g_kbd_max);
+        u8_cut(g_kbd_text, g_kbd_max);
+        ImGui::TextDisabled("Enter  confirm      Esc  cancel      (%d / %d)", u8_len(g_kbd_text), g_kbd_max);
     } else {  // controller: on-screen keyboard (osk.mm, shared with our menus' text fields)
         int r = osk_keys(g_kbd_text, sizeof g_kbd_text, g_kbd_max, appearing, scale, g_font_big);
         if (r) g_kbd = r > 0 ? 2 : 3;  // (Start / + confirms in menu_handle_event too)
@@ -926,10 +933,12 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
 
 // Game thread (runtime/hle/swkbd.c): show the dialog, re-present the last frame until it's answered.
 // Returns 1 confirmed (out = text, UTF-8), 0 cancelled.
-extern "C" int menu_keyboard_run(const char *initial, int max_len, char *out, int cap) {
+extern "C" int menu_keyboard_run(const char *prompt, const char *initial, int max_len, char *out, int cap) {
     extern void backend_represent(void);
+    snprintf(g_kbd_prompt, sizeof g_kbd_prompt, "%s", prompt ? prompt : "");
     snprintf(g_kbd_text, sizeof g_kbd_text, "%s", initial ? initial : "");
-    g_kbd_max = max_len > 0 && max_len < (int)sizeof g_kbd_text / 4 ? max_len : 8;
+    g_kbd_max = max_len > 0 && max_len <= (int)(sizeof g_kbd_text - 1) / 4 ? max_len : 8;
+    u8_cut(g_kbd_text, g_kbd_max);
     input_reset();
     g_kbd = 1;
     // (test) LARECOMP_KBD_AUTO=<text>: answer at once
