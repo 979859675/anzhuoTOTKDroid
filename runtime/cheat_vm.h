@@ -14,7 +14,8 @@ typedef enum {
     CHEAT_HEADING,      // no opcodes: a title or a group label
     CHEAT_DATA,         // writes data only: the VM runs it every presented frame while it is on
     CHEAT_MASTER,       // {name} with data writes: always on
-    CHEAT_CODE,         // writes the game's instructions (main's code): not supported yet
+    CHEAT_CODE,         // writes the game's instructions (main's code, 4 or 8 bytes, aligned): run in the native game
+                        // code (cheats.c), with its opcodes only stores, one button condition around them at most
     CHEAT_UNSUPPORTED,  // an opcode the VM does not run; the note says which
 } CheatKind;
 
@@ -31,10 +32,22 @@ typedef struct CheatMem {
 // FNV-1a 32 of n bytes: a cheat's key (of "<mod folder>/<cheat name>") and the content hash of its words.
 uint32_t cheat_fnv(const char *s, size_t n);
 
-// The kind of a cheat's opcodes: CHEAT_HEADING when it has none (or only an end), CHEAT_CODE when a write goes to
+// The kind of a cheat's opcodes: CHEAT_HEADING when it has none (or only an end), CHEAT_CODE when a store goes to
 // main's offset below code_limit (main's code, with its padding), CHEAT_UNSUPPORTED with note set when an opcode is
-// not run, else CHEAT_DATA. note (notecap bytes) is written for CHEAT_UNSUPPORTED only.
+// not run, or when code writes come with other opcodes or are not 4- or 8-byte aligned writes, else CHEAT_DATA.
+// note (notecap bytes) is written for CHEAT_UNSUPPORTED only.
 CheatKind cheat_classify(const uint32_t *w, int n, uint64_t code_limit, char *note, size_t notecap);
+
+// One store of a cheat into main at a constant offset (opcode 0, region main, no register).
+typedef struct CheatStore {
+    uint64_t off;       // from main's base
+    int width;          // bytes: 1, 2, 4 or 8
+    uint64_t value;     // the value written (its low width bytes)
+} CheatStore;
+
+// The cheat's stores into main at offsets below code_limit, in order, up to cap of them into out (out may be NULL
+// with cap 0). Returns how many there are.
+int cheat_code_stores(const uint32_t *w, int n, uint64_t code_limit, CheatStore *out, int cap);
 
 // Runs one cheat's words once (every presented frame while it is on). keys: the buttons held (HidNpadButton bits).
 // statics: the 256 static registers (C3), shared by all cheats and kept between runs, as dmnt keeps them.

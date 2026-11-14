@@ -16,7 +16,8 @@ typedef struct {
     char mod[96];     // the mod's folder name
     char note[200];   // why it is not run (CHEAT_UNSUPPORTED), else ""
     CheatKind kind;
-    int on;           // switched on (data cheats; always 1 for a master cheat)
+    int on;           // switched on (data and code cheats; always 1 for a master cheat)
+    int always;       // a master cheat ({name}): always on, not switched
 } CheatInfo;
 
 // The game is starting (after loader_load): reads the enabled mods' cheat files for this build and starts the VM.
@@ -28,10 +29,14 @@ void cheats_refresh(void);
 int cheats_count(void);
 // Copies cheat i into out. 0 when there is none.
 int cheats_get(int i, CheatInfo *out);
-// Switches a data cheat on or off at once (the caller saves the settings: settings_save). 0 when it cannot be switched.
+// Switches a data or code cheat on or off at once (the caller saves the settings: settings_save). 0 when it cannot be
+// switched (a master cheat, or one not run).
 int cheats_set(int i, int on);
 // Every presented frame (nvn/objects.c nvnQueuePresentTexture): the data cheats that are on, once the game is running.
 void cheats_frame(void);
+// The game's code is about to run (native_prepare: its modules are rewritten, no game thread runs yet): the pages the
+// code cheats write are made writable and the code cheats that are on are applied.
+void cheats_native_ready(void);
 
 #ifdef __cplusplus
 }

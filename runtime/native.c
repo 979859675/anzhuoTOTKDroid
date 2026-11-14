@@ -20,6 +20,7 @@
 
 #include <pthread.h>
 
+#include "cheats.h"
 #include "hle.h"
 #include "kernel.h"
 #include "rt.h"
@@ -397,6 +398,20 @@ static void prepare_hle(void) {
         FATAL("[native] the HLE slots can't be made executable (errno %d)\n", errno);
 }
 
+// A word the port rewrites itself, or a fix's site (or its other address): a cheat that writes it is not run.
+// w: the word at addr (the code as the file has it, when cheats.c checks a cheat at boot, before this rewrites it).
+bool native_site_reserved(uint64_t addr, uint32_t w) {
+    if ((w & 0xFFE0001Fu) == 0xD4000001u || (w & ~31u) == MRS_TPIDR || (w & ~31u) == MRS_TPIDRRO ||
+        (w & ~31u) == MSR_TPIDR || (w & ~31u) == MRS_CNTPCT)
+        return true;
+    for (uint64_t f = 0; f < sizeof fixes / sizeof *fixes; f++) {
+        if (fixes[f].version != g_game_version) continue;
+        if (addr == MAIN_BASE + (fixes[f].addr - 0x7000000000ull)) return true;
+        if (fixes[f].alt && addr == MAIN_BASE + (fixes[f].alt - 0x7000000000ull)) return true;
+    }
+    return false;
+}
+
 void native_prepare(void) {
     if (!native_on()) return;
     uint64_t f;
@@ -405,6 +420,7 @@ void native_prepare(void) {
         f == 19200000 ? ", as the Switch's" : ": NOT the Switch's 19.2 MHz - the game's timing will be off");
     memset(g_native_tab, 0, sizeof g_native_tab);
     for (int i = 0; i < g_nmodules; i++) prepare_module(&g_modules[i]);
+    cheats_native_ready();   // the pages of the game's code that cheats write made writable, their cheats applied (cheats.c)
     prepare_hle();
 }
 
@@ -416,6 +432,7 @@ bool native_wanted(void) { return false; }
 void native_begin_boot(void) {}
 bool native_on(void) { return false; }
 void native_prepare(void) {}
+bool native_site_reserved(uint64_t addr, uint32_t w) { (void)addr, (void)w; return false; }
 void native_call(Cpu *c, uint64_t addr) { (void)c; (void)addr; }
 void native_thread_end(void) {}
 uint64_t native_ticks(void) { return 0; }

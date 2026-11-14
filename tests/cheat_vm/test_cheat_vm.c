@@ -121,6 +121,29 @@ static void test_classify(void) {
     CHECK(strstr(note, "not supported") != NULL, "the note says why, got '%s'", note);
     uint32_t cut[] = {0x04000000, 0x00000100};   // a store cut short
     CHECK(cheat_classify(cut, 2, limit, note, sizeof note) == CHEAT_UNSUPPORTED, "cut short is unsupported");
+
+    // code writes: whole instructions only, with stores and one button condition around them
+    uint32_t code_w8[] = {0x08000000, 0x00000100, 0x11111111, 0x22222222};   // 8 bytes into code: two instructions
+    CHECK(cheat_classify(code_w8, 4, limit, note, sizeof note) == CHEAT_CODE, "an 8-byte code store is CODE");
+    uint32_t code_w2[] = {0x02000000, 0x00000100, 0x1234};                  // 2 bytes: not an instruction
+    CHECK(cheat_classify(code_w2, 3, limit, note, sizeof note) == CHEAT_UNSUPPORTED, "a 2-byte code store is unsupported");
+    CHECK(strstr(note, "whole instruction") != NULL, "the note says why, got '%s'", note);
+    uint32_t code_odd[] = {0x04000000, 0x00000102, 0x1};                    // not 4-aligned
+    CHECK(cheat_classify(code_odd, 3, limit, note, sizeof note) == CHEAT_UNSUPPORTED, "an unaligned code store is unsupported");
+    uint32_t code_mixed[] = {0x04000000, 0x00000100, 0x1, 0x14000000, 0x00000200, 0x2};   // plus a conditional
+    CHECK(cheat_classify(code_mixed, 6, limit, note, sizeof note) == CHEAT_UNSUPPORTED, "code writes with another opcode are unsupported");
+    CHECK(strstr(note, "other opcodes") != NULL, "the note says why, got '%s'", note);
+    uint32_t code_key[] = {0x80000002, 0x04000000, 0x00000100, 0x1, 0x21000000, 0x04000000, 0x00000100, 0x2, 0x20000000};
+    CHECK(cheat_classify(code_key, 9, limit, note, sizeof note) == CHEAT_CODE, "a button condition around code writes is CODE");
+    CHECK(cheat_classify(store_main_data, 3, limit, note, sizeof note) == CHEAT_DATA, "a data store is still DATA");
+
+    CheatStore st[4];
+    CHECK(cheat_code_stores(code_key, 9, limit, st, 4) == 2, "two code stores in the key cheat");
+    CHECK(st[0].off == 0x100 && st[0].width == 4 && st[0].value == 0x1, "the first store: offset, width, value");
+    CHECK(st[1].off == 0x100 && st[1].value == 0x2, "the else store");
+    CHECK(cheat_code_stores(code_w8, 4, limit, st, 4) == 1 && st[0].width == 8 && st[0].value == 0x1111111122222222ull,
+          "an 8-byte store's value is its two words");
+    CHECK(cheat_code_stores(store_main_data, 3, limit, st, 4) == 0, "a data store is not a code store");
 }
 
 // ---- VM

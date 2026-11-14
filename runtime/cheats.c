@@ -7,8 +7,13 @@
 // The game runs its own ARM64 code here (runtime/native.c), in this process at its own addresses, so a cheat's
 // memory is ordinary memory: the VM (cheat_vm.c) reads and writes it through guest_ok, which asks the kernel's memory
 // regions (kernel_region_of) for the permissions. Writes go through plat_write_prepare, which keeps the GPU copies of
-// the page up to date (the write tracking). Main's code is never written here: cheats that change it are listed as
-// CHEAT_CODE and not run yet.
+// the page up to date (the write tracking).
+// A code cheat (CHEAT_CODE) writes the game's instructions: the VM runs it with a memory whose writes into main's
+// code go to the instruction words, once the pages they touch are made writable (cheats_native_ready, in
+// native_prepare, before any game thread runs). Each word's value before the first such write is kept, so a cheat
+// switched off, or one whose button is released, puts it back (code_apply: the kept words first, then the cheats that
+// are on). The instruction cache is flushed after each write. A cheat that writes an instruction the port changes
+// itself (native_site_reserved), or one that only puts the code back, is not run.
 //
 // The VM runs in the present path (nvn/objects.c nvnQueuePresentTexture -> cheats_frame), every presented frame while
 // the cheat is on, after the game's first 60 frames (as the PC port). The list is read at boot and, while the game is
@@ -18,11 +23,13 @@
 
 #ifdef __ANDROID__
 #include <dirent.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/mman.h>
 
 #include "hle.h"
 #include "kernel.h"
@@ -37,19 +44,36 @@ uint64_t input_buttons_now(void);
 typedef struct {
     CheatInfo info;
     char id[9];          // its settings key: 8 hex digits
-    uint32_t *words;     // the opcodes of a data or master cheat (the others keep none)
+    uint32_t *words;     // the opcodes of a data, master or code cheat (the others keep none)
     int n;
+    int code;            // writes main's code (CHEAT_CODE): run with the code's writes (code_mem_write)
 } Cheat;
 
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;   // g_list, g_count, g_vm: the present thread runs the VM
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;   // g_list, g_count, g_vm, the code state: the present thread runs the VM
 static Cheat *g_list;
 static int g_count;
 static volatile int g_running;        // the game runs (cheats_boot .. the in-place reboot)
-static volatile int g_vm;             // a data or master cheat is on
+static volatile int g_vm;             // a data, master or code cheat is on
 static uint64_t g_frames;             // presented frames since the boot (the VM waits for the game to start)
 static uint64_t g_statics[256];       // C3's static registers, shared by the cheats (dmnt keeps them too)
 static char g_exefs[1024];            // the exefs folder the game booted from
 static uint64_t g_code_limit;         // main's code: the offsets below it (its text segment, page-aligned)
+static int g_code_ok;                 // the code cheats may write the game's code (cheats_native_ready), g_lock
+
+// main's pages the code cheats write (a bit per 4 KB page of main, up to 64 MB): made writable at cheats_native_ready
+enum { CODE_PAGES = 0x4000000 >> 12 };
+static uint8_t g_code_pages[CODE_PAGES / 8];
+
+// The code words written, each with its value before the first write there (a place is kept once, until the next
+// code_apply). code_apply puts them back, last first (a store of 8 bytes over two stores of 4 is undone in order).
+typedef struct {
+    uint64_t a;
+    int width;
+    uint64_t orig;
+} Undo;
+enum { UNDO_MAX = 8192 };
+static Undo g_undo[UNDO_MAX];
+static int g_undo_n;
 
 // ---- the settings' list of switched cheats (cheats_on: keys separated by '|')
 
@@ -135,6 +159,14 @@ static void plain_name(char *s) {
     }
 }
 
+// a cheat that runs in the frames (data and master cheats through the VM; code cheats with the code's writes)
+static int runs(const Cheat *c) { return c->info.on && (c->info.kind == CHEAT_DATA || c->info.kind == CHEAT_MASTER || c->code); }
+static int vm_wanted(void) {   // g_lock held
+    for (int k = 0; k < g_count; k++)
+        if (runs(&g_list[k])) return 1;
+    return 0;
+}
+
 // Reads the enabled mods' cheats for this build into a new list, then replaces the running one.
 static void scan(const char *exefs) {
     uint8_t head[0x48];
@@ -183,9 +215,16 @@ static void scan(const char *exefs) {
                 plain_name(c->info.name);
                 CheatKind kind = cheat_classify(r->words, r->n, code_limit, c->info.note, sizeof c->info.note);
                 if (r->master && kind == CHEAT_DATA) kind = CHEAT_MASTER;
+                if (kind == CHEAT_CODE && !native_wanted()) {
+                    kind = CHEAT_UNSUPPORTED;
+                    snprintf(c->info.note, sizeof c->info.note, "%s",
+                             "the game's code runs recompiled here (LARECOMP_NATIVE=0): code cheats need the native code");
+                }
                 c->info.kind = kind;
-                c->info.on = kind == CHEAT_MASTER || (kind == CHEAT_DATA && list_has(g_settings.cheats_on, c->id));
-                if (kind == CHEAT_DATA || kind == CHEAT_MASTER) {
+                c->code = kind == CHEAT_CODE;
+                c->info.always = kind == CHEAT_MASTER || (c->code && r->master);
+                c->info.on = c->info.always || ((kind == CHEAT_DATA || c->code) && list_has(g_settings.cheats_on, c->id));
+                if (kind == CHEAT_DATA || kind == CHEAT_MASTER || c->code) {
                     c->words = r->words;   // (moved: cheat_parse_free leaves them out)
                     c->n = r->n;
                     r->words = NULL;
@@ -196,15 +235,26 @@ static void scan(const char *exefs) {
         }
         LOG("[cheats] %s in %d mods (%d cheats)\n", file, files, n);
     }
-    int vm = 0;
-    for (int i = 0; i < n; i++) vm |= list[i].info.on && (list[i].info.kind == CHEAT_DATA || list[i].info.kind == CHEAT_MASTER);
     pthread_mutex_lock(&g_lock);
     Cheat *old = g_list;
     int old_n = g_count;
     g_list = list;
     g_count = n;
-    g_vm = vm;
     g_code_limit = code_limit;
+    g_vm = vm_wanted();
+    if (code_limit) {
+        int code = 0, data = 0, master = 0, unsupported = 0, on = 0;
+        for (int i = 0; i < n; i++) {
+            const CheatInfo *c = &list[i].info;
+            code += c->kind == CHEAT_CODE;
+            data += c->kind == CHEAT_DATA;
+            master += c->kind == CHEAT_MASTER;
+            unsupported += c->kind == CHEAT_UNSUPPORTED;
+            on += c->on;
+        }
+        LOG("[cheats] main's code ends at %llx: %d code, %d data, %d master, %d not run, %d on\n",
+            (unsigned long long)code_limit, code, data, master, unsupported, on);
+    }
     pthread_mutex_unlock(&g_lock);
     for (int i = 0; i < old_n; i++) free(old[i].words);
     free(old);
@@ -255,7 +305,7 @@ static int mem_read(void *ctx, uint64_t a, int width, uint64_t *v) {
 
 static void mem_write(void *ctx, uint64_t a, int width, uint64_t v) {
     (void)ctx;
-    if (in_code(a, (uint64_t)width)) {   // not run: the code is the game's own (cheats that change it are CHEAT_CODE)
+    if (in_code(a, (uint64_t)width)) {   // not run: a data cheat has no code writes (cheat_classify: CHEAT_CODE)
         static int warned;
         if (!warned++) LOG("[cheats] a data cheat writes the game's code at %llx: skipped\n", (unsigned long long)a);
         return;
@@ -267,6 +317,110 @@ static void mem_write(void *ctx, uint64_t a, int width, uint64_t v) {
 
 static const CheatMem g_mem = {NULL, mem_region, mem_read, mem_write};
 
+// ---- the game's code: the instruction words the code cheats write (g_lock held)
+
+static uint64_t main_size(void) { return g_nmodules > 0 ? g_modules[0].size : 0; }
+
+// Whether a write of width bytes at a may go to the game's code: the pages it touches are made writable (cheats_native_ready)
+static int code_ready(uint64_t a, uint64_t width) {
+    uint64_t b = main_base();
+    if (!g_code_ok || !b || a < b || a + width > b + main_size()) return 0;
+    for (uint64_t p = (a - b) >> 12; p <= (a + width - 1 - b) >> 12; p++)
+        if (p >= (uint64_t)CODE_PAGES || !(g_code_pages[p >> 3] & (1u << (p & 7)))) return 0;
+    return 1;
+}
+
+// The bytes of v at a, then the instruction cache flushed over them: the game runs these words natively.
+static void put_bytes(uint64_t a, int width, uint64_t v) {
+    memcpy((void *)(uintptr_t)a, &v, (size_t)width);
+    __builtin___clear_cache((char *)(uintptr_t)a, (char *)(uintptr_t)(a + (uint64_t)width));
+}
+
+// Keeps the value before the first write at (a, width). 0 when the table is full.
+static int undo_remember(uint64_t a, int width, uint64_t orig) {
+    for (int i = 0; i < g_undo_n; i++)
+        if (g_undo[i].a == a && g_undo[i].width == width) return 1;
+    if (g_undo_n == UNDO_MAX) return 0;
+    g_undo[g_undo_n].a = a;
+    g_undo[g_undo_n].width = width;
+    g_undo[g_undo_n].orig = orig;
+    g_undo_n++;
+    return 1;
+}
+
+// Puts back every code word written since the last call, last first.
+static void undo_all(void) {
+    for (int i = g_undo_n - 1; i >= 0; i--) put_bytes(g_undo[i].a, g_undo[i].width, g_undo[i].orig);
+    g_undo_n = 0;
+}
+
+static void code_write(uint64_t a, int width, uint64_t v) {
+    if (!code_ready(a, (uint64_t)width)) return;
+    uint64_t now = 0;
+    memcpy(&now, (const void *)(uintptr_t)a, (size_t)width);
+    if (!memcmp(&now, &v, (size_t)width)) return;
+    if (!undo_remember(a, width, now)) {
+        static int warned;
+        if (!warned++) LOG("[cheats] more than %d code words written: the rest are skipped\n", UNDO_MAX);
+        return;
+    }
+    put_bytes(a, width, v);
+}
+
+// The code cheats' memory: writes into main's code are instruction words (code_write), others as a data cheat's.
+static void code_mem_write(void *ctx, uint64_t a, int width, uint64_t v) {
+    if (in_code(a, (uint64_t)width)) code_write(a, width, v);
+    else mem_write(ctx, a, width, v);
+}
+
+static const CheatMem g_code_mem = {NULL, mem_region, mem_read, code_mem_write};
+
+// The code cheats that are on, applied: the words written before are put back first (a cheat switched off goes, the
+// others take their places again). g_lock held; the game's code is writable (g_code_ok).
+static void code_apply(void) {
+    uint64_t keys = input_buttons_now();
+    undo_all();
+    for (int i = 0; i < g_count; i++)
+        if (g_list[i].code && g_list[i].info.on) cheat_vm_run(g_list[i].words, g_list[i].n, &g_code_mem, keys, g_statics);
+}
+
+// At boot, before native_prepare rewrites the game's code: a code cheat that writes an instruction the port changes
+// itself, or only puts the game's code back as it is, is not run. g_lock held.
+static void check_code_sites(void) {
+    uint64_t b = main_base();
+    for (int i = 0; i < g_count; i++) {
+        Cheat *c = &g_list[i];
+        if (!c->code) continue;
+        enum { MAX_STORES = 256 };
+        CheatStore st[MAX_STORES];
+        int k = cheat_code_stores(c->words, c->n, g_code_limit, st, MAX_STORES);
+        const char *why = NULL;
+        int changes = 0;
+        if (k > MAX_STORES || !b) why = "too many writes into the game's code";
+        for (int j = 0; j < k && !why; j++) {
+            if (st[j].off + (uint64_t)st[j].width > main_size()) {
+                why = "a write outside the game's code";
+                break;
+            }
+            for (int q = 0; q < st[j].width / 4 && !why; q++) {
+                uint64_t a = b + st[j].off + 4 * (uint64_t)q;
+                uint32_t cur = *(const uint32_t *)(uintptr_t)a;
+                uint32_t want = (uint32_t)(st[j].value >> (32 * q));
+                if (native_site_reserved(a, cur) || native_site_reserved(a, want)) why = "the port changes this instruction itself";
+                else if (cur != want) changes = 1;
+            }
+        }
+        if (!why && !changes) why = "not needed: switching the cheat off puts the code back";
+        if (!why) continue;
+        LOG("[cheats] %s/%s is not run: %s\n", c->info.mod, c->info.name, why);
+        c->info.kind = CHEAT_UNSUPPORTED;
+        snprintf(c->info.note, sizeof c->info.note, "%s", why);
+        c->info.on = 0;
+        c->info.always = 0;
+        c->code = 0;
+    }
+}
+
 // ---- the interface
 
 // the Mods page's list (the game not running) reads the default folder: the data root's, where the game is set up
@@ -277,7 +431,66 @@ void cheats_boot(const char *exefs) {
     memset(g_statics, 0, sizeof g_statics);
     g_frames = 0;
     scan(g_exefs);
+    pthread_mutex_lock(&g_lock);
+    g_code_ok = 0;
+    g_undo_n = 0;
+    check_code_sites();
+    g_vm = vm_wanted();
+    pthread_mutex_unlock(&g_lock);
     g_running = 1;
+}
+
+void cheats_native_ready(void) {
+    pthread_mutex_lock(&g_lock);
+    memset(g_code_pages, 0, sizeof g_code_pages);
+    g_undo_n = 0;
+    g_code_ok = 0;
+    uint64_t b = main_base();
+    int any = 0, failed = 0, pages = 0;
+    for (int i = 0; i < g_count && b && !failed; i++) {
+        Cheat *c = &g_list[i];
+        if (!c->code) continue;
+        any = 1;
+        enum { MAX_STORES = 256 };
+        CheatStore st[MAX_STORES];
+        int k = cheat_code_stores(c->words, c->n, g_code_limit, st, MAX_STORES);
+        if (k > MAX_STORES) failed = 1;
+        for (int j = 0; j < k && !failed; j++) {
+            uint64_t first = st[j].off >> 12, last = (st[j].off + (uint64_t)st[j].width - 1) >> 12;
+            for (uint64_t p = first; p <= last && !failed; p++) {
+                if (p >= (uint64_t)CODE_PAGES) {
+                    failed = 1;
+                    break;
+                }
+                if (g_code_pages[p >> 3] & (1u << (p & 7))) continue;
+                if (mprotect((void *)(uintptr_t)(b + (p << 12)), 4096, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+                    LOG("[cheats] the game's code page %llx can't be made writable (errno %d)\n",
+                        (unsigned long long)(b + (p << 12)), errno);
+                    failed = 1;
+                    break;
+                }
+                g_code_pages[p >> 3] |= (uint8_t)(1u << (p & 7));
+                pages++;
+            }
+        }
+    }
+    if (failed) {
+        for (int i = 0; i < g_count; i++) {
+            Cheat *c = &g_list[i];
+            if (!c->code) continue;
+            c->info.kind = CHEAT_UNSUPPORTED;
+            snprintf(c->info.note, sizeof c->info.note, "%s", "the game's code can't be written here");
+            c->info.on = 0;
+            c->info.always = 0;
+            c->code = 0;
+        }
+    } else if (any) {
+        g_code_ok = 1;
+        code_apply();
+        LOG("[cheats] code cheats: %d pages of the game's code made writable\n", pages);
+    }
+    g_vm = vm_wanted();
+    pthread_mutex_unlock(&g_lock);
 }
 
 void cheats_refresh(void) {
@@ -302,15 +515,13 @@ int cheats_get(int i, CheatInfo *out) {
 
 int cheats_set(int i, int on) {
     pthread_mutex_lock(&g_lock);
-    int ok = i >= 0 && i < g_count && g_list[i].info.kind == CHEAT_DATA;
+    int ok = i >= 0 && i < g_count && (g_list[i].info.kind == CHEAT_DATA || (g_list[i].code && !g_list[i].info.always));
     if (ok) {
         Cheat *c = &g_list[i];
         c->info.on = on != 0;
         list_set(g_settings.cheats_on, sizeof g_settings.cheats_on, c->id, on != 0);
-        int vm = 0;
-        for (int k = 0; k < g_count; k++)
-            vm |= g_list[k].info.on && (g_list[k].info.kind == CHEAT_DATA || g_list[k].info.kind == CHEAT_MASTER);
-        g_vm = vm;
+        if (c->code && g_code_ok) code_apply();   // its words at once; a switched off cheat's put back
+        g_vm = vm_wanted();
         LOG("[cheats] %s/%s %s\n", c->info.mod, c->info.name, on ? "on" : "off");
     }
     pthread_mutex_unlock(&g_lock);
@@ -324,16 +535,24 @@ void cheats_frame(void) {
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_count; i++) {
         Cheat *c = &g_list[i];
-        if (c->info.on && (c->info.kind == CHEAT_DATA || c->info.kind == CHEAT_MASTER))
+        if (!c->info.on) continue;
+        if (c->code) {
+            if (g_code_ok) cheat_vm_run(c->words, c->n, &g_code_mem, keys, g_statics);
+        } else if (c->info.kind == CHEAT_DATA || c->info.kind == CHEAT_MASTER) {
             cheat_vm_run(c->words, c->n, &g_mem, keys, g_statics);
+        }
     }
     pthread_mutex_unlock(&g_lock);
 }
 
 // the in-place reboot (main.c): the game's memory goes; its cheats stop with it, and the next boot reads them again
 RT_ON_RESET(cheats_reset) {
+    pthread_mutex_lock(&g_lock);
     g_running = 0;
     g_vm = 0;
+    g_code_ok = 0;
+    g_undo_n = 0;
+    pthread_mutex_unlock(&g_lock);
 }
 
 #else   // (the runtime is Android's; elsewhere there are no cheats)
@@ -343,4 +562,5 @@ int cheats_count(void) { return 0; }
 int cheats_get(int i, CheatInfo *out) { (void)i, (void)out; return 0; }
 int cheats_set(int i, int on) { (void)i, (void)on; return 0; }
 void cheats_frame(void) {}
+void cheats_native_ready(void) {}
 #endif

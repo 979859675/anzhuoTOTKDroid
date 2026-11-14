@@ -60,8 +60,9 @@ static void import_mod(void) {
     pthread_mutex_unlock(&g_lock);
 }
 
-// The cheats of the mods that are on (runtime/cheats.c): the data cheats switch at once, while the game runs too; the
-// others are listed and greyed out (they change the game's code: not run yet).
+// The cheats of the mods that are on (runtime/cheats.c): the data and code cheats switch at once, while the game runs
+// too (a code cheat writes the game's instructions, and puts them back when it is switched off); a master cheat is
+// always on; the others are listed and greyed out, with the reason.
 static void draw_cheats(void) {
     static double at = -2;
     double now = SDL_GetTicks() / 1000.0;
@@ -85,21 +86,22 @@ static void draw_cheats(void) {
         }
         if (c.kind == CHEAT_HEADING) {
             ImGui::TextDisabled("%s", c.name);
-        } else if (c.kind == CHEAT_DATA) {
-            bool on = c.on;
-            if (opt_toggle(c.name, &on, false, tr("Changes the game's memory every frame while it is on."))) {
-                cheats_set(i, on);
-                settings_save();
-            }
-        } else if (c.kind == CHEAT_MASTER) {
+        } else if (c.always) {
             opt_disable_next();
             bool on = true;
             opt_toggle(c.name, &on, true, tr("The file's master code: always on."));
+        } else if (c.kind == CHEAT_DATA || c.kind == CHEAT_CODE) {
+            bool on = c.on;
+            const char *tip = c.kind == CHEAT_CODE ? tr("Changes the game's code while it is on: it applies at once.")
+                                                   : tr("Changes the game's memory every frame while it is on.");
+            if (opt_toggle(c.name, &on, false, tip)) {
+                cheats_set(i, on);
+                settings_save();
+            }
         } else {
             opt_disable_next();
             bool off = false;
-            opt_toggle(c.name, &off, false,
-                       c.kind == CHEAT_CODE ? tr("Changes the game's code: not supported yet.") : c.note);
+            opt_toggle(c.name, &off, false, tr(c.note));
         }
         ImGui::PopID();
     }

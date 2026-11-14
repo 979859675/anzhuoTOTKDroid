@@ -58,8 +58,16 @@ static int op_unsupported(const uint32_t *w, char *buf, size_t n) {
     return 0;
 }
 
+// A store opcode into main at a constant offset (0TMR00AA AAAAAAAA ..: M 0, R 0): 1 with its offset in *off, else 0.
+static int main_store(const uint32_t *w, uint64_t *off) {
+    uint32_t f = w[0];
+    if (f >> 28 != 0 || ((f >> 20) & 0xF) != 0 || ((f >> 16) & 0xF) != 0) return 0;
+    *off = ((uint64_t)(f & 0xFF) << 32) | w[1];
+    return 1;
+}
+
 CheatKind cheat_classify(const uint32_t *w, int n, uint64_t code_limit, char *note, size_t notecap) {
-    int ops = 0, ends = 0;
+    int ops = 0, ends = 0, code = 0, other = 0;
     for (int i = 0; i < n;) {
         int len = op_len(w + i, n - i);
         if (!len) {
@@ -69,14 +77,49 @@ CheatKind cheat_classify(const uint32_t *w, int n, uint64_t code_limit, char *no
         uint32_t f = w[i];
         ops++;
         ends += f >> 28 == 2;
-        if (f >> 28 == 0 && ((f >> 20) & 0xF) == 0) {   // a store into main
-            uint64_t off = ((uint64_t)(f & 0xFF) << 32) | w[i + 1];
-            if (off < code_limit) return CHEAT_CODE;
+        uint64_t off;
+        if (main_store(w + i, &off) && off < code_limit) {   // a write into main's code
+            int width = (f >> 24) & 0xF;
+            if ((width != 4 && width != 8) || (off & 3)) {
+                snprintf(note, notecap, "a write into the game's code at offset %llx is not a whole instruction",
+                         (unsigned long long)off);
+                return CHEAT_UNSUPPORTED;
+            }
+            code = 1;
+        } else if (f >> 28 != 0 && f >> 28 != 2 && f >> 28 != 8) {   // (a store, an end or else, a button condition)
+            other = 1;
         }
         if (op_unsupported(w + i, note, notecap)) return CHEAT_UNSUPPORTED;
         i += len;
     }
+    if (code) {
+        if (other) {
+            snprintf(note, notecap, "code writes come with other opcodes");
+            return CHEAT_UNSUPPORTED;
+        }
+        return CHEAT_CODE;
+    }
     return ops == ends && ops <= 1 ? CHEAT_HEADING : CHEAT_DATA;
+}
+
+int cheat_code_stores(const uint32_t *w, int n, uint64_t code_limit, CheatStore *out, int cap) {
+    int k = 0;
+    for (int i = 0; i < n;) {
+        int len = op_len(w + i, n - i);
+        if (!len) break;
+        uint64_t off;
+        if (main_store(w + i, &off) && off < code_limit) {
+            int width = (w[i] >> 24) & 0xF;
+            if (out && k < cap) {
+                out[k].off = off;
+                out[k].width = width;
+                out[k].value = width == 8 ? (uint64_t)w[i + 2] << 32 | w[i + 3] : w[i + 2];
+            }
+            k++;
+        }
+        i += len;
+    }
+    return k;
 }
 
 // ---- guest memory (through CheatMem)
