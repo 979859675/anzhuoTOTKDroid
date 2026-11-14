@@ -84,7 +84,7 @@ static void touch_layout_draw(void) {
         ImGui::PopTextWrapPos();
     };
     ImGui::Spacing();
-    if (icons) {  // (the bow and throw buttons' drag: ui/touch_controls.mm recompute)
+    if (g_settings.touch_scheme == 1) {  // (the icon layout's bow and throw drag: not used now, touch_scheme is 0)
         float as = (g_settings.touch_aim_sens > 0.1f ? g_settings.touch_aim_sens : 1.0f) * 100;
         ImGui::TextUnformatted(tr("Aim sensitivity (bow, throw)"));
         ImGui::SetNextItemWidth(-1);
