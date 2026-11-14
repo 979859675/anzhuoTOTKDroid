@@ -7,6 +7,7 @@
 #include "../kernel.h"
 #include "../settings.h"
 #include "../framepace.h"
+#include "../platform.h"
 #include "nvn.h"
 #include "vulkan/writeback_policy.h"
 
@@ -1723,13 +1724,63 @@ bool rt_totk_auto(void) {
     return on && g_game_version == GAME_V_143 && !g_settings.fps_mode && rt_fps60();
 }
 bool rt_totk_auto60(void) { return rt_totk_auto() && totk_auto60; }
+// ... and a hot phone holds 30 (the idea of totk-android's TOTK_THERMAL_STEP): Android's thermal status SEVERE (3) or
+// more, or its 10 s headroom forecast at 1.0 (throttling begins), brings 30 before the clocks fall; 60 is tried again
+// only after 30 s in a row under MODERATE (2) with the headroom under 0.8 (or none reported). Read once a second
+// from what the activity reports (platform/android.c). LARECOMP_THERMAL_HOLD=0: off. (In the log: "[pace] Auto: the phone is
+// hot" and "cooled down".)
+static bool totk_thermal_hold(uint64_t now) {
+    static int on = -1;
+    if (on < 0) on = !getenv("LARECOMP_THERMAL_HOLD") || atoi(getenv("LARECOMP_THERMAL_HOLD")) != 0;
+    static uint64_t checked, cool_since;
+    static bool held;
+    if (!on || now - checked < 1000000000ull) return held;
+    checked = now;
+    PlatDeviceStats s = {.thermal = -1, .headroom = -1};
+#ifdef __ANDROID__
+    plat_device_stats(&s);
+#endif
+    // (LARECOMP_THERMAL_TEST=<status>[,<headroom>][@<seconds>]: that reading instead, for the first <seconds> - tests)
+    static const char *test = (const char *)1;
+    if (test == (const char *)1) test = getenv("LARECOMP_THERMAL_TEST");
+    if (test) {
+        static uint64_t t0;
+        if (!t0) t0 = now;
+        const char *at = strchr(test, '@');
+        if (!at || now - t0 < (uint64_t)(atof(at + 1) * 1e9)) {
+            s.thermal = atoi(test);
+            const char *c = strchr(test, ',');
+            s.headroom = c && (!at || c < at) ? (float)atof(c + 1) : -1;
+        }
+    }
+    bool hot = s.thermal >= 3 || s.headroom >= 1.0f, cool = s.thermal >= 0 && s.thermal < 2 && s.headroom < 0.8f;
+    if (hot) cool_since = 0;
+    if (!held && hot) {
+        held = true;
+        LOG("[pace] Auto: the phone is hot (thermal status %d, headroom %.2f): 30 fps until it cools\n", s.thermal, s.headroom);
+    } else if (held) {
+        if (!cool) cool_since = 0;
+        else if (!cool_since) cool_since = now;
+        else if (now - cool_since >= 30000000000ull) {
+            held = false, cool_since = 0;
+            LOG("[pace] Auto: cooled down (thermal status %d, headroom %.2f)\n", s.thermal, s.headroom);
+        }
+    }
+    return held;
+}
 static void totk_auto_present(uint64_t now) {
     static uint64_t last, win_start, retry_at, trial_at, backoff = 20000000000ull;
     static uint64_t sum;
     static int n, bad;
     uint64_t p = last ? now - last : 0;
     last = now;
-    if (!rt_totk_auto() || !p || p > 100000000ull || rt_cutscene()) return;
+    if (!rt_totk_auto()) return;
+    if (totk_thermal_hold(now)) {
+        if (totk_auto60) totk_auto60 = false, trial_at = 0, bad = 0, sum = n = 0, win_start = 0;
+        retry_at = now;  // (60 tried as soon as it has cooled)
+        return;
+    }
+    if (!p || p > 100000000ull || rt_cutscene()) return;
     if (!totk_auto60 && now >= retry_at) {
         totk_auto60 = true, trial_at = now, bad = 0;
         sum = n = 0, win_start = now;
