@@ -24,17 +24,19 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
-
+      # The runner's own Android SDK (ANDROID_HOME); the NDK and CMake the build needs are added to it.
       - name: Install the NDK and CMake
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;30.0.16248370" "cmake;3.30.4"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKMANAGER" ] || SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -n 1)"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "ndk;30.0.16248370" "cmake;3.30.4"
 
       # The native dependencies (SDL3, shaderc, the headers, the font): android/deps/build_deps.sh. Cached by its
       # script and patch, so a rebuild with unchanged deps skips the long shaderc build.
@@ -47,8 +49,6 @@ jobs:
 
       - name: Build the native dependencies
         if: steps.deps-cache.outputs.cache-hit != 'true'
-        env:
-          ANDROID_HOME: ${{ env.ANDROID_HOME }}
         run: bash android/deps/build_deps.sh
 
       - name: Build the APK
