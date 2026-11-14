@@ -114,6 +114,11 @@ static void test_classify(void) {
     uint32_t end_only[] = {0x20000000};
     uint32_t unsupported[] = {0xC4000000, 0x00000000};                     // C4: not run
     CHECK(cheat_classify(store_code, 3, limit, note, sizeof note) == CHEAT_CODE, "store into code is CODE");
+    // the register field (R, the 4th nibble of 0TMR00AA): a cheat that writes no registers keeps it 0, so the write
+    // is still at main + offset (the cheats' 040A0000 stores: "Inf. Battery" and the rest of the code cheats)
+    uint32_t store_code_r[] = {0x040A0000, 0x00000100, 0x12345678};
+    CHECK(cheat_classify(store_code_r, 3, limit, note, sizeof note) == CHEAT_CODE, "a code store with register field A is CODE");
+    CHECK(cheat_code_stores(store_code_r, 3, limit, NULL, 0) == 1, "and it is one code store");
     CHECK(cheat_classify(store_main_data, 3, limit, note, sizeof note) == CHEAT_DATA, "store into main data is DATA");
     CHECK(cheat_classify(store_heap, 3, limit, note, sizeof note) == CHEAT_DATA, "store into heap is DATA");
     CHECK(cheat_classify(end_only, 1, limit, note, sizeof note) == CHEAT_HEADING, "an end alone is a heading");

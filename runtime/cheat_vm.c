@@ -58,10 +58,11 @@ static int op_unsupported(const uint32_t *w, char *buf, size_t n) {
     return 0;
 }
 
-// A store opcode into main at a constant offset (0TMR00AA AAAAAAAA ..: M 0, R 0): 1 with its offset in *off, else 0.
+// A store opcode into main (0TMR00AA AAAAAAAA ..: M 0; the address is main + A + register R, R is 0 unless a cheat
+// writes registers, which a code cheat never does: cheat_classify). 1 with its offset in *off, else 0.
 static int main_store(const uint32_t *w, uint64_t *off) {
     uint32_t f = w[0];
-    if (f >> 28 != 0 || ((f >> 20) & 0xF) != 0 || ((f >> 16) & 0xF) != 0) return 0;
+    if (f >> 28 != 0 || ((f >> 20) & 0xF) != 0) return 0;
     *off = ((uint64_t)(f & 0xFF) << 32) | w[1];
     return 1;
 }

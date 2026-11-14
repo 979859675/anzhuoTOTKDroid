@@ -388,8 +388,22 @@ static void code_apply(void) {
         if (g_list[i].code && g_list[i].info.on) cheat_vm_run(g_list[i].words, g_list[i].n, &g_code_mem, keys, g_statics);
 }
 
+// A branch word (B, BL, B.cond, CBZ / CBNZ, TBZ / TBNZ) written at main's offset off whose target is a zero word of main:
+// a code cave (PC's cheats are compiled with the cave's body; here there is none, and a zero word traps).
+static int64_t sext(uint32_t v, int bits) { return ((int64_t)v ^ ((int64_t)1 << (bits - 1))) - ((int64_t)1 << (bits - 1)); }
+static int branch_into_cave(uint64_t b, uint64_t off, uint32_t w) {
+    int64_t imm;
+    if ((w & 0xFC000000u) == 0x14000000u || (w & 0xFC000000u) == 0x94000000u) imm = sext(w & 0x3FFFFFFu, 26);
+    else if ((w & 0xFF000010u) == 0x54000000u || (w & 0x7E000000u) == 0x34000000u) imm = sext((w >> 5) & 0x7FFFFu, 19);
+    else if ((w & 0x7E000000u) == 0x36000000u) imm = sext((w >> 5) & 0x3FFFu, 14);
+    else return 0;
+    int64_t t = (int64_t)off + imm * 4;
+    if (t < 0 || (uint64_t)t + 4 > main_size()) return 0;
+    return *(const uint32_t *)(uintptr_t)(b + (uint64_t)t) == 0;
+}
+
 // At boot, before native_prepare rewrites the game's code: a code cheat that writes an instruction the port changes
-// itself, or only puts the game's code back as it is, is not run. g_lock held.
+// itself, or only puts the game's code back as it is, or a branch into a code cave, is not run. g_lock held.
 static void check_code_sites(void) {
     uint64_t b = main_base();
     for (int i = 0; i < g_count; i++) {
@@ -411,6 +425,7 @@ static void check_code_sites(void) {
                 uint32_t cur = *(const uint32_t *)(uintptr_t)a;
                 uint32_t want = (uint32_t)(st[j].value >> (32 * q));
                 if (native_site_reserved(a, cur) || native_site_reserved(a, want)) why = "the port changes this instruction itself";
+                else if (branch_into_cave(b, st[j].off + 4 * (uint64_t)q, want)) why = "a branch into a code cave (zeros in the game's code)";
                 else if (cur != want) changes = 1;
             }
         }
