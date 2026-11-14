@@ -148,7 +148,8 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     static int fg = 0;
     static PlatDeviceStats ds;
     uint64_t now = SDL_GetTicksNS();
-    int items = g_settings.overlay_items;
+    // the frame rate is always shown: its readout is what the overlay is for (the other items are the user's choice)
+    int items = g_settings.overlay_items | OVERLAY_FPS;
     if (now >= next_ns) {
         uint64_t g = vk_presented_images(), gf = vk_game_frames();
         if (t0) {  // the raw rate: the game's frames; shown: every window image (generated ones too)
@@ -164,10 +165,9 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         read_caps();
         fg = vk_fg_state();
         static bool said;
-        if (!said) {  // (the overlay's items and style in the log: a readout is "--" when its item is off)
+        if (!said) {  // (once: the overlay's items and frame generation's state, for the log)
             said = true;
-            fprintf(stderr, "[overlay] items %d (FPS %s) style %s\n", items, items & OVERLAY_FPS ? "on" : "off",
-                    g_settings.overlay_style == 0 ? "detailed" : "compact");
+            fprintf(stderr, "[overlay] items %d style %s fg %d\n", items, g_settings.overlay_style == 0 ? "detailed" : "compact", fg);
         }
         bool gen = fg == 1 || fg == 2;
         float fps = gen ? game_fps : shown;
@@ -225,7 +225,10 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     float size = (g_settings.overlay_scale >= 40 && g_settings.overlay_scale <= 150 ? g_settings.overlay_scale : 75) / 100.0f;
     float alpha = (g_settings.overlay_opacity >= 20 && g_settings.overlay_opacity <= 100 ? g_settings.overlay_opacity : 100) / 100.0f;
     char a[16], b[16], s[160], f[48];
-    if (isfinite(presented) && presented > fps + 1) snprintf(f, sizeof f, "%s > %s FPS", number(a, fps), number(b, presented));
+    // with frame generation on: the game's frames > the shown ones (the generated frames included), both always
+    // (the two rates are what it is for); otherwise the one rate
+    if (gen && isfinite(presented)) snprintf(f, sizeof f, "%s > %s FPS", number(a, fps), number(b, presented));
+    else if (isfinite(presented) && presented > fps + 1) snprintf(f, sizeof f, "%s > %s FPS", number(a, fps), number(b, presented));
     else snprintf(f, sizeof f, "%s FPS", number(a, fps));
     char ram[24];
     if (rss < 0) strcpy(ram, "--");

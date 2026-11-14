@@ -565,8 +565,6 @@ static void tab_display(void) {
         opt_int("Overlay opacity", &g_settings.overlay_opacity, 20, 100, 5, 100, "%d%%",
                 "How see-through the overlay is: lower lets more of the game show through.");
         static const struct { int bit; const char *label, *desc; } items[] = {
-            {OVERLAY_FPS, "Frame rate and frame time", "The game's frames a second and the time of one; with frame "
-                                                       "generation, the game's > the shown rate."},
             {OVERLAY_THROTTLE, "Thermal state", "Android's thermal state, T: 0 (none) to 6 (shutdown): how much the phone is "
                                                 "holding back for heat."},
             {OVERLAY_GPU, "GPU time", "The GPU's time for one frame."},

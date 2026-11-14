@@ -257,7 +257,7 @@ void settings_load(void) {
         else if (!strcmp(key, "overlay")) g_settings.overlay_style = !strcmp(val, "compact");
         else if (!strcmp(key, "overlay_scale")) g_settings.overlay_scale = atoi(val);
         else if (!strcmp(key, "overlay_opacity")) g_settings.overlay_opacity = atoi(val);
-        else if (!strcmp(key, "overlay_items")) g_settings.overlay_items = atoi(val);
+        else if (!strcmp(key, "overlay_items")) g_settings.overlay_items = atoi(val) | OVERLAY_FPS;  // (the frame rate is always shown)
         else if (!strcmp(key, "overlay_pos")) sscanf(val, "%f,%f", &g_settings.overlay_pos[0], &g_settings.overlay_pos[1]);
 #endif
 #ifdef __ANDROID__
