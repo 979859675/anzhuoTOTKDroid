@@ -983,10 +983,50 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     // ~2.4 MB a frame in the overworld). The periodic full hash stays as a safety net. LARECOMP_VK_TEX_WATCH=0: off.
     static int watch = -1;
     if (watch < 0) { const char *e = getenv("LARECOMP_VK_TEX_WATCH"); watch = !e || atoi(e) != 0; }
+    // Pages the CPU wrote: hashed whole, never only sampled - the check below takes the written-since mark, so a change
+    // a sample missed then was never seen again until the periodic full hash, which an 8 MB texture waits long for (the
+    // budget): the font atlas (R8 2048x4096) kept new letters unseen, "Pr n esa de   r le" for "Princesa de Hyrule"
+    // in the opening and "I  DE" for "FIM DE JOGO" (2026-11-14). LARECOMP_TEX_WATCH_FULL=0: sampled, as before.
+    static int watch_full = -1;
+    if (watch_full < 0) { const char *e = getenv("LARECOMP_TEX_WATCH_FULL"); watch_full = !e || atoi(e) != 0; }
+    bool written = false;
     if (watch && !always_full) {
         extern int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now);
         uint32_t now = 0;
         int ch = vk_pages_changed(t->addr, total, b->wgen, &now);
+        if (ch > 0 && watch_full) written = full = true;
+        {   static int lw = -2, lh, n;  // LARECOMP_LOG_TEXWATCH=<w>x<h> (diagnosis): that texture's page checks
+            static uint64_t wa0, wa1;  // (and those of every other texture over its memory)
+            if (lw == -2) { const char *e = getenv("LARECOMP_LOG_TEXWATCH"); lw = e ? atoi(e) : 0; lh = e && strchr(e, 'x') ? atoi(strchr(e, 'x') + 1) : 0; }
+            bool target = lw && t->width == (uint32_t)lw && t->height == (uint32_t)lh;
+            if (target) wa0 = t->addr, wa1 = t->addr + total;
+            bool over = !target && wa0 && t->addr < wa1 && t->addr + total > wa0;
+            if ((target || over) && n++ < 4000) {
+                uint64_t h = tex_hash_full(mem, total);
+                LOG("[texwatch] frame %llu: %s %ux%u f%#x flags %#x @%llx+%llx: pages %d periodic %d dynamic %d calm-run %u, memory %s\n",
+                    (unsigned long long)frame, target ? "atlas" : "OVER", t->width, t->height, t->format, t->flags,
+                    (unsigned long long)t->addr, (unsigned long long)total, ch, periodic, b->dynamic, b->same_run,
+                    h == b->data_hash ? "as uploaded" : "DIFFERS from the upload");
+                // LARECOMP_DUMP_TEXWATCH=<frame>: from that frame, the texture's memory (level 0, linear) into the debug
+                // folder each time it differs from the upload, 8 times at most (texwatch_<frame>.raw)
+                static int dumps;
+                const char *df = getenv("LARECOMP_DUMP_TEXWATCH"), *dir = getenv("LARECOMP_DEBUG_DIR");
+                if (target && df && dir && frame >= (uint64_t)atoll(df) && h != b->data_hash && dumps < 8) {
+                    LevelLayout l = tegra_level(&t->layout, 0);
+                    uint64_t row = (uint64_t)l.wb * fi->bpb;
+                    uint8_t *lin = malloc(row * l.hb);
+                    if (lin) {
+                        tegra_copy_region((uint8_t *)mem + l.offset, lin, row, row * l.hb, &l, fi->bpb, 0, 0, 0, l.wb, l.hb, 1, true);
+                        char path[512];
+                        snprintf(path, sizeof path, "%s/texwatch_%llu.raw", dir, (unsigned long long)frame);
+                        FILE *f = fopen(path, "wb");
+                        if (f) fwrite(lin, 1, row * l.hb, f), fclose(f), dumps++;
+                        LOG("[texwatch] dumped %s (%ux%u blocks)\n", path, l.wb, l.hb);
+                        free(lin);
+                    }
+                }
+            }
+        }
         if (ch >= 0) {
             b->wgen = now;
             if (!ch && b->uploaded && !restyle) {
@@ -1006,12 +1046,18 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     // changed once while loading, and a 2048x4096 R8 one (flags 0x14) that changed once in ~38 looks - ~1 GB per 2 s,
     // 97% unchanged (LARECOMP_VK_PROF, 2026-10-30). A change the sample misses shows up to dyn_every - 1 frames late.
     // LARECOMP_TEX_DYN_EVERY=<n> (1: every frame, as before); LARECOMP_AB=<frames>:texcalm alternates it.
+    // Not for a linear texture (flags 0x10): those the CPU updates a piece at a time, and a sample misses a piece. That
+    // R8 one is the font's glyph cache: the game draws new text once into a layout image of its own, so letters added
+    // to the cache on a sampled frame stayed missing until the text changed - "Pr n esa de   r le" for "Princesa de
+    // Hyrule" in the opening, "I  DE" for "FIM DE JOGO" (POCO, placed heap: no write tracking; 2026-11-14). It is hashed
+    // whole when used, ~8 MB. LARECOMP_TEX_CALM_LINEAR=1: sampled as before.
     enum { DYN_CALM = 30, DYN_LARGE = 2 << 20 };
-    static int dyn_every = -1;
+    static int dyn_every = -1, calm_linear = -1;
     if (dyn_every < 0) dyn_every = getenv("LARECOMP_TEX_DYN_EVERY") ? atoi(getenv("LARECOMP_TEX_DYN_EVERY")) : 4;
+    if (calm_linear < 0) calm_linear = getenv("LARECOMP_TEX_CALM_LINEAR") && atoi(getenv("LARECOMP_TEX_CALM_LINEAR"));
     extern int vk_ab(const char *what);
     bool calm = fast && dyn_every > 1 && b->dynamic && b->uploaded && total >= DYN_LARGE && b->same_run >= DYN_CALM &&
-                !restyle && !always_full && vk_ab("texcalm") != 0;
+                !restyle && !always_full && !written && (calm_linear || !(t->flags & 0x10)) && vk_ab("texcalm") != 0;
     if (calm && (frame + ((uintptr_t)b >> 6)) % (uint64_t)dyn_every && tex_hash_sample(mem, total) == b->dyn_sample) {
         prof_tex_calm_bytes += total;
         return;
@@ -1037,6 +1083,13 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                 t->width, t->height, t->depth, t->format, t->flags, t->target, t->levels, (unsigned long long)t->addr,
                 (unsigned long long)total, h == b->data_hash ? "unchanged" : "CHANGED", b->gpu_owned ? " gpu-owned" : "");
         }
+    }
+    if (written && b->uploaded && h != b->data_hash) {  // (a change the samples alone would have missed)
+        static int n;
+        uint64_t sh = fast ? tex_hash_sample(mem, total) : fnv_sample(mem, total);
+        if (sh == (b->dynamic && total >= DYN_LARGE && fast ? b->dyn_sample : old_sample) && n++ < 12)
+            LOG("[tex] CPU-written %ux%u fmt %#x flags %#x (%llu KB): a change its samples missed, uploaded now\n", t->width,
+                t->height, t->format, t->flags, (unsigned long long)(total >> 10));
     }
     if (b->dynamic && total >= DYN_LARGE && fast) {
         b->same_run = b->uploaded && h == b->data_hash ? (b->same_run < 0xFFFF ? b->same_run + 1 : b->same_run) : 0;
