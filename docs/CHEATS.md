@@ -12,7 +12,8 @@ A cheat file goes into a mod, like any other mod (Mods page; see the README).
   button, puts the original instructions back. Not verified on a device yet.
 - Not run, with a note: a cheat whose code writes come with other opcodes, a code write that is not a whole 4- or 8-byte
   instruction, a write to an instruction the port changes itself (svc, TLS and counter reads, and the port's own
-  patches), and a cheat that only puts the game's code back (switching a cheat off already does that).
+  patches), and a branch into a zero word of the game's code that the cheat doesn't write itself (its cave, the
+  note gives the address).
 - Not run: opcode C4, the 0xF extensions, and opcode 5 with a register offset.
 - Not verified yet: the cheats in the recompiled build (`LARECOMP_NATIVE=0`, `totkgame.so`). Code cheats are not run
   there at all; data cheats use the same memory and the same present hook, but the recompiled game may keep some of
@@ -63,7 +64,8 @@ Each cheat's switch is stored in the settings as `cheats_on`: the FNV-1a 32 hash
 ## How code cheats are applied
 
 - At boot (`cheats_boot`), before the game's code is rewritten, each code cheat is checked: a write to an instruction
-  the port changes itself (`native_site_reserved`), or a cheat that only restores the code, is not run.
+  the port changes itself (`native_site_reserved`), or a branch into a zero word of the game's code that the cheat
+  doesn't write (`branch_into_cave`), is not run. A cheat that writes the words as they are (a restore cheat) runs too.
 - In `native_prepare`, before any game thread starts, the pages of main's code the code cheats write are made
   readable, writable and executable (`cheats_native_ready`), and the cheats that are on are applied.
 - Each instruction word a cheat writes is recorded with its value before the first write. Before the cheats are
