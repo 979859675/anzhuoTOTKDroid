@@ -391,7 +391,13 @@ static void code_apply(void) {
 // A branch word (B, BL, B.cond, CBZ / CBNZ, TBZ / TBNZ) written at main's offset off whose target is a zero word of main:
 // a code cave (PC's cheats are compiled with the cave's body; here there is none, and a zero word traps).
 static int64_t sext(uint32_t v, int bits) { return ((int64_t)v ^ ((int64_t)1 << (bits - 1))) - ((int64_t)1 << (bits - 1)); }
-static int branch_into_cave(uint64_t b, uint64_t off, uint32_t w) {
+// (the cave's body is the cheat's own writes: a target one of them writes is no cave; the note says the offset)
+static int written_by(const CheatStore *st, int k, uint64_t t) {
+    for (int j = 0; j < k; j++)
+        if (t >= st[j].off && t < st[j].off + (uint64_t)st[j].width) return 1;
+    return 0;
+}
+static int branch_into_cave(uint64_t b, uint64_t off, uint32_t w, const CheatStore *st, int k, char *note, size_t cap) {
     int64_t imm;
     if ((w & 0xFC000000u) == 0x14000000u || (w & 0xFC000000u) == 0x94000000u) imm = sext(w & 0x3FFFFFFu, 26);
     else if ((w & 0xFF000010u) == 0x54000000u || (w & 0x7E000000u) == 0x34000000u) imm = sext((w >> 5) & 0x7FFFFu, 19);
@@ -399,7 +405,11 @@ static int branch_into_cave(uint64_t b, uint64_t off, uint32_t w) {
     else return 0;
     int64_t t = (int64_t)off + imm * 4;
     if (t < 0 || (uint64_t)t + 4 > main_size()) return 0;
-    return *(const uint32_t *)(uintptr_t)(b + (uint64_t)t) == 0;
+    if (written_by(st, k, (uint64_t)t)) return 0;
+    if (*(const uint32_t *)(uintptr_t)(b + (uint64_t)t) != 0) return 0;
+    snprintf(note, cap, "a branch into a zero word of the game's code at main+%llx (no cave of the cheat)",
+             (unsigned long long)t);
+    return 1;
 }
 
 // At boot, before native_prepare rewrites the game's code: a code cheat that writes an instruction the port changes
@@ -413,7 +423,7 @@ static void check_code_sites(void) {
         CheatStore st[MAX_STORES];
         int k = cheat_code_stores(c->words, c->n, g_code_limit, st, MAX_STORES);
         const char *why = NULL;
-        int changes = 0;
+        char note[200];
         if (k > MAX_STORES || !b) why = "too many writes into the game's code";
         for (int j = 0; j < k && !why; j++) {
             if (st[j].off + (uint64_t)st[j].width > main_size()) {
@@ -425,12 +435,10 @@ static void check_code_sites(void) {
                 uint32_t cur = *(const uint32_t *)(uintptr_t)a;
                 uint32_t want = (uint32_t)(st[j].value >> (32 * q));
                 if (native_site_reserved(a, cur) || native_site_reserved(a, want)) why = "the port changes this instruction itself";
-                else if (branch_into_cave(b, st[j].off + 4 * (uint64_t)q, want)) why = "a branch into a code cave (zeros in the game's code)";
-                else if (cur != want) changes = 1;
+                else if (branch_into_cave(b, st[j].off + 4 * (uint64_t)q, want, st, k, note, sizeof note)) why = note;
             }
         }
-        if (!why && !changes) why = "not needed: switching the cheat off puts the code back";
-        if (!why) continue;
+        if (!why) continue;   // (a cheat that writes the words as they are, a restore one, stays: switching it on is harmless)
         LOG("[cheats] %s/%s is not run: %s\n", c->info.mod, c->info.name, why);
         c->info.kind = CHEAT_UNSUPPORTED;
         snprintf(c->info.note, sizeof c->info.note, "%s", why);
