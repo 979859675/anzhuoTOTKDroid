@@ -21,6 +21,7 @@ extern "C" {
 }
 
 #ifdef __ANDROID__
+#include "gb2312_hanzi.inc"   // (the Han glyphs the cheats' names can use: i18n_merge_fonts)
 typedef const char *const Pair[2];
 static const char *const kPt[][2] = {
 #include "i18n_pt.inc"
@@ -128,6 +129,7 @@ void i18n_merge_fonts(ImFontAtlas *atlas, float size_px) {
         ImFontGlyphRangesBuilder b;
         for (size_t i = 0; i < t->n; i++) b.AddText(t->rows[i][1]);
         b.AddText("0123456789 %.,:;!?()[]/-+x");
+        if (!strncmp(code, "zh", 2)) b.AddRanges(gb2312_hanzi_ranges);   // (the cheats' names: any Chinese text, as the file has it)
         b.BuildRanges(&ranges);
     }
     // Candidates, the language's own first: Xiaomi's MiSans (HyperOS), then Google's NotoSansCJK collection (Japanese,

@@ -71,8 +71,8 @@ typedef struct {
                           // #227): set when the app starts, before the driver loads (vulkan/device.c)
 #define TOUCH_NCTL 19  // (ui/touch_controls.mm: LAS's 12, then the right stick, L3 / R3 and the d-pad)
     float touch_pos[TOUCH_NCTL][2];  // each on-screen control's place, a share of the screen (negative: default)
-    // The icon layout (ui/touch_controls.mm), in the world only - the classic one above stays in the game's menus:
-    // touch_scheme 1 (0: the classic one everywhere), its controls' places of their own
+    // The icon layout (ui/touch_controls.mm) is no longer used: touch_scheme is always 0 (the classic layout
+    // everywhere, as the Switch's buttons). Its code stays for now; touch_scheme 1 is never set (settings.c).
 #define TOUCH_NCTL2 22
     int touch_scheme;
     float touch_pos2[TOUCH_NCTL2][2];

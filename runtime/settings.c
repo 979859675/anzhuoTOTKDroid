@@ -40,7 +40,7 @@ Settings g_settings = {
     .overlay_items = OVERLAY_ALL,
     .touch_pos = {{-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1},
                   {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}},
-    .touch_scheme = 1,
+    .touch_scheme = 0,   // (the classic layout: the one control layout, see touch_scheme below)
     .touch_pos2 = {{-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1},
                    {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1},
                    {-1, -1}},
@@ -281,7 +281,7 @@ void settings_load(void) {
                 while (*q == ',' || *q == ' ') q++;
             }
         }
-        else if (!strcmp(key, "touch_scheme")) g_settings.touch_scheme = atoi(val);
+        else if (!strcmp(key, "touch_scheme")) g_settings.touch_scheme = 0;   // (the action-icon layout is no longer used: the classic one everywhere; old files say 1)
         else if (!strcmp(key, "touch_aim_sens")) g_settings.touch_aim_sens = (float)atof(val);
         else if (!strcmp(key, "touch_talk")) g_settings.touch_talk = atoi(val) != 0;
         else if (!strcmp(key, "touch_minimap_top")) g_settings.touch_minimap_top = atoi(val) != 0;

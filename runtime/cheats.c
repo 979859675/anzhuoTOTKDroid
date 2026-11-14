@@ -364,6 +364,10 @@ static void code_write(uint64_t a, int width, uint64_t v) {
         if (!warned++) LOG("[cheats] more than %d code words written: the rest are skipped\n", UNDO_MAX);
         return;
     }
+    static int logged;   // (the first writes, to see what a code cheat changes: its address in main, the words)
+    if (logged++ < 200)
+        LOG("[cheats] code write main+%llx: %llx -> %llx (%d bytes)\n", (unsigned long long)(a - main_base()),
+            (unsigned long long)now, (unsigned long long)v, width);
     put_bytes(a, width, v);
 }
 
