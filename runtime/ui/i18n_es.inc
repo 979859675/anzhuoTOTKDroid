@@ -669,3 +669,7 @@
  "Vibración"},
 {"The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off.",
  "La vibración del juego: en los motores del mando, o en el vibrador del propio teléfono sin mando. 0%: apagada."},
+{"Spanish (Latin America)",
+ "Español (Latinoamérica)"},
+{"French (Canada)",
+ "Francés (Canadá)"},

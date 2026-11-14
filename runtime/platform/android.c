@@ -190,6 +190,10 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
         fprintf(stderr, "[android] guest window %#llx-%#llx\n", (unsigned long long)base, (unsigned long long)(base + hi - lo));
         const char *last = getenv("LARECOMP_LAST_EXIT");  // (the activity: ApplicationExitInfo)
         if (last && *last) fprintf(stderr, "[android] the last run ended: %s\n", last);
+        // The crash report from here on, not only once the game's threads run (BOTWRecomp ed930d4): a custom driver
+        // (RADV on an Xclipse, BOTW #234 #345 #383) crashed in the first frames, before the game loaded, and the log just
+        // stopped. (The handler is process-wide; the game's threads install it again for their own signal stacks.)
+        plat_crash_handler_install();
         return true;
     }
     void *p = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE,

@@ -666,3 +666,7 @@
  "Trilling"},
 {"The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off.",
  "De trillingen van het spel: in de motoren van de controller, of zonder controller in de trilmotor van de telefoon. 0%: uit."},
+{"Spanish (Latin America)",
+ "Spaans (Latijns-Amerika)"},
+{"French (Canada)",
+ "Frans (Canada)"},

@@ -666,3 +666,7 @@
  "진동"},
 {"The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off.",
  "게임의 진동: 컨트롤러의 모터, 컨트롤러가 없으면 휴대폰의 진동 모터. 0%: 끄기."},
+{"Spanish (Latin America)",
+ "스페인어 (중남미)"},
+{"French (Canada)",
+ "프랑스어 (캐나다)"},

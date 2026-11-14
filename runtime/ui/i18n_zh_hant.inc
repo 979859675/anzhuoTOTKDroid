@@ -666,3 +666,7 @@
  "震動"},
 {"The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off.",
  "遊戲的震動：在控制器的馬達上；沒有控制器時使用手機本身的震動器。0%：關閉。"},
+{"Spanish (Latin America)",
+ "西班牙語（拉丁美洲）"},
+{"French (Canada)",
+ "法語（加拿大）"},

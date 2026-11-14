@@ -666,3 +666,7 @@
  "振動"},
 {"The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off.",
  "ゲームの振動: コントローラーのモーター、コントローラーがないときは本体のバイブレーター。0%: オフ。"},
+{"Spanish (Latin America)",
+ "スペイン語 (中南米)"},
+{"French (Canada)",
+ "フランス語 (カナダ)"},
