@@ -62,9 +62,9 @@ jobs:
 
       - name: Build FFmpeg
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
-        env:
-          ANDROID_NDK_LINUX: ${{ env.ANDROID_HOME }}/ndk/30.0.16248370
         run: |
+          export ANDROID_NDK_LINUX="$ANDROID_HOME/ndk/30.0.16248370"
+          test -x "$ANDROID_NDK_LINUX/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
           LOG="$RUNNER_TEMP/ffmpeg.log"
           set +e
           bash android/deps/build_ffmpeg.sh > "$LOG" 2>&1
