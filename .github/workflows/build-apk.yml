@@ -64,7 +64,20 @@ jobs:
         if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         env:
           ANDROID_NDK_LINUX: ${{ env.ANDROID_HOME }}/ndk/30.0.16248370
-        run: bash android/deps/build_ffmpeg.sh
+        run: |
+          LOG="$RUNNER_TEMP/ffmpeg.log"
+          set +e
+          bash android/deps/build_ffmpeg.sh > "$LOG" 2>&1
+          status=$?
+          set -e
+          tail -n 40 "$LOG"
+          if [ "$status" -ne 0 ]; then
+            # the end of the log and of FFmpeg's config.log, as annotations (readable through the API)
+            echo "::error title=ffmpeg-log::$(tail -n 40 "$LOG" | tr '\n' '|' | cut -c1-3500)"
+            CL="$HOME/totkrecompandroid-ffmpeg/ffmpeg/ffbuild/config.log"
+            [ -f "$CL" ] && echo "::error title=ffmpeg-config::$(tail -n 40 "$CL" | tr '\n' '|' | cut -c1-3500)"
+            exit "$status"
+          fi
 
       - name: Build the APK
         id: gradle
