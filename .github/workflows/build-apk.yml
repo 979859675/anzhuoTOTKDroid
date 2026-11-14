@@ -51,6 +51,21 @@ jobs:
         if: steps.deps-cache.outputs.cache-hit != 'true'
         run: bash android/deps/build_deps.sh
 
+      # FFmpeg (the movies, the voices; runtime/services/hwopus.c needs its headers): android/deps/build_ffmpeg.sh,
+      # with the runner's NDK (the same version) instead of a download. Cached like the dependencies above.
+      - name: Cache FFmpeg
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: android/deps/ffmpeg
+          key: ffmpeg-${{ hashFiles('android/deps/build_ffmpeg.sh') }}
+
+      - name: Build FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        env:
+          ANDROID_NDK_LINUX: ${{ env.ANDROID_HOME }}/ndk/30.0.16248370
+        run: bash android/deps/build_ffmpeg.sh
+
       - name: Build the APK
         id: gradle
         working-directory: android/totkrecompandroid
