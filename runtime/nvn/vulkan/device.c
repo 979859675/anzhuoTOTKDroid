@@ -1327,6 +1327,10 @@ uint64_t renderer_present_count(void) { return vk_async_on() && !vk_async_is_ren
 uint64_t renderer_present_count(void) { return total_frames; }
 #endif
 uint64_t vk_frame_counter(void) { return g_frame_counter; }
+// The game's own frames presented (generated ones not counted): the overlay's raw frame rate
+uint64_t vk_game_frames(void) { return total_frames; }
+// When the last game frame was presented: the generated frames before the next one are spaced from it
+static uint64_t g_last_game_shown;
 static float g_shot_crop[4] = {0, 0, 1, 1};
 static double last_fps_time;
 static NvnTexture *g_last_presented;
@@ -1396,16 +1400,16 @@ void backend_present(NvnTexture *t) {
         double hold = 0;
         int ng = vk_fg_frame(b, &hold, gen);
         if (g_fg_layout[2] <= 0 || g_fg_layout[3] <= 0) ng = 0;  // (no game frame placed yet)
-        static uint64_t last_shown;
+        // Spaced evenly from the last game frame: generated g at (g+1) holds, the game's own at (ng+1) holds. (Before,
+        // the first went out at once and the rest a hold apart: the gaps were uneven, and that flickered.)
         for (int g = 0; g < ng; g++) {
-            if (g && hold > 0) plat_sleep_until_ns(last_shown + (uint64_t)(hold * 1e9));
+            if (hold > 0 && g_last_game_shown) plat_sleep_until_ns(g_last_game_shown + (uint64_t)((g + 1) * hold * 1e9));
             if (!vk_frame_begin(black)) break;
             vk_present_draw(vk_cmd(), gen[g], g_fg_layout[0], g_fg_layout[1], g_fg_layout[2], g_fg_layout[3], g_fg_pv);
             menu_render_again((void *)vk_cmd());
             vk_frame_end(NULL);
-            last_shown = SDL_GetTicksNS();
         }
-        if (ng && hold > 0) plat_sleep_until_ns(last_shown + (uint64_t)(hold * 1e9));
+        if (ng && hold > 0 && g_last_game_shown) plat_sleep_until_ns(g_last_game_shown + (uint64_t)((ng + 1) * hold * 1e9));
     }
 #endif
     bool have = vk_frame_begin(black);
@@ -1478,6 +1482,7 @@ void backend_present(NvnTexture *t) {
         if (win_shot < 0) win_shot = getenv("LARECOMP_WINDOW_SHOT") ? atol(getenv("LARECOMP_WINDOW_SHOT")) : 0;
         bool shot = win_shot && (long)total_frames + 1 == win_shot;
         vk_frame_end(shot ? "build/window.png" : NULL);
+        g_last_game_shown = SDL_GetTicksNS();
         if (shot && getenv("LARECOMP_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
     } else {
         renderer_submit();

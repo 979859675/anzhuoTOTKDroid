@@ -10,8 +10,8 @@
 // item switched off reads "--", as there. The readings: runtime/platform/android.c plat_device_stats (the battery and
 // thermal state from the activity, reportDeviceStats), the CPU caps from cpufreq (each cluster's scaling_max_freq),
 // frame generation from vulkan/framegen.c. (TOTKDroid: BOTWRecompAndroid's d304e64; a generated frame redraws the last
-// overlay - ui/menu.mm menu_render_again - so this counts the game's frames, and the shown ones are the window images
-// presented: vulkan/device.c vk_presented_images.)
+// overlay - ui/menu.mm menu_render_again - so the raw rate counts the game's own frames (vulkan/device.c vk_game_frames),
+// and the shown ones are the window images presented: vulkan/device.c vk_presented_images.)
 #ifdef __ANDROID__
 #include <SDL3/SDL.h>
 #include <ctype.h>
@@ -29,6 +29,7 @@ extern "C" {
 const char *vk_gpu_desc(void);  // vulkan/device.c: "<device> - <driver>"
 double vk_frame_gpu_ms(void);   // vulkan/exec.c
 uint64_t vk_presented_images(void);    // vulkan/device.c: the window images shown, the game's and the generated ones
+uint64_t vk_game_frames(void);         // vulkan/device.c: the game's own frames presented (not the generated ones)
 int vk_fg_state(void);                  // vulkan/framegen.c: 1 generating, 2 on and waiting, 0 off, -1 unavailable
 }
 
@@ -142,22 +143,20 @@ static void chart(int metric, float y, uint32_t color, const char *label) {
 
 void perf_overlay_draw(ImVec2 display, float scale) {
     // the readings, twice a second (Swap2's samples)
-    static uint64_t next_ns, t0, shown0, last_sample;
-    static int frames;
+    static uint64_t next_ns, t0, shown0, game0, last_sample;
     static float shown = NAN, game_fps = NAN, gpu_ms = NAN;
     static int fg = 0;
     static PlatDeviceStats ds;
     uint64_t now = SDL_GetTicksNS();
     int items = g_settings.overlay_items;
-    frames++;
     if (now >= next_ns) {
-        uint64_t g = vk_presented_images();
-        if (t0) {
+        uint64_t g = vk_presented_images(), gf = vk_game_frames();
+        if (t0) {  // the raw rate: the game's frames; shown: every window image (generated ones too)
             double dt = (now - t0) / 1e9;
-            game_fps = (float)(frames / dt);
+            game_fps = (float)((gf - game0) / dt);
             shown = (float)((g - shown0) / dt);
         }
-        shown0 = g, frames = 0, t0 = now;
+        shown0 = g, game0 = gf, t0 = now;
         next_ns = now + 500000000ull;
         double gm = vk_frame_gpu_ms();
         gpu_ms = gm > 0 ? (float)gm : NAN;
