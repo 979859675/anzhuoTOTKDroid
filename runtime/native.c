@@ -336,6 +336,46 @@ static int fix_aspect_view(Cpu *c) { vset(c, 0, rt_widen_aspect(vget(c, 0) / vge
 // real time - a measured step's remainder in (0, FLT_EPSILON] kept weapon, shield and bow changes locked until a load.
 bool rt_realtime(void);  // nvn/objects.c
 static int fix_cooldown(Cpu *c) { if (!rt_realtime()) return 0; c->v[1] = 0; return 3; }  // movi v1.2s, #0x34, lsl #24
+// Optional rendering reductions, after totk-android's "opt-in game rendering reductions" (games/totk/runtime/
+// game_patches_v143.c, MIT, Copyright (c) 2026 MacNativeGames contributors; NOTICE.md) - the same sites, as hooks here:
+//  - the shadow map's size: main+0x6835a4 (fcvtzs w11, s18: the size from the distance) takes a fixed one, and its width
+//    modulation (+0x6835a8 ..) is skipped to +0x683604, where the original rounding and packing go on;
+//  - the game's own FXAA: its effective flag's store (main+0x586944, strb w9, [x0, #0x18c]) stores 0;
+//  - the render camera's far plane: main+0x628c30 (ldr s0, [x19, #0x138]) loads min(far, cap) and keeps it there.
+// rt_render_opts (nvn/objects.c: the settings, LARECOMP_SHADOW_RES / LARECOMP_GAME_FXAA / LARECOMP_FAR_CLAMP) says which.
+void rt_render_opts(int *shadow, int *fxaa, float *far_cap);
+static int fix_shadow_size(Cpu *c) {  // fcvtzs w11, s18
+    int shadow, fxaa;
+    float far_cap;
+    rt_render_opts(&shadow, &fxaa, &far_cap);
+    if (!shadow) return 0;
+    static int n;
+    if (n < 4) n++, LOG("[totk] shadow map %d instead of the game's %d\n", shadow, (int)vget(c, 18));
+    c->x[11] = (uint32_t)shadow;
+    return 1;  // (on at +0x683604)
+}
+static int fix_game_fxaa(Cpu *c) {  // strb w9, [x0, #0x18c]
+    int shadow, fxaa;
+    float far_cap;
+    rt_render_opts(&shadow, &fxaa, &far_cap);
+    if (fxaa) return 0;
+    *(uint8_t *)(uintptr_t)(c->x[0] + 0x18c) = 0;
+    return 3;
+}
+static int fix_far_clamp(Cpu *c) {  // ldr s0, [x19, #0x138]
+    int shadow, fxaa;
+    float far_cap, far;
+    rt_render_opts(&shadow, &fxaa, &far_cap);
+    if (far_cap <= 0) return 0;
+    memcpy(&far, (const void *)(uintptr_t)(c->x[19] + 0x138), 4);
+    if (far > far_cap) {
+        static int n;
+        if (n < 4) n++, LOG("[totk] far plane %.0f m capped at %.0f\n", far, far_cap);
+        far = far_cap, memcpy((void *)(uintptr_t)(c->x[19] + 0x138), &far, 4);
+    }
+    vset(c, 0, far);
+    return 3;
+}
 static int fix_fade_w8(Cpu *c) { return fade_step(c, 8); }
 static int fix_fade_w10(Cpu *c) { return fade_step(c, 10); }
 typedef struct { int version; uint64_t addr, alt; uint32_t word; int (*fn)(Cpu *); const char *what; } Fix;
@@ -374,6 +414,9 @@ static const Fix fixes[] = {  // (canonical addresses, 0x7000000000 + the offset
     {143, 0x7001ff04f4, 0, 0x1e211800, fix_aspect_view, "camera aspect (viewport)"},
     {143, 0x700253fbb0, 0, 0x1e211800, fix_aspect_view, "camera aspect (viewport)"},
     {143, 0x70002b036c, 0, 0x0f016681, fix_cooldown, "equipment-switch cooldown"},
+    {143, 0x70006835a4, 0x7000683604, 0x1e38024b, fix_shadow_size, "shadow map size"},
+    {143, 0x7000586944, 0, 0x39063009, fix_game_fxaa, "the game's FXAA"},
+    {143, 0x7000628c30, 0, 0xbd413a60, fix_far_clamp, "render far plane"},
 };
 int native_patch_c(Cpu *c, uint32_t i) { return fixes[i].fn(c); }
 

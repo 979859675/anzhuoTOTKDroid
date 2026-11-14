@@ -1839,6 +1839,29 @@ static int realtime_on(void) {
     return on;
 }
 bool rt_realtime(void) { return realtime_on(); }  // (tools/patches.py: the equipment-switch cooldown)
+
+// The optional rendering reductions (native.c fix_shadow_size / fix_game_fxaa / fix_far_clamp): shadow map size 0 (the
+// game's) or 288 / 256; the game's own FXAA on / off; the render far plane capped at that many metres (0: not).
+// LARECOMP_SHADOW_RES=<0|288|256>, LARECOMP_GAME_FXAA=<0|1>, LARECOMP_FAR_CLAMP=<metres>.
+void rt_render_opts(int *shadow, int *fxaa, float *far_cap) {
+    static int s = -1, f = -1;
+    static float fc = -1;
+    if (s < 0) {
+        const char *e = getenv("LARECOMP_SHADOW_RES");
+        int v = e ? atoi(e) : 0;
+        s = v == 288 || v == 256 ? v : 0;
+        e = getenv("LARECOMP_GAME_FXAA");
+        f = e ? atoi(e) != 0 : 1;
+        e = getenv("LARECOMP_FAR_CLAMP");
+        fc = e ? (float)atof(e) : 0;
+        if (s || !f || fc > 0) {
+            char far[32] = "unchanged";
+            if (fc > 0) snprintf(far, sizeof far, "at most %.0f m", fc);
+            LOG("[totk] rendering reductions: shadow maps %d, the game's FXAA %s, far plane %s\n", s, f ? "on" : "off", far);
+        }
+    }
+    *shadow = s, *fxaa = f, *far_cap = fc;
+}
 static void frame_step_update(uint64_t now_ns) {
     static uint64_t last;
     static double samples[5];

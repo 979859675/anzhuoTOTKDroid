@@ -25,4 +25,6 @@
   `audio_mixer.c` (Copyright (c) 2026 MacNativeGames contributors, MIT), whose reverb network is based on
   Ryujinx.Audio's Reverb3d (Copyright (c) Ryujinx Team and Contributors, MIT). The software keyboard in
   `runtime/hle/swkbd.c` (the argument layout, the UTF-16 / UTF-8 answer, the disabled keys and the cancel result)
-  follows its `games/totk/runtime/swkbd_host.c` (Copyright (c) 2026 MacNativeGames contributors, MIT).
+  follows its `games/totk/runtime/swkbd_host.c` (Copyright (c) 2026 MacNativeGames contributors, MIT). The optional
+  rendering reductions in `runtime/native.c` (shadow map size, the game's FXAA, the render far plane) use the sites
+  its `games/totk/runtime/game_patches_v143.c` found (same copyright, MIT).
