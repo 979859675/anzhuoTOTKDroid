@@ -25,6 +25,7 @@
 #include "../renderer.h"
 #include "../../settings.h"
 #include "../../paths.h"
+uint64_t renderer_present_count(void);  // (device.c: the game's present count; used before its definition below)
 
 // LARECOMP_AB (vk_ab, below): AB() costs no call while it is not set - it is asked per constant buffer and per pass
 static int ab_n = -1;  // (LARECOMP_AB's frame count; 0: no A/B)
