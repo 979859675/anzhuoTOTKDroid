@@ -103,6 +103,15 @@ static int nlclear;
 static uint32_t pass_written;  // (the attachments this pass's draws wrote so far: draw_writes)
 static uint32_t pass_dup_null;  // (color slots left unbound: their image is bound in another slot - begin_pass)
 
+// (diagnosis) LARECOMP_DRV_TIMES=1: time in the driver calls around submissions, per frame every 120 frames ("[drvt]")
+enum { DT_RESET_DS, DT_RESET_CMD, DT_BEGIN, DT_END, DT_SUBMIT, DT_COMPLETED, DT_ALLOC_SET, DT_AFTER, DT_N };
+static uint64_t drvt_ns[DT_N], drvt_n[DT_N];
+static int drvt_on = -1;
+static inline uint64_t drvt_t0(void) {
+    if (drvt_on < 0) drvt_on = getenv("LARECOMP_DRV_TIMES") != NULL;
+    return drvt_on ? plat_now_ns() : 0;
+}
+static inline void drvt_add(int k, uint64_t t0) { if (t0) drvt_ns[k] += plat_now_ns() - t0, drvt_n[k]++; }
 // The last submission the GPU finished. With the waiter thread (seq_thread_on, below) it is read from what that
 // thread saw; else asked of the driver, at most every LARECOMP_SEQ_CACHE_US (default 0: every time) - the value in
 // between is the last one read: it only grows, and a lower one only makes a caller free or reuse a little later.
@@ -179,8 +188,9 @@ uint64_t vk_completed_seq(void) {
         uint64_t at = atomic_load_explicit(&done_asked, memory_order_relaxed);
         if (at && now - at < (uint64_t)every) return atomic_load_explicit(&done_cached, memory_order_acquire);
     }
-    uint64_t v = 0;
+    uint64_t v = 0, t0 = drvt_t0();
     vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v);
+    drvt_add(DT_COMPLETED, t0);
     if (every) {
         done_note(v);
         atomic_store_explicit(&done_asked, now, memory_order_relaxed);
@@ -820,8 +830,12 @@ static Sub *sub(void) {
                 prof_gpu += (uint64_t)((double)(t[1] - t[0]) * g_vk.props.limits.timestampPeriod);
             s->ts = false;
         }
+        uint64_t t0 = drvt_t0();
         for (int i = 0; i < s->npools; i++) vkResetDescriptorPool(g_vk.dev, s->pools[i], 0);
+        drvt_add(DT_RESET_DS, t0);
+        t0 = drvt_t0();
         if (s->cpool) vkResetCommandPool(g_vk.dev, s->cpool, 0);
+        drvt_add(DT_RESET_CMD, t0);
         s->cur_pool = 0;
         s->seq = submit_seq + 1;
         s->main_begun = s->upload_begun = false;
@@ -844,7 +858,9 @@ static void begin_cb(Sub *s, VkCommandBuffer *cb, bool *begun) {
         VK_CHECK(vkAllocateCommandBuffers(g_vk.dev, &ai, cb));
     }
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    uint64_t t0 = drvt_t0();
     VK_CHECK(vkBeginCommandBuffer(*cb, &bi));
+    drvt_add(DT_BEGIN, t0);
     *begun = true;
 }
 
@@ -1018,7 +1034,9 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     }
 #endif
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
+    uint64_t te = drvt_t0();
     VK_CHECK(vkEndCommandBuffer(s->main));
+    drvt_add(DT_END, te);
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
     VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
                                      .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
@@ -1035,7 +1053,9 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
 #ifdef __ANDROID__
         uint64_t trace_start = vk_timing_trace_on() ? SDL_GetTicksNS() : 0;
 #endif
+        uint64_t ts = drvt_t0();
         VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+        drvt_add(DT_SUBMIT, ts);
 #ifdef __ANDROID__
         tl_add((int64_t)plat_now_ns(), wait || signal ? "render: submitted (present)" : "render: submitted", submit_seq + 1, 0);
         if (trace_start) vk_timing_trace_wait(VK_TIMING_SUBMIT, SDL_GetTicksNS() - trace_start);
@@ -1060,9 +1080,28 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     cur_sub = (cur_sub + 1) % SUBS;
     stat_flushes++;
     cum_submits++;
+    uint64_t ta = drvt_t0();
     ring_retire();
     vk_collect_dead();
     pipe_evict();
+    drvt_add(DT_AFTER, ta);
+    if (drvt_on > 0) {
+        static uint64_t at;
+        uint64_t f = renderer_present_count();
+        if (f >= at + 120) {
+            static const char *nm[DT_N] = {"reset ds pools", "reset cmd pool", "begin cb", "end cb", "submit", "completed seq", "alloc set", "after submit"};
+            uint64_t frames = at ? f - at : 1;
+            for (int k = 0; k < DT_N && at; k++)
+                LOG("[drvt] %-15s %6.3f ms/frame, %7.1f calls/frame, %6.1f us/call\n", nm[k], drvt_ns[k] / 1e6 / frames,
+                    (double)drvt_n[k] / frames, drvt_n[k] ? drvt_ns[k] / 1e3 / drvt_n[k] : 0.0);
+            extern uint64_t prof_tex_helper_jobs, prof_tex_helper_hits;
+            if (at) LOG("[drvt] texture checks on the helper: %.1f a frame, %.2f found differing\n", (double)prof_tex_helper_jobs / frames,
+                        (double)prof_tex_helper_hits / frames);
+            prof_tex_helper_jobs = prof_tex_helper_hits = 0;
+            memset(drvt_ns, 0, sizeof drvt_ns), memset(drvt_n, 0, sizeof drvt_n);
+            at = f;
+        }
+    }
 }
 
 void renderer_submit(void) { vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE); }
@@ -1131,7 +1170,9 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
         VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                           .descriptorPool = s->pools[s->cur_pool], .descriptorSetCount = 1, .pSetLayouts = &layout};
         VkDescriptorSet set;
+        uint64_t t0 = drvt_t0();
         VkResult r = vkAllocateDescriptorSets(g_vk.dev, &ai, &set);
+        drvt_add(DT_ALLOC_SET, t0);
         if (r == VK_SUCCESS) return set;
         s->cur_pool++;
     }
@@ -1336,8 +1377,16 @@ static void guest_copy_invalidate(uint64_t lo, uint64_t hi) {
 static VkBuffer gmem_buf;  // (the heap's GPU buffer, below)
 static struct { uint64_t lo, hi, seq; } bcopy_pend[BCOPY_PEND];
 static int bcopy_npend;
+static uint64_t bcopy_done, bcopy_done_at;  // (bcopy_pending: the GPU's progress as last asked, and in which submission)
 static bool bcopy_pending(uint64_t lo, uint64_t hi) {  // (render thread) drops the done ones; is [lo, hi) still to land?
-    uint64_t done = vk_completed_seq();
+    // The GPU's progress is a driver call (vkGetSemaphoreCounterValue: an ioctl on Turnip / KGSL, ~0.8 us), and every
+    // guest_copy came here while any copy was pending: ~3000 a frame on the surface, 1.7 ms of the render thread's
+    // ~17 (POCO F7 Ultra, 2026-11-14). Asked once a submission instead (gpu_buffer_copy always asks): for guest_copy
+    // an older answer only keeps a landed copy's range bound in place in the heap, which holds its bytes all the same.
+    // LARECOMP_AB=<frames>:bcpoll alternates it (side 0: asked every call, as before).
+    uint64_t done;
+    if (bcopy_done_at == vk_pending_seq() && AB("bcpoll") != 0) done = bcopy_done;
+    else done = bcopy_done = vk_completed_seq(), bcopy_done_at = vk_pending_seq();
     bool hit = false;
     int k = 0;
     for (int i = 0; i < bcopy_npend; i++) {
@@ -4632,6 +4681,8 @@ static bool gmem_placed;  // (gmem_buf is the guest heap itself, usable as a uni
 static bool gpu_buffer_copy(uint64_t src, uint64_t dst, uint64_t size) {
     static int on = -1;
     if (on < 0) on = !getenv("LARECOMP_VK_GPU_BUFCOPY") || atoi(getenv("LARECOMP_VK_GPU_BUFCOPY"));
+    bcopy_done_at = 0;  // (below: the GPU's progress asked afresh - an old answer would send the copy to the CPU's wait)
+    if (bcopy_npend >= BCOPY_PEND) bcopy_pending(0, 0);  // (full: the done ones dropped first)
     if (!on || AB("bufcopy") == 0 || !gmem_placed || !size || size > 4096 || bcopy_npend >= BCOPY_PEND) return false;
     if (src < HEAP_BASE || src + size > HEAP_BASE + gmem_size || dst < HEAP_BASE || dst + size > HEAP_BASE + gmem_size) return false;
     if (src < dst + size && dst < src + size) return false;

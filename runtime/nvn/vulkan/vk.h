@@ -123,6 +123,8 @@ typedef struct TexBackend {
     uint8_t skip;                 // first guest mip retained on low-RAM devices
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     uint16_t same_run;    // (a large dynamic texture: full hashes in a row that found it unchanged - textures.c)
+    uint8_t check_suspect;  // (textures.c tex_check thread: its sample differed - checked on the render thread at the next
+                            // use; __atomic builtins)
     uint64_t dyn_sample;  // (and its sampled hash at the last full one)
     bool discarded; // (low RAM) its guest bytes given back to the OS after the upload: zero pages there (textures.c)
     uint64_t disc_hash;  // (discarded) the full hash of its memory right after: still that one = unchanged

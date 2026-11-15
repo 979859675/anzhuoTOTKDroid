@@ -775,6 +775,7 @@ static TexBackend *tex_backend(NvnTexture *t) {
 }
 
 static void texture_snapshot_forget(TexBackend *b);
+static void tex_check_forget(TexBackend *b);
 
 void backend_texture_destroyed(NvnTexture *t) {
     TexBackend *b = t->backend;
@@ -788,6 +789,7 @@ void backend_texture_destroyed(NvnTexture *t) {
     live_remove(b);
     destroy_image(b);
     texture_snapshot_forget(b);
+    tex_check_forget(b);
     free(b->pending_rgba);
     free(b);
     t->backend = NULL;
@@ -1068,17 +1070,84 @@ static uint64_t tex_hash_big(const uint8_t *p, uint64_t n) {
     return r ^ n;
 }
 
+// ---- the sampled checks of textures not seen changing, on a helper thread (the render thread queues them and goes
+// on): a sample that differs marks the texture (check_suspect), and its next use checks it on the render thread at once
+// - instead of at its turn, one frame in eight. A change shows up a frame later at most than when the render thread
+// sampled it itself. Destroying a texture waits for the helper to be done with it (tex_check_forget). Their strided
+// reads, a cache miss each, were ~3% of the render thread on TOTK's surface; moved, −0.38 ms a frame (55-80 checks a
+// frame, POCO F7 Ultra, 2026-11-15; prefetching the reads instead gained nothing). LARECOMP_TEX_CHECK_THREAD=0: on the
+// render thread, as before; LARECOMP_AB=<frames>:texhelper alternates it.
+enum { TCHECK_N = 1024 };
+static struct { TexBackend *b; const uint8_t *mem; uint64_t size, expect; } tcheck_q[TCHECK_N];
+static unsigned tcheck_head, tcheck_tail;  // (head: next to take; tail: next free - under tcheck_lock)
+static TexBackend *tcheck_cur;             // (the one the helper is hashing now)
+static pthread_mutex_t tcheck_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t tcheck_more = PTHREAD_COND_INITIALIZER, tcheck_idle = PTHREAD_COND_INITIALIZER;
+static int tcheck_started;
+uint64_t prof_tex_helper_jobs, prof_tex_helper_hits;  // (LARECOMP_VK_PROF-style counters: queued, found differing)
+static void *tcheck_main(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&tcheck_lock);
+    for (;;) {
+        while (tcheck_head == tcheck_tail) pthread_cond_wait(&tcheck_more, &tcheck_lock);
+        unsigned i = tcheck_head++ % TCHECK_N;
+        TexBackend *b = tcheck_q[i].b;
+        if (!b) continue;  // (forgotten: tex_check_forget)
+        const uint8_t *mem = tcheck_q[i].mem;
+        uint64_t size = tcheck_q[i].size, expect = tcheck_q[i].expect;
+        tcheck_cur = b;
+        pthread_mutex_unlock(&tcheck_lock);
+        bool differs = tex_hash_sample(mem, size) != expect;
+        pthread_mutex_lock(&tcheck_lock);
+        if (differs) __atomic_store_n(&b->check_suspect, 1, __ATOMIC_RELEASE), prof_tex_helper_hits++;
+        tcheck_cur = NULL;
+        pthread_cond_broadcast(&tcheck_idle);
+    }
+    return NULL;
+}
+static bool tex_check_thread_on(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("LARECOMP_TEX_CHECK_THREAD") || atoi(getenv("LARECOMP_TEX_CHECK_THREAD"));
+    extern int vk_ab(const char *what);
+    int ab = vk_ab("texhelper");
+    return ab >= 0 ? ab == 1 : on;
+}
+static bool tex_check_queue(TexBackend *b, const uint8_t *mem, uint64_t size, uint64_t expect) {  // false: full queue
+    pthread_mutex_lock(&tcheck_lock);
+    if (!tcheck_started) {
+        pthread_t th;
+        tcheck_started = pthread_create(&th, NULL, tcheck_main, NULL) == 0 ? 1 : -1;
+        if (tcheck_started > 0) pthread_setname_np(th, "tex check");
+    }
+    bool ok = tcheck_started > 0 && tcheck_tail - tcheck_head < TCHECK_N;
+    if (ok) {
+        tcheck_q[tcheck_tail++ % TCHECK_N] = (typeof(tcheck_q[0])){b, mem, size, expect};
+        prof_tex_helper_jobs++;
+        pthread_cond_signal(&tcheck_more);
+    }
+    pthread_mutex_unlock(&tcheck_lock);
+    return ok;
+}
+static void tex_check_forget(TexBackend *b) {  // (before b is freed)
+    pthread_mutex_lock(&tcheck_lock);
+    for (unsigned i = tcheck_head; i != tcheck_tail; i++)
+        if (tcheck_q[i % TCHECK_N].b == b) tcheck_q[i % TCHECK_N].b = NULL;
+    while (tcheck_cur == b) pthread_cond_wait(&tcheck_idle, &tcheck_lock);
+    pthread_mutex_unlock(&tcheck_lock);
+}
 static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (!t->addr || t->target == 10) return;
     uint64_t frame = vk_frame_counter();
     if (b->uploaded && b->checked_frame == frame) return;
-    if (b->uploaded && !b->dynamic && ((frame + ((uintptr_t)b >> 6)) & 7)) return;
+    if (b->uploaded && !b->dynamic && ((frame + ((uintptr_t)b >> 6)) & 7) && !__atomic_load_n(&b->check_suspect, __ATOMIC_ACQUIRE))
+        return;
     const FormatInfo *fi = t->layout.fmt;
     if (!fi || !fi->bpb) return;
     VkFmt mf = fmt_of(t->format);
     uint64_t total = tegra_total_size(&t->layout);
     b->checked_frame = frame;
     prof_tex_checks++;
+    bool suspect = __atomic_load_n(&b->check_suspect, __ATOMIC_ACQUIRE) && __atomic_exchange_n(&b->check_suspect, 0, __ATOMIC_ACQ_REL);
     if (t->flags & 0x10) b->dynamic = true;
     if (full_hash_budget_frame != frame) { full_hash_budget_frame = frame; full_hash_budget = 4 << 20; }
     const uint8_t *mem = (const uint8_t *)(uintptr_t)t->addr;
@@ -1189,6 +1258,9 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     }
     if (!full && !restyle) {
         prof_tex_samples++;
+        // (a texture not seen changing: its sample on the helper thread, unless that already found it differing)
+        if (fast && !suspect && b->uploaded && !b->dynamic && tex_check_thread_on() && tex_check_queue(b, mem, total, b->sample_hash))
+            return;
         uint64_t sh = fast ? tex_hash_sample(mem, total) : fnv_sample(mem, total);
         if (sh == b->sample_hash) return;
     }
