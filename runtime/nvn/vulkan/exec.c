@@ -3446,9 +3446,15 @@ static bool snap_ok[8];
 static bool snap_fb_dirty[8];
 static const char *snap_why[8];
 static const char *snap_reason = "?";
+static bool snap_any;  // (some snap_ok set: the invalidations each draw makes for its targets look no further without one)
 static void snapshots_invalidate(NvnTexture *t) {
-    for (int i = 0; i < 8; i++)
+    if (!snap_any) return;
+    bool any = false;
+    for (int i = 0; i < 8; i++) {
         if ((!t || snap_tex[i] == t) && snap_ok[i]) { snap_ok[i] = false; snap_fb_dirty[i] = false; snap_why[i] = snap_reason; }
+        any |= snap_ok[i];
+    }
+    snap_any = any;
 }
 static void snapshots_mark_fb_dirty(NvnTexture *t) {
     for (int i = 0; i < 8; i++) if (snap_tex[i] == t && snap_ok[i]) snap_fb_dirty[i] = true;
@@ -3934,7 +3940,7 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
                     if (si < 0 || !snap_ok[si]) {
                         if (in_pass && !st.rt_dirty && (pass_written & bit)) st.rt_dirty = true, stat_inplace_breaks++;
                         if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
-                        snap_ok[si] = true;
+                        snap_ok[si] = true, snap_any = true;
                         snap_fb_dirty[si] = false;
                     }
                     if (ninplace < 4) inplace_tex[ninplace++] = t;
@@ -3986,7 +3992,7 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
             feedback_snap[nfeedback] = dst;
             feedback_view[nfeedback++] = vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
             if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
-            snap_ok[si] = true;
+            snap_ok[si] = true, snap_any = true;
             snap_fb_dirty[si] = false;
             st.rt_dirty = true;
         }

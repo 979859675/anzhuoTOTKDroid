@@ -1941,12 +1941,17 @@ VkSampler vk_sampler_point(NvnSamplerDesc *d) {
 // garbage: the grass stretched and black (#307 Immortalis-G715, #258 G68; #244, Propinbo). Those take the sampler's
 // nearest twin instead (exec.c). LARECOMP_NO_FILTER_FALLBACK=1: as before.
 bool vk_format_filters_linear(VkFormat f) {
+    // (asked for every texture a draw binds: the core formats, < 256, answered from a table - a search of the list
+    // below was 1% of the render thread on the POCO F7 Ultra, simpleperf 2026-11-14)
+    static int8_t direct[256];  // 0 not asked yet, 1 filters, -1 doesn't
+    if ((unsigned)f < 256 && direct[f]) return direct[f] > 0;
     static struct { VkFormat f; bool ok; } cache[64];
     static int n;
     for (int i = 0; i < n; i++) if (cache[i].f == f) return cache[i].ok;
     bool ok = format_supports(f, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) || getenv("LARECOMP_NO_FILTER_FALLBACK");
     if (!ok) LOG("[vk] format %d can't be filtered linearly on this GPU: its textures sampled nearest\n", f);
-    if (n < 64) cache[n].f = f, cache[n].ok = ok, n++;
+    if ((unsigned)f < 256) direct[f] = ok ? 1 : -1;
+    else if (n < 64) cache[n].f = f, cache[n].ok = ok, n++;
     return ok;
 }
 
