@@ -227,9 +227,68 @@ default for any Turnip, and no longer signals the timeline.
 So the texture checks have little left that is cheap. The big remaining item is (c): moving the Vulkan recording to a
 replay thread. It needs the user's go-ahead, because of its size and risk.
 
+## (c) The replay thread: first stages (2026-11-15, morning; work in progress)
+
+The user gave the go-ahead. `runtime/nvn/vulkan/replay.h` / `replay.c`, off by default (`LARECOMP_VK_REPLAY=1`;
+`LARECOMP_AB=<frames>:replay` alternates it between submissions; `LARECOMP_VK_REPLAY_LOG=1`: packets, the replay thread's
+time per packet type, the render thread's waits for the ring and where they come from).
+
+**How it works.**
+- `draw_` writes the draw's commands into a single-producer ring of packets instead of calling Turnip: the pipeline,
+  the dynamic state, the descriptor sets with their offsets, the vertex and index buffers, the draw.
+- The same goes for the commands between passes (end of rendering, the full barrier, begin of rendering with the
+  attachments copied), compute dispatches (barrier, binds, dispatch), and the write-back copies at the end of a pass.
+- A "vk replay" thread calls the driver for them, in order.
+- **Order is kept by construction.** `vk_rp_install` puts a check in front of every volk `vkCmd*` pointer the
+  runtime and ImGui use. A command into the buffer the packets go to first waits until the ring is empty (so do
+  `vk_cmd()`, the command pool calls, `vk_async_drain`, and the heap re-import).
+- So any recording not converted to packets stays correct, and only costs a wait.
+- The upload buffer gets its own command pool, since one pool's buffers may not record on two threads.
+- An Opus review of the ring, the encoding and the lifetimes found two use-after-free risks, both fixed: the heap
+  buffer destroyed on growth while queued binds still named it, and `vk_async_drain` not waiting for the ring.
+
+**What was measured on the POCO** (surface save copy, forced 60):
+- **Stable, and the image looks right**, in every run.
+- **First version (draws only): worse** (15.46 → 18.90 ms render).
+  - The render thread waited for the ring at every pass end (~150 a frame) and at every wake-up of the replay thread.
+  - The replay thread slept after 50 µs idle, and a `sched_yield` in the wait handed the render thread's core to a
+    game thread for a whole slice.
+  - Fixed:
+    - pass begin / end / barrier, dispatches and write-backs became packets;
+    - no `sched_yield`;
+    - the replay thread spins 2 ms before sleeping;
+    - one publish of the ring position per draw instead of per packet;
+    - the free space is cached.
+- **With those fixes: −0.19 ms** (15.39 → 15.20 ms, 6 of 6 pairs, fps the same at the cap).
+  - A later A/B was noisy: the phone was heating, and its battery was running out.
+  - About 23 waits a frame are left, ~2.6 ms in all: depth clears inside passes (`clear()`, ~11 a frame, ~1.3 ms),
+    the mid-frame submissions (`begin_pass` chunking, ~4 a frame), the end of each submission.
+- **The profile says more than the `render` field.**
+  - With replay on, the render thread is on its core ~10 ms a frame, against ~15 ms without (simpleperf, 20 s).
+  - The `render` field counts its waits too (at a held 30 fps it reads ~30 ms), so at the 60 cap it can't show a
+    thread that got faster.
+  - The replay thread spends ~5 ms a frame in Turnip, against ~4.3 ms when the render thread did it. Per-packet
+    timing exaggerates that: its own clock reads cost ~1 ms.
+- **Not measured yet, and needed**: an uncapped A/B with the phone charged.
+  - The last two runs ran with the battery at 1%: the CPU was capped at 1.4 GHz and the game sat at ~28 fps on both
+    sides. They are discarded.
+  - The question is whether the ~5 ms the render thread no longer spends turns into fps, or whether the GPU and the
+    game's threads hold the frame at the cap.
+  - Also whether the spinning core costs fps through the phone's power budget: some blocks hinted at it.
+
+**Next, in order**:
+1. Uncapped and capped A/Bs with the phone charged.
+2. Clears inside passes as packets (`vkCmdClearAttachments`, the clear draw's binds).
+3. The submission itself on the replay thread (end, submit), so the render thread stops waiting at each of the
+   ~10 submissions a frame.
+4. Then decide the default. It stays off until a measured gain.
+
 ## Files
 
 - `runtime/nvn/vulkan/exec.c`: `bcopy_pending` / `gpu_buffer_copy` (the fix), `LARECOMP_DRV_TIMES` (the probe).
 - `runtime/nvn/vulkan/textures.c`: the texture check helper (`tcheck_*`, `tex_check_forget`); `vk.h`: `check_suspect`.
+- `runtime/nvn/vulkan/replay.h` / `replay.c`: the replay thread (the ring, the packets, the checks in front of volk's
+  pointers); `exec.c`: `vk_cmd_rp`, the `rpCmd*` calls in `draw_`, `begin_pass`, `vk_end_pass`, `dispatch_compute`,
+  `wb_queue`; the GPU waits by cause in `[drvt]`.
 - Measurements and scripts (copied to the sessions' notes folder, `render-thread-scripts/`, with the profile report): `rt_spot.sh` (a run from a save copy, with simpleperf),
   `rt_analyze.py` (the render thread by leaf, caller and line), `ab_sum.py` (A/B blocks from `[pace]` lines).

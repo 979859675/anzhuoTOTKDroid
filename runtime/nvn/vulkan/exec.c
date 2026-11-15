@@ -23,6 +23,7 @@
 #include "vk.h"
 #include "buffer_copy.h"
 #include "timing_trace.h"
+#include "replay.h"
 #include "../renderer.h"
 #include "../../settings.h"
 #include "../../paths.h"
@@ -76,6 +77,7 @@ void vk_collect_dead(void);
 typedef struct {
     VkCommandBuffer main, upload;
     VkCommandPool cpool;  // (their own pool, reset whole when the slot is reused - begin_cb)
+    VkCommandPool upool;  // (with the replay thread, replay.h: the upload buffer's own - it records while the main one does)
     bool main_begun, upload_begun, ts;  // ts: GPU timestamps written (profiling)
     uint64_t seq;
     VkDescriptorPool pools[16];
@@ -551,8 +553,9 @@ void vk_pace_frame(void) {
             if (renderer_present_count() >= hot_at) {
                 hot_at = renderer_present_count() + 600;
                 extern int kernel_hot_tids(int32_t *out, int max);
-                int32_t tids[8];
+                int32_t tids[9];
                 int n = kernel_hot_tids(tids, 8);
+                if (vk_rp_tid()) tids[n++] = vk_rp_tid();  // (the replay thread's work is on the frame's path too)
                 if (n) plat_adpf_extra_threads(tids, n);
             }
         }
@@ -887,6 +890,7 @@ static Sub *sub(void) {
         drvt_add(DT_RESET_DS, t0);
         t0 = drvt_t0();
         if (s->cpool) vkResetCommandPool(g_vk.dev, s->cpool, 0);
+        if (s->upool) vkResetCommandPool(g_vk.dev, s->upool, 0);
         drvt_add(DT_RESET_CMD, t0);
         s->cur_pool = 0;
         s->seq = submit_seq + 1;
@@ -900,12 +904,15 @@ static Sub *sub(void) {
 // allocated it again while recording (vkBeginCommandBuffer ~6% of the render thread, plus malloc / munmap).
 static void begin_cb(Sub *s, VkCommandBuffer *cb, bool *begun) {
     if (*begun) return;
-    if (!s->cpool) {
+    // (a command pool's buffers may not record on two threads at once: with the replay thread the upload buffer has
+    // a pool of its own)
+    VkCommandPool *pool = cb == &s->upload && vk_rp_installed() ? &s->upool : &s->cpool;
+    if (!*pool) {
         VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = g_vk.qfam};
-        VK_CHECK(vkCreateCommandPool(g_vk.dev, &pi, NULL, &s->cpool));
+        VK_CHECK(vkCreateCommandPool(g_vk.dev, &pi, NULL, pool));
     }
     if (!*cb) {
-        VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = s->cpool,
+        VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = *pool,
                                           .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
         VK_CHECK(vkAllocateCommandBuffers(g_vk.dev, &ai, cb));
     }
@@ -941,7 +948,16 @@ static void upload_begin_barrier(VkCommandBuffer cb) {
 #endif
     vk_full_barrier(cb);
 }
+// vk_cmd_rp: the main buffer for packets (replay.h) - its caller records only through rpCmd*; vk_cmd: for recording
+// here, after the replay thread has caught up
+static VkCommandBuffer vk_cmd_rp(void);
 VkCommandBuffer vk_cmd(void) {
+#ifdef __ANDROID__
+    if (atomic_load_explicit(&rp_rpos, memory_order_acquire) != rp_w) vk_rp_drain_at(__builtin_return_address(0));
+#endif
+    return vk_cmd_rp();
+}
+static VkCommandBuffer vk_cmd_rp(void) {
     Sub *s = sub();
     if (!s->main_begun) {
         begin_cb(s, &s->main, &s->main_begun);
@@ -1087,8 +1103,15 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
 #endif
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
     uint64_t te = drvt_t0();
-    VK_CHECK(vkEndCommandBuffer(s->main));
+    VK_CHECK(vkEndCommandBuffer(s->main));  // (after the replay thread's packets: replay.c's check in front of it)
     drvt_add(DT_END, te);
+    {   // the replay thread (replay.h) on or off from the next submission: LARECOMP_VK_REPLAY / LARECOMP_AB=<frames>:replay
+        static int env = -1;
+        if (env < 0) env = getenv("LARECOMP_VK_REPLAY") && atoi(getenv("LARECOMP_VK_REPLAY")) != 0;
+        int ab = vk_rp_installed() ? AB("replay") : -1;
+        vk_rp_latch(ab >= 0 ? ab == 1 : env);
+        vk_rp_frame();
+    }
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
     VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
                                      .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
@@ -1171,6 +1194,18 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
                 if (at) LOG("[drvt] texture upload checks a frame: %.1f; snapshot compares %.2f MB\n",
                             (double)(prof_tex_checks - checks0) / frames, (prof_tex_snap_bytes - snap0) / 1048576.0 / frames);
                 snap0 = prof_tex_snap_bytes, checks0 = prof_tex_checks;
+            }
+            {   // the GPU waits by cause (wait_tab: every thread's)
+                char b[768];
+                int n = 0;
+                pthread_mutex_lock(&wait_tab_lock);
+                for (int i = 0; i < 12 && wait_tab[i].why && n < 700; i++) {
+                    if (at) n += snprintf(b + n, sizeof b - n, " %s %.1f/%.3fms", wait_tab[i].why, (double)wait_tab[i].n / frames,
+                                          wait_tab[i].ns / 1e6 / frames);
+                    wait_tab[i].n = wait_tab[i].ns = 0;
+                }
+                pthread_mutex_unlock(&wait_tab_lock);
+                if (at && n) LOG("[drvt] GPU waits a frame:%s\n", b);
             }
             memset(drvt_ns, 0, sizeof drvt_ns), memset(drvt_n, 0, sizeof drvt_n);
             at = f;
@@ -2115,16 +2150,13 @@ static void wb_queue(NvnTexture *t, uint32_t lv) {
             LOG("[wb-frame] %llu: %ux%u f%#x flags %#x at %llx, submission %llu\n", (unsigned long long)renderer_present_count(),
                 t->width, t->height, t->format, t->flags, (unsigned long long)t->addr, (unsigned long long)e->seq);
     }
-    VkCommandBuffer cb = vk_cmd();
-    vk_full_barrier(cb);
+    VkCommandBuffer cb = vk_cmd_rp();  // (packets for the replay thread while rp_on, replay.h)
+    rpFullBarrier(cb);
     VkBufferImageCopy c = {.bufferOffset = (VkDeviceSize)off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, 1},
                            .imageExtent = {lvw, lvh, 1}};
-    vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, wb_buf, 1, &c);
-    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
-                           .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
-    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
-    vkCmdPipelineBarrier2(cb, &di);
+    rpCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, wb_buf, &c);
+    rpMemBarrier(cb, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
+                 VK_ACCESS_2_HOST_READ_BIT);
     stat_wb++;
     static int nlog;  // LARECOMP_LOG_WRITEBACK=1: the targets written back
     static int lw = -2;  // (=<w> > 1: only targets that wide)
@@ -2285,7 +2317,8 @@ void vk_end_pass(void) { vk_end_pass_at(0); }
 static void vk_end_pass_at(int line) {
     if (!in_pass) return;
     if (prof && line < 4096) prof_end_line[line]++;
-    vk_end_rendering(vk_cmd());
+    if (g_vk.dyn_render && rp_on) rpCmdEndRendering(vk_cmd_rp());  // (a packet for the replay thread, replay.h)
+    else vk_end_rendering(vk_cmd());
     in_pass = false;
     {   extern TexBackend *g_dump_sampled;
         if (g_dump_sampled) { TexBackend *db = g_dump_sampled; g_dump_sampled = NULL; dump_layers_raw(db); }
@@ -2432,11 +2465,11 @@ static void begin_pass(void) {
     vk_bc_shadows_resolve(st.rt.color, st.rt.cview, st.rt.has_cview, st.rt.ncolor);  // (BC textures drawn into before: decoded, unless this pass draws on)
 #endif
     st.rt_dirty = false;
-    VkCommandBuffer cb = vk_cmd();
+    VkCommandBuffer cb = vk_cmd_rp();  // (the barrier and the begin: packets for the replay thread while rp_on, replay.h)
     static int no_barrier = -1;  // (LARECOMP_VK_NO_PASS_BARRIER=1: none - unsafe, a measurement of what it costs)
     if (no_barrier < 0) no_barrier = getenv("LARECOMP_VK_NO_PASS_BARRIER") != NULL;
     extern int vk_ab(const char *what);
-    if (!no_barrier && AB("nobarrier") != 1) vk_full_barrier(cb);  // passes, copies and dispatches see each other's results
+    if (!no_barrier && AB("nobarrier") != 1) rpFullBarrier(cb);  // passes, copies and dispatches see each other's results
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
@@ -2644,8 +2677,9 @@ static void begin_pass(void) {
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {minw, minh}}, .layerCount = 1,
                           .colorAttachmentCount = pass_ncolor, .pColorAttachments = ca,
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
-    vk_begin_rendering(cb, &ri, pass_color, pass_depth != VK_FORMAT_UNDEFINED ? pass_depth : pass_stencil,
-                       (VkSampleCountFlagBits)pass_samples);
+    if (!g_vk.dyn_render || !rpCmdBeginRendering(cb, &ri))
+        vk_begin_rendering(cb, &ri, pass_color, pass_depth != VK_FORMAT_UNDEFINED ? pass_depth : pass_stencil,
+                           (VkSampleCountFlagBits)pass_samples);
     if (g_debug_frame) {  // (LARECOMP_DEBUG_RT=<n>: the pass's color target n where it has one, else its first)
         static int rt_i = -1;
         if (rt_i < 0) rt_i = getenv("LARECOMP_DEBUG_RT") ? atoi(getenv("LARECOMP_DEBUG_RT")) & 7 : 0;
@@ -2765,7 +2799,7 @@ static void apply_scissor(void) {
     VkRect2D r = scissor_rect();
     if (!ss_need(SS_SC, !memcmp(&r, &ss.sc, sizeof r))) return;
     ss.sc = r;
-    vkCmdSetScissor(vk_cmd(), 0, 1, &r);
+    rpCmdSetScissor(vk_cmd_rp(), 0, 1, &r);
 }
 
 // Metal convention (y up in NDC, origin top-left) through a negative-height viewport.
@@ -2775,7 +2809,7 @@ static void set_viewport(float x, float y, float w, float h, float zn, float zf)
     VkViewport vp = {x, y + h, w, -h, fminf(fmaxf(zn, 0), 1), fminf(fmaxf(zf, 0), 1)};
     if (!ss_need(SS_VP, !memcmp(&vp, &ss.vp, sizeof vp))) return;
     ss.vp = vp;
-    vkCmdSetViewport(vk_cmd(), 0, 1, &vp);
+    rpCmdSetViewport(vk_cmd_rp(), 0, 1, &vp);
 }
 
 // ================================================================== clears
@@ -4885,6 +4919,7 @@ static bool gmem_import(uint64_t size) {
     if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, mem, NULL); return false; }
     vkBindBufferMemory(g_vk.dev, buf, mem, 0);
     if (gmem_buf) {  // the heap grew: the old import may still be in use by submitted work
+        vk_rp_drain();  // (and by packets the replay thread hasn't recorded yet: replay.h)
         vk_wait_seq(submit_seq);
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
         vkFreeMemory(g_vk.dev, gmem_mem, NULL);
@@ -6976,10 +7011,10 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
 #ifdef __ANDROID__
     vk_bc_shadows_resolve(NULL, NULL, NULL, 0);  // (BC textures drawn into: decoded before anything outside a pass reads them)
 #endif
-    VkCommandBuffer cb = vk_cmd();
+    VkCommandBuffer cb = vk_cmd_rp();  // (the barrier, binds and dispatch: packets for the replay thread while rp_on)
     bool chained = dchain && cb == dchain_cb && dchain_ok();
     if (chained) stat_dchained++;
-    else vk_full_barrier(cb);
+    else rpFullBarrier(cb);
     dchain = false;
     dchain_after = false;
     gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx gmem %d", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
@@ -7000,9 +7035,9 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
 #endif
     if (cp->si->uses_gmem_map) gfast_prepare(cb);
     VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL, NULL, NULL);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
-    vkCmdDispatch(cb, gx, gy, gz);
+    rpCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
+    rpCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
+    rpCmdDispatch(cb, gx, gy, gz);
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
     if (cp->si->uses_gmem_store) vc_mark_sbufs(5), note_gmem_store(5);
     stat_dispatches++;
@@ -7497,7 +7532,7 @@ static void draw_(CmdRec *r, bool indexed) {
         gres_premerge((pr->vi->uses_gmem_map ? 1u : 0u) | (pr->fi->uses_gmem_map ? 2u : 0u));  // (before the pass opens)
 #endif
     begin_pass();
-    VkCommandBuffer cb = vk_cmd();
+    VkCommandBuffer cb = vk_cmd_rp();  // (the draw's commands: packets for the replay thread while rp_on, replay.h)
 
     uint32_t mode = (uint32_t)r->x[0];
     VkPrimitiveTopology topo;
@@ -7678,36 +7713,36 @@ static void draw_(CmdRec *r, bool indexed) {
         return;
     }
     ss_enabled();
-    if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; stat_pipe_binds++; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
+    if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; stat_pipe_binds++; rpCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
     pp->used = SDL_GetTicksNS(), pp->seq = vk_pending_seq();  // (pipe_evict)
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_key += prof_td_ - prof_tk_;
 
     // ---- depth / stencil (dynamic; without extended dynamic state the calls but the masks' do nothing - device.c - and
     // the pipeline has them, PipeKey.fx)
-    if (ss_need(SS_DT, ss.dt == (VkBool32)dt)) { ss.dt = dt; vkCmdSetDepthTestEnable(cb, dt); }
-    if (ss_need(SS_DW, ss.dw == dw)) { ss.dw = dw; vkCmdSetDepthWriteEnable(cb, dw); }
-    if (ss_need(SS_DOP, ss.dop == dop)) { ss.dop = dop; vkCmdSetDepthCompareOp(cb, dop); }  // (EQUAL's tolerance: above)
-    if (ss_need(SS_STEN, ss.sten == (VkBool32)sten)) { ss.sten = sten; vkCmdSetStencilTestEnable(cb, sten); }
+    if (ss_need(SS_DT, ss.dt == (VkBool32)dt)) { ss.dt = dt; rpCmdSetDepthTestEnable(cb, dt); }
+    if (ss_need(SS_DW, ss.dw == dw)) { ss.dw = dw; rpCmdSetDepthWriteEnable(cb, dw); }
+    if (ss_need(SS_DOP, ss.dop == dop)) { ss.dop = dop; rpCmdSetDepthCompareOp(cb, dop); }  // (EQUAL's tolerance: above)
+    if (ss_need(SS_STEN, ss.sten == (VkBool32)sten)) { ss.sten = sten; rpCmdSetStencilTestEnable(cb, sten); }
     if (sten) {
         for (int f = 0; f < 2; f++) {
             VkStencilFaceFlags face = f ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
             const uint32_t *v = sface[f];
             if (!ss_need(f ? SS_SFACE1 : SS_SFACE0, !memcmp(v, ss.sface[f], sizeof sface[f]))) continue;
             memcpy(ss.sface[f], v, sizeof sface[f]);
-            vkCmdSetStencilOp(cb, face, (VkStencilOp)v[0], (VkStencilOp)v[1], (VkStencilOp)v[2], (VkCompareOp)v[3]);
-            vkCmdSetStencilCompareMask(cb, face, v[4]);
-            vkCmdSetStencilWriteMask(cb, face, v[5]);
-            vkCmdSetStencilReference(cb, face, v[6]);
+            rpCmdSetStencilOp(cb, face, (VkStencilOp)v[0], (VkStencilOp)v[1], (VkStencilOp)v[2], (VkCompareOp)v[3]);
+            rpCmdSetStencilCompareMask(cb, face, v[4]);
+            rpCmdSetStencilWriteMask(cb, face, v[5]);
+            rpCmdSetStencilReference(cb, face, v[6]);
         }
     }
-    if (ss_need(SS_BC, !memcmp(ss.bc, st.blend_color, sizeof ss.bc))) { memcpy(ss.bc, st.blend_color, sizeof ss.bc); vkCmdSetBlendConstants(cb, st.blend_color); }
+    if (ss_need(SS_BC, !memcmp(ss.bc, st.blend_color, sizeof ss.bc))) { memcpy(ss.bc, st.blend_color, sizeof ss.bc); rpCmdSetBlendConstants(cb, st.blend_color); }
 
     // ---- rasterizer (as above: computed before the pipeline)
-    if (ss_need(SS_CULL, ss.cull == cm)) { ss.cull = cm; vkCmdSetCullMode(cb, cm); }
-    if (ss_need(SS_FF, ss.ff == ff)) { ss.ff = ff; vkCmdSetFrontFace(cb, ff); }
-    if (ss_need(SS_TOPO, ss.topo == tp)) { ss.topo = tp; vkCmdSetPrimitiveTopology(cb, tp); }
-    if (g_vk.eds2 && ss_need(SS_PRE, ss.pre == pre)) { ss.pre = pre; vkCmdSetPrimitiveRestartEnable(cb, pre); }
+    if (ss_need(SS_CULL, ss.cull == cm)) { ss.cull = cm; rpCmdSetCullMode(cb, cm); }
+    if (ss_need(SS_FF, ss.ff == ff)) { ss.ff = ff; rpCmdSetFrontFace(cb, ff); }
+    if (ss_need(SS_TOPO, ss.topo == tp)) { ss.topo = tp; rpCmdSetPrimitiveTopology(cb, tp); }
+    if (g_vk.eds2 && ss_need(SS_PRE, ss.pre == pre)) { ss.pre = pre; rpCmdSetPrimitiveRestartEnable(cb, pre); }
     {
         float f[3] = {0, 0, 0};
         static int off = -1;
@@ -7738,8 +7773,8 @@ static void draw_(CmdRec *r, bool indexed) {
             }
         }
         if (equal_tol) { f[1] -= 8; on = true; }  // (see the EQUAL comment above: a few depth ulps nearer)
-        if (g_vk.eds2 && ss_need(SS_DBE, ss.dbe == (VkBool32)on)) { ss.dbe = on; vkCmdSetDepthBiasEnable(cb, on); }
-        if (ss_need(SS_DB, !memcmp(ss.db, f, sizeof f))) { memcpy(ss.db, f, sizeof f); vkCmdSetDepthBias(cb, f[1], f[2], f[0]); }
+        if (g_vk.eds2 && ss_need(SS_DBE, ss.dbe == (VkBool32)on)) { ss.dbe = on; rpCmdSetDepthBiasEnable(cb, on); }
+        if (ss_need(SS_DB, !memcmp(ss.db, f, sizeof f))) { memcpy(ss.db, f, sizeof f); rpCmdSetDepthBias(cb, f[1], f[2], f[0]); }
     }
 
     // ---- textures first (their scales feed the widescreen decision and the rscale table), then the viewport
@@ -7851,7 +7886,7 @@ static void draw_(CmdRec *r, bool indexed) {
         ss.layout = pr->layout, ss.sets[0] = vset, ss.sets[1] = fset;
         ss.ndyn = nd;
         memcpy(ss.dyn, dyn, nd * sizeof dyn[0]);
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, nd, dyn);
+        rpCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, nd, dyn);
         stat_set_binds++;
     }
     if (pr->vi->uses_gmem_store) vc_mark_sbufs(0), note_gmem_store(0);
@@ -7939,7 +7974,7 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     if (use_index && ss_need(SS_IB, ss.ib == ib.buf && ss.io == ib.off && ss.it == itype_vk)) {
         ss.ib = ib.buf; ss.io = ib.off; ss.it = itype_vk;
-        vkCmdBindIndexBuffer(cb, ib.buf, ib.off, itype_vk);
+        rpCmdBindIndexBuffer(cb, ib.buf, ib.off, itype_vk);
     }
 
     // ---- vertex streams: the range this draw can read, copied once per submission
@@ -7967,7 +8002,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 VkDeviceSize zoff = sp.off;
                 if (!(ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == sp.buf && ss.vo[s] == zoff)) {
                     ss.vb[s] = sp.buf; ss.vo[s] = zoff; ss.vb_known |= 1u << s;
-                    vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &sp.buf, &zoff);
+                    rpCmdBindVertexBuffers(cb, (uint32_t)s, 1, &sp.buf, &zoff);
                 }
                 continue;
             }
@@ -7992,7 +8027,7 @@ static void draw_(CmdRec *r, bool indexed) {
             if (v.addr && v.size && guest_direct(v.addr, v.size, &dbuf, &doff)) {
                 if (ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == dbuf && ss.vo[s] == doff) continue;
                 ss.vb[s] = dbuf; ss.vo[s] = doff; ss.vb_known |= 1u << s;
-                vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &dbuf, &doff);
+                rpCmdBindVertexBuffers(cb, (uint32_t)s, 1, &dbuf, &doff);
                 continue;
             }
             if (scan_src) {  // copying after all: the index scan bounds the copy
@@ -8022,7 +8057,7 @@ static void draw_(CmdRec *r, bool indexed) {
         VkDeviceSize off = sp.off;
         if (ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == sp.buf && ss.vo[s] == off) continue;
         ss.vb[s] = sp.buf; ss.vo[s] = off; ss.vb_known |= 1u << s;
-        vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &sp.buf, &off);
+        rpCmdBindVertexBuffers(cb, (uint32_t)s, 1, &sp.buf, &off);
     }
 
     if (prof) prof_vtx += SDL_GetTicksNS() - prof_t2_;
@@ -8074,8 +8109,8 @@ static void draw_(CmdRec *r, bool indexed) {
         }
     }
     // ---- draw
-    if (!use_index) vkCmdDraw(cb, count, inst, first, base_inst);
-    else vkCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
+    if (!use_index) rpCmdDraw(cb, count, inst, first, base_inst);
+    else rpCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
     if (g_debug_frame) pick_after_draw();
     pass_written |= draw_w;
     stat_draws++;
@@ -9079,7 +9114,7 @@ static void exec_list(uint64_t handle, int depth) {
         }
         if (dchain && r->op != CMD_DISPATCH && !dchain_keeps(r->op)) {  // (the dispatches' run ends)
             dchain = false;
-            if (dchain_after) vk_full_barrier(vk_cmd());
+            if (dchain_after) rpFullBarrier(vk_cmd_rp());
             dchain_after = false;
         }
         switch (r->op) {

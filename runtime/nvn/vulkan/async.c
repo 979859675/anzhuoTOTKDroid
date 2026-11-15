@@ -194,6 +194,9 @@ void vk_async_drain(void) {
     }
     while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
     pthread_mutex_unlock(&q_lock);
+    // and the replay thread done with the draws' packets (replay.h): what runs next here may destroy what they bind
+    extern void vk_rp_drain_at(void *ra);
+    vk_rp_drain_at(__builtin_return_address(0));
     if (waits) vk_tl("host: drain wait end", id, 0);
 }
 
