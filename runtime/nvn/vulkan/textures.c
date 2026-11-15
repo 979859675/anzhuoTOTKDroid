@@ -954,6 +954,67 @@ static void texture_trace_record(int kind, uint64_t source, uint64_t upload, uin
     }
     since = now;
 }
+// ---- the whole hash of a large texture, in four parts at once: three helper threads and the caller (the render
+// thread). Without page write tracking (the heap placed in GPU memory) a large linear texture is hashed whole each
+// frame it's used - the font's 8 MB glyph cache, ~1.2 ms of the render thread on the POCO F7 Ultra (simpleperf,
+// 2026-11-14); a read only, so it splits. Each part is tex_hash_full of its own bytes, the four folded in order:
+// a change anywhere still changes the result. Textures under 2 MB: in one piece, as before.
+// LARECOMP_TEX_HASH_THREADS=0: one piece always.
+#include <semaphore.h>
+enum { HASH_PARTS = 4, HASH_PAR_MIN = 2 << 20 };
+static struct {
+    pthread_t th;
+    sem_t go;
+    const uint8_t *p;
+    uint64_t n, h;
+} hash_job[HASH_PARTS - 1];
+static sem_t hash_done;
+static int hash_par = -1;
+static void *hash_worker(void *arg) {
+    int i = (int)(intptr_t)arg;
+    for (;;) {
+        sem_wait(&hash_job[i].go);
+        hash_job[i].h = tex_hash_full(hash_job[i].p, hash_job[i].n);
+        sem_post(&hash_done);
+    }
+    return NULL;
+}
+static uint64_t tex_hash_big_alone(const uint8_t *p, uint64_t n) {  // (the same value, the four parts in turn)
+    uint64_t part = (n / HASH_PARTS) & ~63ull, r = tex_hash_full(p, part);
+    for (int i = 1; i < HASH_PARTS; i++) {
+        uint64_t h = tex_hash_full(p + part * i, i == HASH_PARTS - 1 ? n - part * (HASH_PARTS - 1) : part);
+        r = (r ^ h) * 0x9E3779B97F4A7C15ull, r ^= r >> 32;
+    }
+    return r ^ n;
+}
+static uint64_t tex_hash_big(const uint8_t *p, uint64_t n) {
+    if (hash_par < 0) {
+        const char *e = getenv("LARECOMP_TEX_HASH_THREADS");
+        hash_par = !e || atoi(e) != 0;
+        if (hash_par) {
+            sem_init(&hash_done, 0, 0);
+            for (int i = 0; i < HASH_PARTS - 1 && hash_par; i++) {
+                sem_init(&hash_job[i].go, 0, 0);
+                if (pthread_create(&hash_job[i].th, NULL, hash_worker, (void *)(intptr_t)i)) hash_par = 0;
+                else pthread_setname_np(hash_job[i].th, "tex hash");
+            }
+        }
+    }
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;  // (the helpers serve one caller at a time; another: alone)
+    if (!hash_par || n < HASH_PAR_MIN || pthread_mutex_trylock(&mu)) return hash_par && n >= HASH_PAR_MIN ? tex_hash_big_alone(p, n) : tex_hash_full(p, n);
+    uint64_t part = (n / HASH_PARTS) & ~63ull;
+    for (int i = 0; i < HASH_PARTS - 1; i++) {
+        hash_job[i].p = p + part * (i + 1);
+        hash_job[i].n = i == HASH_PARTS - 2 ? n - part * (HASH_PARTS - 1) : part;
+        sem_post(&hash_job[i].go);
+    }
+    uint64_t r = tex_hash_full(p, part);
+    for (int i = 0; i < HASH_PARTS - 1; i++) sem_wait(&hash_done);
+    for (int i = 0; i < HASH_PARTS - 1; i++) r = (r ^ hash_job[i].h) * 0x9E3779B97F4A7C15ull, r ^= r >> 32;
+    pthread_mutex_unlock(&mu);
+    return r ^ n;
+}
+
 static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (!t->addr || t->target == 10) return;
     uint64_t frame = vk_frame_counter();
@@ -1002,7 +1063,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             if (target) wa0 = t->addr, wa1 = t->addr + total;
             bool over = !target && wa0 && t->addr < wa1 && t->addr + total > wa0;
             if ((target || over) && n++ < 4000) {
-                uint64_t h = tex_hash_full(mem, total);
+                uint64_t h = tex_hash_big(mem, total);
                 LOG("[texwatch] frame %llu: %s %ux%u f%#x flags %#x @%llx+%llx: pages %d periodic %d dynamic %d calm-run %u, memory %s\n",
                     (unsigned long long)frame, target ? "atlas" : "OVER", t->width, t->height, t->format, t->flags,
                     (unsigned long long)t->addr, (unsigned long long)total, ch, periodic, b->dynamic, b->same_run,
@@ -1068,7 +1129,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
         if (sh == b->sample_hash) return;
     }
     prof_tex_full++; prof_tex_full_bytes += total; if (b->dynamic) prof_tex_dyn++;
-    uint64_t h = fast ? tex_hash_full(mem, total) : hash_full(mem, total), last_full = b->full_frame,
+    uint64_t h = fast ? tex_hash_big(mem, total) : hash_full(mem, total), last_full = b->full_frame,
              old_sample = b->sample_hash;
     b->full_frame = frame;
     // (the sample is only compared while the texture isn't dynamic, and a dynamic one stays so: none for those)
