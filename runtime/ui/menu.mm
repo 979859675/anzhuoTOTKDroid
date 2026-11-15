@@ -22,6 +22,8 @@
 #else
 #include "imgui_impl_vulkan.h"
 extern "C" bool vk_imgui_backend_init(void);  // runtime/nvn/vulkan/imgui_glue.cpp
+extern "C" bool vk_low_ram(void);                // runtime/nvn/vulkan/exec.c: RAM saving as the app started
+extern "C" bool vk_low_ram_auto(long *total_mb); // (what Automatic picks on this device)
 #endif
 
 extern "C" {
@@ -704,8 +706,11 @@ static void tab_display(void) {
                                    "(Internal resolution) follows it.\n\nThe final image is %.0f x %.0f."),
                  1920.0 * ox, 1080.0 * oy);
         if (on > 0 && on < (int)sizeof od)
-            snprintf(od + on, sizeof od - on, "\n\n%s", tr("Auto: 1080p on screens with more lines than that, where it costs the "
-                                                           "GPU the most; the screen's own on the others."));
+            snprintf(od + on, sizeof od - on, "\n\n%s", vk_low_ram()
+                         ? tr("Auto: 720p at most, with RAM saving on - on these devices the GPU is the limit, and the "
+                              "last passes at more lines cost it frames.")
+                         : tr("Auto: 1080p on screens with more lines than that, where it costs the GPU the most; the "
+                              "screen's own on the others."));
 #ifdef __ANDROID__
         enum { OUT_DEFAULT = 0 };  // (Auto: settings.c)
 #else
@@ -746,6 +751,29 @@ static void tab_display(void) {
                "Translates the game's shaders with 32-bit address math, the path used for drivers without 64-bit "
                "integers (Adreno 6xx / 7xx and Mali stock drivers). Try it if lighting, grass or text are missing or wrong "
                "on your GPU. Applies to shaders translated from now on: restart the app for all of them.");
+    {   // RAM saving (vulkan/exec.c vk_low_ram): read once as the app starts
+        void launcher_restart_app(void);  // (ui/launcher.mm)
+        static const char *ram[] = {"Automatic", "On", "Off"};  // display order -> low_ram -1 / 1 / 0
+        int ri = g_settings.low_ram < 0 ? 0 : g_settings.low_ram ? 1 : 2;
+        bool autolow = vk_low_ram_auto(NULL);
+        if (opt_choice("RAM saving", &ri, ram, 3, 0,
+                       autolow ? "For devices with 4 GB of RAM or less, where Android closes the game when memory runs out: "
+                                 "smaller GPU buffers, textures' copies given back once on the GPU, compressed textures at "
+                                 "half size, and the drawing thread on a fast core. Uses less memory and is faster on such "
+                                 "devices; textures can look a little softer. Automatic: on for this device. Applies when "
+                                 "TOTKDroid restarts."
+                               : "For devices with 4 GB of RAM or less, where Android closes the game when memory runs out: "
+                                 "smaller GPU buffers, textures' copies given back once on the GPU, compressed textures at "
+                                 "half size, and the drawing thread on a fast core. Uses less memory and is faster on such "
+                                 "devices; textures can look a little softer. Automatic: off for this device (more than 4 GB). "
+                                 "Applies when TOTKDroid restarts."))
+            g_settings.low_ram = ri == 0 ? -1 : ri == 1 ? 1 : 0;
+        bool want = g_settings.low_ram < 0 ? autolow : g_settings.low_ram != 0;
+        if (want != vk_low_ram() && !getenv("LARECOMP_LOW_RAM") &&
+            opt_button("Restart to apply RAM saving", "Closes TOTKDroid and opens it again with the new setting. "
+                                                      "Progress since the game's last save is lost."))
+            launcher_restart_app();
+    }
 #endif
     opt_end();
 }

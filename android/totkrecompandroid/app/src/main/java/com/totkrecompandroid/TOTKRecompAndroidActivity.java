@@ -103,6 +103,7 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
             copyIfChanged(new File(games, "totkgame.so"), new File(res, "totkgame.so"));
             copyIfChanged(new File(games, "totkgame.so.id"), new File(res, "totkgame.so.id"));
             setenv("LARECOMP_NATIVE_LIB_DIR", getApplicationInfo().nativeLibraryDir);
+            setenv("LARECOMP_APP", appLine());
             setenv("LARECOMP_LAST_EXIT", lastExit());
             File gen = new File(getFilesDir(), "gen");
             unpackGen(gen);
@@ -470,6 +471,38 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
             return self.getPackageManager().getPackageInfo(self.getPackageName(), 0).versionName;
         } catch (Exception e) {
             return "";
+        }
+    }
+
+    // The start screen's banner (runtime/ui/launcher.mm banner_thread, on its own thread, never the UI's): url (https,
+    // or a file:// one for tests) saved to dst, at most maxBytes. false on any failure (offline, 404, too big): dst is
+    // then left as it was.
+    public static boolean download(String url, String dst, int maxBytes) {
+        File part = new File(dst + ".part");
+        try {
+            java.net.URLConnection c = new java.net.URL(url).openConnection();
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(8000);
+            c.setUseCaches(false);
+            c.setRequestProperty("User-Agent", "TOTKDroid/" + appVersion());
+            if (c instanceof java.net.HttpURLConnection && ((java.net.HttpURLConnection) c).getResponseCode() != 200) {
+                ((java.net.HttpURLConnection) c).disconnect();
+                return false;
+            }
+            try (InputStream in = c.getInputStream(); OutputStream out = new FileOutputStream(part)) {
+                byte[] buf = new byte[65536];
+                long total = 0;
+                for (int n; (n = in.read(buf)) > 0;) {
+                    if ((total += n) > maxBytes) throw new IOException("over " + maxBytes + " bytes");
+                    out.write(buf, 0, n);
+                }
+            }
+            if (!part.renameTo(new File(dst))) throw new IOException("rename");
+            return true;
+        } catch (Exception e) {
+            Log.i(TAG, "banner: " + url + ": " + e);
+            part.delete();
+            return false;
         }
     }
 
@@ -1291,6 +1324,19 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
 
     // How the previous run ended (ApplicationExitInfo), for the log: a setup that vanished with nothing in the log was
     // the system closing the app - for memory or something else (issue #18). "" when unknown.
+    // The log's first line: which build wrote it, on what ("0.4.0-beta (versionCode 39), Xiaomi 2510DPC44G, Android 16
+    // (API 36)") - the reports' logs couldn't be told apart by version.
+    private String appLine() {
+        String v = "?";
+        try {
+            android.content.pm.PackageInfo p = getPackageManager().getPackageInfo(getPackageName(), 0);
+            v = p.versionName + " (versionCode " + p.getLongVersionCode() + ")";
+        } catch (Exception ignored) {
+        }
+        return v + ", " + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL + ", Android "
+                + android.os.Build.VERSION.RELEASE + " (API " + android.os.Build.VERSION.SDK_INT + ")";
+    }
+
     private static final String[] EXIT_REASONS = {"unknown", "exit self", "signaled", "low memory", "crash", "native crash",
             "not responding", "initialization failure", "permission change", "excessive resource usage", "user requested",
             "user stopped", "dependency died", "other", "freezer", "package state change", "package updated"};
