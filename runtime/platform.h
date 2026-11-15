@@ -76,7 +76,8 @@ void plat_crash_handler_install(void);  // per thread where the OS needs it (alt
 bool rt_fault_watch(uint64_t fault_addr, uint64_t host_pc);
 void rt_fault_report(const char *what, uint64_t fault_addr, uint64_t host_pc, uint64_t host_lr) __attribute__((noreturn));
 
-// ---- device state for the performance overlay (Android: the values; the desktop reports none) (runtime/ui/perf_overlay.mm); -1 / 0 where unknown
+#ifdef __ANDROID__
+// ---- device state for the performance overlay (runtime/ui/perf_overlay.mm); -1 / 0 where unknown
 typedef struct {
     int ncluster;                  // CPU clusters (cpufreq policies)
     uint32_t cluster_mhz[8];
@@ -113,6 +114,7 @@ void plat_adpf_stats(PlatAdpfStats *out);
 // pinned to the fastest cores (platform/android.c)
 void plat_thread_unpin(void);
 void plat_render_follow_clock(void);  // (Android: the render thread on the cores clocked higher now)
+#endif
 #endif
 
 #ifdef __cplusplus
