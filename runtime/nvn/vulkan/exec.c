@@ -113,6 +113,7 @@ static inline uint64_t drvt_t0(void) {
     return drvt_on ? plat_now_ns() : 0;
 }
 static inline void drvt_add(int k, uint64_t t0) { if (t0) drvt_ns[k] += plat_now_ns() - t0, drvt_n[k]++; }
+uint64_t drvt_tex_full[3], drvt_tex_full_bytes;  // (textures.c upload_texture: whole hashes by size, and their bytes)
 // The last submission the GPU finished. With the waiter thread (seq_thread_on, below) it is read from what that
 // thread saw; else asked of the driver, at most every LARECOMP_SEQ_CACHE_US (default 0: every time) - the value in
 // between is the last one read: it only grows, and a lower one only makes a caller free or reuse a little later.
@@ -1161,6 +1162,16 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
             if (at) LOG("[drvt] texture checks on the helper: %.1f a frame, %.2f found differing\n", (double)prof_tex_helper_jobs / frames,
                         (double)prof_tex_helper_hits / frames);
             prof_tex_helper_jobs = prof_tex_helper_hits = 0;
+            if (at) LOG("[drvt] whole texture hashes a frame: %.1f under 256 KB, %.1f to 2 MB, %.1f larger; %.2f MB\n",
+                        (double)drvt_tex_full[0] / frames, (double)drvt_tex_full[1] / frames, (double)drvt_tex_full[2] / frames,
+                        drvt_tex_full_bytes / 1048576.0 / frames);
+            memset(drvt_tex_full, 0, sizeof drvt_tex_full), drvt_tex_full_bytes = 0;
+            {   extern uint64_t prof_tex_snap_bytes, prof_tex_checks;  // (textures.c: snapshot compares, upload checks)
+                static uint64_t snap0, checks0;
+                if (at) LOG("[drvt] texture upload checks a frame: %.1f; snapshot compares %.2f MB\n",
+                            (double)(prof_tex_checks - checks0) / frames, (prof_tex_snap_bytes - snap0) / 1048576.0 / frames);
+                snap0 = prof_tex_snap_bytes, checks0 = prof_tex_checks;
+            }
             memset(drvt_ns, 0, sizeof drvt_ns), memset(drvt_n, 0, sizeof drvt_n);
             at = f;
         }
@@ -1446,9 +1457,12 @@ static bool bcopy_pending(uint64_t lo, uint64_t hi) {  // (render thread) drops 
     // guest_copy came here while any copy was pending: ~3000 a frame on the surface, 1.7 ms of the render thread's
     // ~17 (POCO F7 Ultra, 2026-11-14). Asked once a submission instead (gpu_buffer_copy always asks): for guest_copy
     // an older answer only keeps a landed copy's range bound in place in the heap, which holds its bytes all the same.
-    // LARECOMP_AB=<frames>:bcpoll alternates it (side 0: asked every call, as before).
+    // LARECOMP_BCOPY_ASK_EVERY=1: asked every call, as before; LARECOMP_AB=<frames>:bcpoll alternates it.
+    static int every = -1;
+    if (every < 0) every = getenv("LARECOMP_BCOPY_ASK_EVERY") && atoi(getenv("LARECOMP_BCOPY_ASK_EVERY"));
+    int ab = AB("bcpoll");
     uint64_t done;
-    if (bcopy_done_at == vk_pending_seq() && AB("bcpoll") != 0) done = bcopy_done;
+    if (bcopy_done_at == vk_pending_seq() && (ab >= 0 ? ab == 1 : !every)) done = bcopy_done;
     else done = bcopy_done = vk_completed_seq(), bcopy_done_at = vk_pending_seq();
     bool hit = false;
     int k = 0;

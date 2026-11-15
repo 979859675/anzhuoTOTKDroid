@@ -200,6 +200,33 @@ Together, the render thread does about **−1.1 ms a frame (~7%)** less in this 
    can't simply move to a helper.
 2. **(c), the replay thread for the Vulkan recording**: the large step (−2.5 to −3.5 ms), with high risk.
 
+## On top of main, with BOTWRecomp's GPU-progress changes (2026-11-15, night)
+
+The branch was rebased onto main (`488e559` with BOTW's `1885c8e`: the GPU progress read from a waiter thread, on low
+RAM) and BOTW's `b8a1d05` was ported on top. That port has the waiter wait on a fence per submission, makes it the
+default for any Turnip, and no longer signals the timeline.
+- **Everything against main's behaviour** (`LARECOMP_SEQ_THREAD=0,LARECOMP_TEX_CHECK_THREAD=0,LARECOMP_BCOPY_ASK_EVERY=1`),
+  alternated launches:
+  - **at forced 30**: the render thread **22.58 → 21.50 / 21.43 ms** a frame, 2 of 2 pairs (28 fps both: capped);
+  - **at forced 60**: launch order and heat decided the fps (the first launch, cool, held 60), so the in-run A/Bs
+    above are the numbers for 60.
+- **The fence waiter on the POCO**, alternated launches against `LARECOMP_SEQ_THREAD=0` (46-64 s window): frame period
+  17.72 / 18.48 / 17.37 ms against 17.61 / 18.21 / 17.31. It costs **~0.15 ms (~0.5 fps)**, 3 of 3 pairs: the game
+  thread waits a little longer for its fences. It stays on, as in BOTW, for the weak Turnip phones (Tab A9+:
+  +25% fps there).
+- **The whole hash split from 256 KB** instead of 2 MB (`hashmin`): slightly worse, 5 of 6 launches. Dropped.
+- **What the texture checks do a frame** (`LARECOMP_DRV_TIMES`): ~123 upload checks; whole hashes 7.3 under 256 KB,
+  1.4 to 2 MB and 1.3 larger (the glyph cache), 14 MB in all; snapshot compares of dynamic textures up to 1 MB.
+  - **The snapshot table thrashes.** Each 2 s, ~235-360 compares found the slot taken against ~310-350 hits; a miss
+    is a 1 MB copy plus a whole hash.
+  - **Tried: 32 slots** by a hash of the texture, instead of 8 by address bits (`snap32`). The misses were true
+    collisions (none from a re-upload), and with 32 slots they fell from ~120-230 to 0-48 every 2 s. But those
+    textures are tiny (~0.06 MB a frame), and the render thread didn't gain (15.31 → 15.63 ms, worse in 3 of 4 pairs).
+    Dropped.
+
+So the texture checks have little left that is cheap. The big remaining item is (c): moving the Vulkan recording to a
+replay thread. It needs the user's go-ahead, because of its size and risk.
+
 ## Files
 
 - `runtime/nvn/vulkan/exec.c`: `bcopy_pending` / `gpu_buffer_copy` (the fix), `LARECOMP_DRV_TIMES` (the probe).

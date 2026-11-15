@@ -1265,6 +1265,10 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
         if (sh == b->sample_hash) return;
     }
     prof_tex_full++; prof_tex_full_bytes += total; if (b->dynamic) prof_tex_dyn++;
+    {   // (LARECOMP_DRV_TIMES' line: whole hashes by size - under 256 KB, to 2 MB, more - and bytes)
+        extern uint64_t drvt_tex_full[3], drvt_tex_full_bytes;
+        drvt_tex_full[total < (256u << 10) ? 0 : total < (2u << 20) ? 1 : 2]++, drvt_tex_full_bytes += total;
+    }
     uint64_t h = fast ? tex_hash_big(mem, total) : hash_full(mem, total), last_full = b->full_frame,
              old_sample = b->sample_hash;
     b->full_frame = frame;
