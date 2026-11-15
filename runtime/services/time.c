@@ -6,12 +6,6 @@
 #include "../hle.h"
 #include "../ipc.h"
 
-// localtime_r / gmtime_r: POSIX; Windows has the reversed-argument gmtime_s / localtime_s
-#ifdef _WIN32
-static struct tm *localtime_r(const time_t *t, struct tm *r) { return localtime_s(r, t) ? NULL : r; }
-static struct tm *gmtime_r(const time_t *t, struct tm *r) { return gmtime_s(r, t) ? NULL : r; }
-#endif
-
 static const uint8_t clock_uuid[16] = {0x4c, 0x41, 0x52, 0x65, 0x63, 0x6f, 0x6d, 0x70, 1, 2, 3, 4, 5, 6, 7, 8};
 
 static int64_t steady_seconds(void) { return (int64_t)(rt_ticks() / 19200000ull); }

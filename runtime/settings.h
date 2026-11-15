@@ -41,12 +41,6 @@ typedef struct {
     // Frame generation (nvn/vulkan/framegen.c): the engine (FG_*), images per game frame (2-4), Win-FG's quality (0
     // quality, 1 balanced, 2 performance), LSFG's motion estimation resolution (0 the game's own, or 25-100 %)
     int fg_engine, fg_mult, fg_perf, lsfg_flow;
-    // (the frame rate, the in-place reads and the stick dead zone are read by the common runtime too)
-    int fps_mode;         // 0 Auto, 1 30 fps, 2 60 fps, 3 20 fps, 4 40/45 fps (display dependent)
-    int inplace_reads;    // Turnip: draws sample targets they write as they are (vulkan/exec.c resolve_feedback); off: copies
-                          // (Automatic: Adreno 7xx too - vulkan/device.c vk_inplace_reads_on, #48)
-    float stick_deadzone;  // a controller's sticks: a round dead zone (share of the travel, 0-0.4), rescaled past it
-                           // (hle/input.c): worn sticks that drift. 0: the game's own only
     bool motion;          // the phone's (or a controller's) gyroscope as the controller's motion sensor (hle/motion.c)
     int motion_source;    // whose: 0 automatic (a controller's once its gyroscope is alive), 1 the phone's, 2 a controller's
     bool motion_flat;     // the phone's sensors as the Switch's screen in handheld mode, not a flat controller (hle/motion.c)
@@ -56,6 +50,7 @@ typedef struct {
     int overlay_scale, overlay_opacity;  // its size and opacity, % (40..150, 20..100): Swap2-Native's
     int overlay_items;    // OVERLAY_* bits: what it shows (all by default)
     float overlay_pos[2]; // its top left, a share of the screen, dragged there with a finger (negative: the corner)
+    int fps_mode;         // 0 Auto, 1 30 fps, 2 60 fps, 3 20 fps, 4 40/45 fps (display dependent)
     bool shader_int32;    // shader address math in 32-bit words even where the driver offers 64-bit (vulkan/exec.c)
     bool files_in_place;  // Android: a setup reads the picked romfs/ where it is, no copy (services/fs.c); off by default
     bool native_code;     // Android: the game's own code on the CPU, no build of it (runtime/native.c); off by default
@@ -67,6 +62,8 @@ typedef struct {
     int gpu_heap;         // Turnip: the game's memory mapped as GPU memory (vulkan/exec.c vk_heap_place); off: CPU copies
     bool heap_file;       // the game's memory as GPU memory through an exported file mapped at its address, where the driver
                           // can't place it (Mali, Xclipse; experimental): vulkan/exec.c vk_heap_place, at the game's start
+    int inplace_reads;    // Turnip: draws sample targets they write as they are (vulkan/exec.c resolve_feedback); off: copies
+                          // (Automatic: Adreno 7xx too - vulkan/device.c vk_inplace_reads_on, #48)
     int turnip_lrz;       // Turnip's low-resolution Z; off: TU_DEBUG=nolrz before the driver loads (vulkan/device.c)
     bool log_file;        // the log in a file as well (platform/android.c), to send with a report
     char gpu_model[64];   // the GPU of the last start ("Adreno (TM) 830v1"): turnip_lrz's Automatic, before the driver
@@ -89,6 +86,8 @@ typedef struct {
     // area a whole half of the screen
     bool touch_drag_camera, touch_sticks_hidden, touch_half_areas;
     float touch_drag_sens;
+    float stick_deadzone;  // a controller's sticks: a round dead zone (share of the travel, 0-0.4), rescaled past it
+                           // (hle/input.c): worn sticks that drift. 0: the game's own only
 #endif
     int language;        // LANG_AUTO or an index into g_language_codes: the game's text language
     bool aspect_asked;   // the start screen's one-time "authentic 16:9 or unlocked?" question was answered
