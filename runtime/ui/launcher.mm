@@ -1156,7 +1156,7 @@ static bool banner_fetch(const std::string &url, const std::string &dst, int max
 #endif
     std::string part = dst + ".part", max = std::to_string(max_bytes);
     const char *av[] = {curl.c_str(), "-fsSL", "--max-time", "15", "--max-filesize", max.c_str(),
-                        "-A", "BOTWRecompAndroid/" LARECOMP_VERSION, url.c_str(), NULL};
+                        "-A", "TOTKDroid/" LARECOMP_VERSION, url.c_str(), NULL};
     PlatProc p = plat_spawn(av, part.c_str(), false);
     if (!p || plat_proc_wait(p, true) != 0) { remove(part.c_str()); return false; }
     remove(dst.c_str());
