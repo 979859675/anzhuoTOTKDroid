@@ -1841,24 +1841,31 @@ static int realtime_on(void) {
 bool rt_realtime(void) { return realtime_on(); }  // (tools/patches.py: the equipment-switch cooldown)
 
 // The optional rendering reductions (native.c fix_shadow_size / fix_game_fxaa / fix_far_clamp): shadow map size 0 (the
-// game's) or 288 / 256; the game's own FXAA on / off; the render far plane capped at that many metres (0: not).
-// LARECOMP_SHADOW_RES=<0|288|256>, LARECOMP_GAME_FXAA=<0|1>, LARECOMP_FAR_CLAMP=<metres>.
+// game's) or 288 / 256; the game's own FXAA on / off; the render far plane capped at that many metres (0: not). The
+// Video tab's choices (g_settings, read each time: they apply at once), or LARECOMP_SHADOW_RES=<0|288|256>,
+// LARECOMP_GAME_FXAA=<0|1>, LARECOMP_FAR_CLAMP=<metres> over them.
 void rt_render_opts(int *shadow, int *fxaa, float *far_cap) {
-    static int s = -1, f = -1;
-    static float fc = -1;
-    if (s < 0) {
+    static int es = -2, ef = -2;
+    static float efc = -2;
+    if (es == -2) {
         const char *e = getenv("LARECOMP_SHADOW_RES");
-        int v = e ? atoi(e) : 0;
-        s = v == 288 || v == 256 ? v : 0;
+        es = e ? (atoi(e) == 288 || atoi(e) == 256 ? atoi(e) : 0) : -1;
         e = getenv("LARECOMP_GAME_FXAA");
-        f = e ? atoi(e) != 0 : 1;
+        ef = e ? atoi(e) != 0 : -1;
         e = getenv("LARECOMP_FAR_CLAMP");
-        fc = e ? (float)atof(e) : 0;
-        if (s || !f || fc > 0) {
-            char far[32] = "unchanged";
-            if (fc > 0) snprintf(far, sizeof far, "at most %.0f m", fc);
-            LOG("[totk] rendering reductions: shadow maps %d, the game's FXAA %s, far plane %s\n", s, f ? "on" : "off", far);
-        }
+        efc = e ? (float)atof(e) : -1;
+    }
+    int s = es >= 0 ? es : g_settings.shadow_res, f = ef >= 0 ? ef : g_settings.game_fxaa;
+    float fc = efc >= 0 ? efc : (float)g_settings.far_clip;
+    if (s != 288 && s != 256) s = 0;
+    static int ls = -1, lf = -1;
+    static float lfc = -1;
+    if (s != ls || f != lf || fc != lfc) {  // (each change, once)
+        ls = s, lf = f, lfc = fc;
+        char far[32] = "the game's", shadows[16] = "the game's";
+        if (fc > 0) snprintf(far, sizeof far, "at most %.0f m", fc);
+        if (s) snprintf(shadows, sizeof shadows, "%d", s);
+        LOG("[totk] rendering: shadow maps %s, the game's FXAA %s, far plane %s\n", shadows, f ? "on" : "off", far);
     }
     *shadow = s, *fxaa = f, *far_cap = fc;
 }

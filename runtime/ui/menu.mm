@@ -718,6 +718,25 @@ static void tab_display(void) {
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. FXAA: a single, cheaper pass that also softens the image "
                "a little. Most useful at a lower internal resolution.");
+    {   // The game's own rendering costs (runtime/native.c: shadow map size, its FXAA, the far plane). They apply at once.
+        static const char *shadows[] = {"Game", "Lower", "Lowest"};
+        static const int shadow_px[] = {0, 288, 256};
+        int si = g_settings.shadow_res == 288 ? 1 : g_settings.shadow_res == 256 ? 2 : 0;
+        if (opt_choice("Shadow quality", &si, shadows, 3, 0,
+                       "The size of the sun's shadow maps. Lower ones cost the GPU less, with softer, blockier shadows. "
+                       "It may help a weaker GPU; on a Snapdragon 8 Elite it made no difference.", false))
+            g_settings.shadow_res = shadow_px[si];
+        opt_toggle("Game's anti-aliasing", &g_settings.game_fxaa, true,
+                   "The game's own FXAA pass, apart from the Anti-aliasing above. Off saves a little GPU time; edges and "
+                   "grass shimmer more.");
+        static const char *dists[] = {"Game", "12 km", "8 km", "5 km"};
+        static const int dist_m[] = {0, 12000, 8000, 5000};
+        int di = g_settings.far_clip == 12000 ? 1 : g_settings.far_clip == 8000 ? 2 : g_settings.far_clip == 5000 ? 3 : 0;
+        if (opt_choice("Draw distance", &di, dists, 4, 0,
+                       "How far the camera draws; the game's goes to 25 km. Shorter can cut the farthest scenery from view. "
+                       "The world, its objects and their behavior are not changed, only what is drawn.", false))
+            g_settings.far_clip = dist_m[di];
+    }
 #ifdef __ANDROID__
     opt_toggle("Sync lag", &g_settings.sync_lag, true,
                "The game starts its next frame while the GPU still finishes the last one: a few more fps. What the game reads "
