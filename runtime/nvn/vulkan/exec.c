@@ -208,6 +208,17 @@ static void wb_apply(uint64_t done);
 
 #ifdef __ANDROID__
 static bool gcopy_mode;   // (no heap import: global memory copied by the CPU, gcopy_prepare)
+// Page write tracking and the vertex cache's page tables (vcache_lookup) span [VC_BASE, HEAP_BASE + HEAP_MAX). On
+// Android that starts at the physical memory region (ALIAS_BASE), below the heap: TOTK keeps its vertices there, and
+// without placed memory (Mali, Xclipse) 1.25 GB of them were copied every 2 s, for want of tracking to cache them by
+// (2026-11-15, the copy mode on the POCO). Heap offsets are VC_HEAP_OFF further in.
+#ifdef __ANDROID__
+#define VC_BASE ALIAS_BASE
+#else
+#define VC_BASE HEAP_BASE
+#endif
+#define VC_HEAP_OFF (HEAP_BASE - VC_BASE)
+#define VC_SPAN (VC_HEAP_OFF + HEAP_MAX)
 #ifdef __ANDROID__
 static bool gwin_mode;    // (heap placed, larger than a storage buffer reaches, no pointer: draws get a window of it, gwin_prepare)
 static uint64_t gmem_bda;  // the placed heap's device address when shaders reach it by pointer (vk_heap_place), else 0
@@ -1730,7 +1741,7 @@ void vk_exec_init(void) {
     // (for good, without placed memory: the vertex cache and the texture checks fed by write tracking - vc_flush)
     // (nor with an exported file to map there: vk_heap_place turns it on if that fails)
     extern bool vk_heap_file_asked(void);
-    if (gcopy_mode && !g_vk.map_placed && !vk_heap_file_asked()) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+    if (gcopy_mode && !g_vk.map_placed && !vk_heap_file_asked()) plat_write_tracking_enable(VC_BASE, HEAP_BASE + HEAP_MAX);
 #endif
     if (prof) {
         prof_up_ns = 0;
@@ -4608,6 +4619,7 @@ static VkBuffer gmem_buf;
 static VkDeviceMemory gmem_mem;
 static uint64_t gmem_size;
 #ifdef __ANDROID__
+static bool gmem_file;    // (placed through a shared file / the driver's map moved: Driver compatibility's heap_file)
 static bool gmem_placed;  // (gmem_buf is the guest heap itself, usable as a uniform buffer: vk_heap_place)
 
 // CopyBufferToBuffer within the heap's GPU buffer, done by the GPU in its place in the queue. The CPU copy waited for
@@ -4916,7 +4928,7 @@ bool vk_heap_place(uint64_t size) {
     // OS's write tracking - vk_exec_init turns it on only without placed memory at all, so a Turnip that has it but
     // isn't an Adreno 8xx (Automatic) had neither: every vertex and index buffer copied each frame, ~150 MB, 7-9 fps
     // on an Adreno 730 (issue #31). A page not tracked yet counts as written, so turning it on late is safe.
-#define NOT_PLACED() (gcopy_mode ? plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX) : (void)0, false)
+#define NOT_PLACED() (gcopy_mode ? plat_write_tracking_enable(VC_BASE, HEAP_BASE + HEAP_MAX) : (void)0, false)
     // Without placed maps, the same through an exported file (VK_KHR_external_memory_fd, a dma-buf) mapped at the heap's
     // address by mmap (BOTWRecompAndroid ed53b68, after legendszaonandroid's VULKAN_BACKEND.md, MIT; memfd_probe.c tests
     // it): Mali and Xclipse have neither the placed map nor the import, and their CPU copies with write tracking upload
@@ -5098,6 +5110,7 @@ placed_ahb:  // (MEMFD_FAILED: the heap as an Android hardware buffer)
     gmem_mem = mem;
     gmem_size = size;
     gmem_placed = true;
+    gmem_file = memfd;
     gcopy_mode = false;
     gmem_bda = 0;
     if (bda && gmem_bda_wanted(size)) {
@@ -5118,6 +5131,18 @@ placed_ahb:  // (MEMFD_FAILED: the heap as an Android hardware buffer)
 }
 #undef NOT_PLACED
 #undef MEMFD_FAILED
+
+// The crash message after an out-of-memory error says what to change: with the heap in GPU memory, the option that
+// put it there (an 8 GB Adreno 618 with it turned on by hand: vkEndCommandBuffer -2, #58 #60; Off ran).
+const char *vk_fatal_hint(VkResult r) {
+    if (r != VK_ERROR_OUT_OF_DEVICE_MEMORY && r != VK_ERROR_OUT_OF_HOST_MEMORY) return "";
+    if (gmem_placed)
+        return gmem_file ? "\n\nThe GPU ran out of memory. Turn off Settings > Driver compatibility > Game memory through "
+                           "a shared file: the game's memory then stays out of the GPU's."
+                         : "\n\nThe GPU ran out of memory. Set Settings > Driver compatibility > Game memory on the GPU "
+                           "to Off (or Automatic): the game's memory then stays out of the GPU's.";
+    return "\n\nThe GPU ran out of memory. Close other apps, or turn on Video > RAM saving.";
+}
 
 // Shaders reach the placed heap by pointer (translate.c maxwell_gmem_bda) where one storage buffer can't cover it: the
 // descriptor reaches maxStorageBufferRange from the heap's start, and Turnip on Adreno 7xx caps that at 128 MB - the
@@ -5154,6 +5179,8 @@ static bool gaddr_write(uint64_t a) {
 }
 
 static VkDescriptorBufferInfo gaddr_info(void) { return (VkDescriptorBufferInfo){gaddr_buf, 0, 16}; }
+#else
+const char *vk_fatal_hint(VkResult r) { (void)r; return ""; }
 #endif
 
 static VkDescriptorBufferInfo gmem_info(void) {
@@ -6126,9 +6153,9 @@ static bool pt_init(void) {
     int n = plat_written_pages(HEAP_BASE, VC_PAGE, &one, 1, &pg);  // (is there write tracking?)
     pt_state = n >= 0 && pg == VC_PAGE;
     if (!pt_state) { LOG("[vk] no page write tracking (%d, page %llu)\n", n, (unsigned long long)pg); return false; }
-    vc_page_gen = calloc(HEAP_MAX / VC_PAGE, sizeof *vc_page_gen);
-    vc_page_gpu = calloc(HEAP_MAX / VC_PAGE, 1);
-    vc_page_gen[0] = ++vc_gen;  // (the probe took page 0's tracking)
+    vc_page_gen = calloc(VC_SPAN / VC_PAGE, sizeof *vc_page_gen);
+    vc_page_gpu = calloc(VC_SPAN / VC_PAGE, 1);
+    vc_page_gen[VC_HEAP_OFF / VC_PAGE] = ++vc_gen;  // (the probe took the heap's first page's tracking)
     return true;
 }
 
@@ -6137,14 +6164,14 @@ static bool pt_init(void) {
 // *now: the generation to pass next time.
 int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) {
     if (!size || addr < HEAP_BASE || addr - HEAP_BASE + size > HEAP_MAX || !pt_init()) return -1;
-    uint64_t lo = (addr - HEAP_BASE) & ~(VC_PAGE - 1), hi = (addr - HEAP_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
+    uint64_t lo = (addr - VC_BASE) & ~(VC_PAGE - 1), hi = (addr - VC_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
     static uint64_t pages[4096];
     uint64_t pg = VC_PAGE;
-    int n = plat_written_pages(HEAP_BASE + lo, hi - lo, pages, 4096, &pg);
+    int n = plat_written_pages(VC_BASE + lo, hi - lo, pages, 4096, &pg);
     if (n < 0) return -1;
     uint32_t g = ++vc_gen;
     if (n >= 4096) for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE; p++) vc_page_gen[p] = g;
-    else for (int k = 0; k < n; k++) vc_page_gen[(pages[k] - HEAP_BASE) / VC_PAGE] = g;
+    else for (int k = 0; k < n; k++) vc_page_gen[(pages[k] - VC_BASE) / VC_PAGE] = g;
     *now = g;
     int changed = 0;
     for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE; p++) {
@@ -6157,7 +6184,8 @@ int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now
 // Heap pages [lo, hi) (offsets) written by the GPU: never cached from now on.
 static void vc_mark_gpu(uint64_t lo, uint64_t hi) {
     if (!pt_init()) return;
-    for (uint64_t p = lo / VC_PAGE; p < (hi + VC_PAGE - 1) / VC_PAGE && p < HEAP_MAX / VC_PAGE; p++) vc_page_gpu[p] = 1;
+    lo += VC_HEAP_OFF, hi += VC_HEAP_OFF;  // (heap offsets -> the page tables')
+    for (uint64_t p = lo / VC_PAGE; p < (hi + VC_PAGE - 1) / VC_PAGE && p < VC_SPAN / VC_PAGE; p++) vc_page_gpu[p] = 1;
     vc_epoch++;
 }
 
@@ -6201,8 +6229,11 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
     bool cpu_fill = false;
 #endif
     if (!vc_on || (!gmem_buf && !cpu_fill) || size > VC_MAX_RANGE) return false;
-    uint64_t lo = (addr - HEAP_BASE) & ~(VC_PAGE - 1), hi = (addr - HEAP_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
-    if (hi > (gmem_buf ? gmem_size : HEAP_MAX)) return false;
+    // (the heap; with CPU fills also the physical memory region, where TOTK keeps its vertices - VC_BASE)
+    bool in_heap = addr >= HEAP_BASE && addr + size <= HEAP_BASE + (gmem_buf ? gmem_size : HEAP_MAX);
+    bool in_alias = cpu_fill && addr >= ALIAS_BASE && addr + size <= ALIAS_BASE + ALIAS_SIZE && ALIAS_BASE >= VC_BASE;
+    if (!in_heap && !in_alias) return false;
+    uint64_t lo = (addr - VC_BASE) & ~(VC_PAGE - 1), hi = (addr - VC_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
     uint64_t pend = vk_pending_seq();
     uint64_t h = (lo * 0x9E3779B97F4A7C15ull) ^ (hi * 0xC2B2AE3D27D4EB4Full);
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (VC_TAB - 1), free_slot = ~0u, old_slot = ~0u;
@@ -6246,7 +6277,7 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
     }
     prof_vc_hits++;
     *buf = e->buf;
-    *off = addr - HEAP_BASE - lo;
+    *off = addr - VC_BASE - lo;
     return true;
 }
 
@@ -6270,10 +6301,10 @@ void vc_flush(void) {
         for (; j < vc_npend && vc_tab[vc_pend[j]].lo <= hi + 64 * VC_PAGE; j++)
             if (vc_tab[vc_pend[j]].hi > hi) hi = vc_tab[vc_pend[j]].hi;
         uint64_t pg = VC_PAGE;
-        int n = plat_written_pages(HEAP_BASE + lo, hi - lo, pages, 4096, &pg);
+        int n = plat_written_pages(VC_BASE + lo, hi - lo, pages, 4096, &pg);
         prof_vc_queries++;
         if (n < 0 || n >= 4096) for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE; p++) vc_page_gen[p] = g;  // (all)
-        else for (int k = 0; k < n; k++) vc_page_gen[(pages[k] - HEAP_BASE) / VC_PAGE] = g;
+        else for (int k = 0; k < n; k++) vc_page_gen[(pages[k] - VC_BASE) / VC_PAGE] = g;
         if (n > 0) prof_vc_scan_pages += (uint64_t)n;
         i = j;
     }
@@ -6290,13 +6321,16 @@ void vc_flush(void) {
             if (nc == 64) { nc = 1; cp[0] = (VkBufferCopy){e->lo, 0, e->hi - e->lo}; break; }  // (scattered: the whole range)
             cp[nc++] = (VkBufferCopy){o, o - e->lo, VC_PAGE};
         }
-        if (nc && gmem_buf) copy_buffer(cb, gmem_buf, e->buf, (uint32_t)nc, cp);
+        if (nc && gmem_buf) {  // (heap entries only: their offsets from the page tables' base -> the heap buffer's)
+            for (int k = 0; k < nc; k++) cp[k].srcOffset -= VC_HEAP_OFF;
+            copy_buffer(cb, gmem_buf, e->buf, (uint32_t)nc, cp);
+        }
         else if (nc) {  // (copy mode: no heap buffer - the written pages go through the upload ring)
             uint64_t tot = 0, o = 0;
             for (int k = 0; k < nc; k++) tot += cp[k].size;
             VkSpan sp = vk_transient(tot, 256);
             for (int k = 0; k < nc; k++) {
-                memcpy((uint8_t *)sp.ptr + o, (const void *)(uintptr_t)(HEAP_BASE + cp[k].srcOffset), cp[k].size);
+                memcpy((uint8_t *)sp.ptr + o, (const void *)(uintptr_t)(VC_BASE + cp[k].srcOffset), cp[k].size);
                 cp[k].srcOffset = sp.off + o;
                 o += cp[k].size;
             }
@@ -6318,10 +6352,11 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
 #ifdef __ANDROID__
     if (!copy && vk_vamm_buffer(addr, size, buf, off)) return true;
 #endif
-    if (copy || addr < HEAP_BASE) return false;
+    if (copy) return false;
 #ifdef __ANDROID__
-    if (gcopy_mode && !gmem_buf) return addr + size <= HEAP_BASE + HEAP_MAX && vcache_lookup(addr, size, buf, off);  // (else copied)
+    if (gcopy_mode && !gmem_buf) return vcache_lookup(addr, size, buf, off);  // (heap or physical memory region; else copied)
 #endif
+    if (addr < HEAP_BASE) return false;
     if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
     if (vcache_lookup(addr, size, buf, off)) return true;
@@ -6363,7 +6398,7 @@ void vk_exec_reset(void) {
     vc_npend = 0;
     vc_free_dead(true);
     vc_bytes = 0;
-    if (vc_page_gpu) memset(vc_page_gpu, 0, HEAP_MAX / VC_PAGE);
+    if (vc_page_gpu) memset(vc_page_gpu, 0, VC_SPAN / VC_PAGE);
     vc_epoch++;
     st_defaults();
 }

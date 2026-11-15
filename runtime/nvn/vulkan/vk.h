@@ -32,8 +32,9 @@ void vk_vamm_before_map(uint64_t addr, uint64_t size);
 bool vk_vamm_buffer(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off);
 void vk_vamm_reset(void);
 #endif
+const char *vk_fatal_hint(VkResult r);  // exec.c: what to change, after an out-of-memory error ("" none)
 #define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { if (r_ == VK_ERROR_DEVICE_LOST) vk_device_fault_report(); \
-    FATAL("%s failed: %d (%s:%d)\n", #x, r_, __FILE__, __LINE__); } } while (0)
+    FATAL("%s failed: %d (%s:%d)%s\n", #x, r_, __FILE__, __LINE__, vk_fatal_hint(r_)); } } while (0)
 // The most swapchain images the renderer keeps (one view and one present semaphore each): it asks for few, but drivers
 // may make more - a Mali-G57's made 12 (issue #1)
 #define VK_MAX_SWAP_IMAGES 16

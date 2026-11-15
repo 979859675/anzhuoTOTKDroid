@@ -230,6 +230,15 @@ void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 void plat_discard(uint64_t addr, uint64_t size) {
     extern bool vk_vamm_clear(uint64_t addr, uint64_t size);
     if (vk_vamm_clear(addr, size)) return;
+    if (wt_state && size && addr < wt_hi && addr + size > wt_lo) {
+        // (tracked pages: what was read-only since asked turns to zeros now - counted as written, else the vertex cache
+        // kept the old bytes. Those pages stay read-only: a write faults and opens them, wt_fault's state-0 path.)
+        uint64_t a = (addr < wt_lo ? wt_lo : addr) & ~0xFFFull, e = addr + size > wt_hi ? wt_hi : addr + size;
+        wt_lock();
+        for (uint64_t p = (a - wt_lo) >> 12; p < (e - wt_lo + 0xFFF) >> 12; p++)
+            if (wt_state[p] == 1) wt_state[p] = 0;
+        wt_unlock();
+    }
     uint64_t pg = (uint64_t)sysconf(_SC_PAGESIZE), lo = (addr + pg - 1) & ~(pg - 1), hi = (addr + size) & ~(pg - 1);
     if (lo >= hi) {
         memset((void *)(uintptr_t)addr, 0, size);
