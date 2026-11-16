@@ -1114,9 +1114,50 @@ static void android_create_surface(struct ANativeWindow *aw) {
     surface_aw = aw;
 }
 
+// The window says what frame rate its content has, so the system can pick a refresh that fits (BOTWRecomp's, with
+// 409829c): 40 / 45 fps (Frame rate "40 / 45": a 120 Hz screen that offers 90 may switch for 45), and with frame
+// generation on, the chosen frame rate times its multiplier (60 fps x 2: 120 Hz) - Android leaves a game at 60 Hz unless
+// asked, and then a 40-50 fps game left no refresh between its frames and none was generated (framegen.c's refresh cap;
+// a ROG Phone 8, 165 Hz screen, in BOTW). Otherwise the system's own choice. Asked again for a new window (from the
+// background). libnativewindow's functions looked up, not linked: Android 12+ with the change strategy ALWAYS (the plain
+// call changes the refresh only when it's seamless).
+#include <android/native_window.h>
+#include <dlfcn.h>
+int vk_between_fps(void);
+static void android_frame_rate(struct ANativeWindow *aw) {
+    static struct ANativeWindow *asked_aw;
+    static float asked = -1;
+    int mode = g_settings.fps_mode;
+    float want = mode == 4 && vk_between_fps() != 30 ? (float)vk_between_fps() : 0.0f;
+    bool fg = false;
+    extern int vk_fg_state(void);
+    if (vk_fg_state() > 0) {  // (1 generating, 2 waiting, 3 no refresh left)
+        int base = mode == 1 ? 30 : mode == 3 ? 20 : mode == 4 ? vk_between_fps() : 60;
+        int mult = g_settings.lsfg_mult < 2 ? 2 : g_settings.lsfg_mult > 4 ? 4 : g_settings.lsfg_mult;
+        want = (float)(base * mult), fg = true;
+    }
+    if (aw == asked_aw && want == asked) return;
+    static int (*set_rate)(struct ANativeWindow *, float, int8_t);
+    static int (*set_rate2)(struct ANativeWindow *, float, int8_t, int8_t);
+    static bool looked;
+    if (!looked) {
+        looked = true;
+        void *lib = dlopen("libnativewindow.so", RTLD_NOW);
+        set_rate = lib ? (int (*)(struct ANativeWindow *, float, int8_t))dlsym(lib, "ANativeWindow_setFrameRate") : NULL;
+        set_rate2 = lib ? (int (*)(struct ANativeWindow *, float, int8_t, int8_t))dlsym(lib, "ANativeWindow_setFrameRateWithChangeStrategy") : NULL;
+    }
+    int8_t compat = want > 0 && !fg ? ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE  // (generated: at least that rate)
+                                    : ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT;
+    int r = set_rate2 ? set_rate2(aw, want, compat, 1 /* ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS */)
+          : set_rate ? set_rate(aw, want, compat) : -1;
+    if (want != asked) LOG("[vk] the window asks for %.0f fps content (%d)\n", want, r);
+    asked_aw = aw, asked = want;
+}
+
 static bool android_surface_ready(void) {  // false: no window to draw into now
     struct ANativeWindow *aw = android_window();
     if (!aw) { surface_lost = true; return false; }
+    android_frame_rate(aw);
     if (aw == surface_aw && !surface_lost) return true;
     vkDeviceWaitIdle(g_vk.dev);
     for (uint32_t i = 0; i < g_vk.sc_count; i++) vk_rp_forget_view(g_vk.sc_views[i]), vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);

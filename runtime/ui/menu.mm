@@ -10,6 +10,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <atomic>
+#include <string>
 #include <vector>
 
 #include "i18n.h"
@@ -630,6 +631,16 @@ static void tab_display(void) {
                            "Auto: the game's own."))
                 g_settings.lsfg_flow = flv[k];
             ImGui::TextWrapped("%s", vk_fg_built() ? vk_fg_status() : tr("Not in this build."));
+            if (vk_fg_built()) {  // (a copy in the app's own files: read without All files access; BOTWRecomp e3ccd7a)
+                void launcher_pick_lsfg_dll(void);
+                std::string launcher_lsfg_import_msg(void);
+                std::string m = launcher_lsfg_import_msg();
+                char id[900];
+                snprintf(id, sizeof id, "%s%s%s", tr("Picks your Lossless.dll with Android's file picker and keeps a copy "
+                         "in the app's own files, which the app can always read - for when it says it can't open the "
+                         "file where you put it."), m.empty() ? "" : "\n\n", m.c_str());
+                if (opt_button("Import Lossless.dll", id)) launcher_pick_lsfg_dll();
+            }
         }
     }
 #endif
@@ -758,12 +769,12 @@ static void tab_display(void) {
         bool autolow = vk_low_ram_auto(NULL);
         if (opt_choice("RAM saving", &ri, ram, 3, 0,
                        autolow ? "For devices with 4 GB of RAM or less, where Android closes the game when memory runs out: "
-                                 "smaller GPU buffers, textures' copies given back once on the GPU, compressed textures at "
+                                 "smaller GPU buffers, compressed textures at "
                                  "half size, and the drawing thread on a fast core. Uses less memory and is faster on such "
                                  "devices; textures can look a little softer. Automatic: on for this device. Applies when "
                                  "TOTKDroid restarts."
                                : "For devices with 4 GB of RAM or less, where Android closes the game when memory runs out: "
-                                 "smaller GPU buffers, textures' copies given back once on the GPU, compressed textures at "
+                                 "smaller GPU buffers, compressed textures at "
                                  "half size, and the drawing thread on a fast core. Uses less memory and is faster on such "
                                  "devices; textures can look a little softer. Automatic: off for this device (more than 4 GB). "
                                  "Applies when TOTKDroid restarts."))

@@ -22,12 +22,13 @@
 #include "lsfg/lsfg.h"
 #endif
 
-static char g_status[256] = "off";
-static int g_state;  // 1 generating, 2 on and waiting, 0 off, -1 unavailable (the overlay: ui/perf_overlay.mm)
+static char g_status[700] = "off";
+static int g_state;  // 1 generating, 2 on and waiting, 3 on and no refresh left, 0 off, -1 unavailable (ui/perf_overlay.mm)
 const char *vk_fg_status(void) { return g_status; }  // (the menu's line under the setting)
 int vk_fg_state(void) { return g_state; }
 static void status(const char *s) {
-    g_state = !strncmp(s, "generating", 10) ? 1 : !strncmp(s, "on", 2) ? 2 : !strcmp(s, "off") ? 0 : -1;
+    g_state = !strncmp(s, "generating", 10) ? 1 : strstr(s, "no refresh left") ? 3 : !strncmp(s, "on", 2) ? 2
+            : !strcmp(s, "off") ? 0 : -1;
     if (strcmp(g_status, s)) LOG("[lsfg] %s\n", s);
     snprintf(g_status, sizeof g_status, "%s", s);
 }
@@ -75,8 +76,10 @@ static bool device_ok(void) {
     vkGetPhysicalDeviceFeatures(g_vk.phys, &f);
     const char *miss = !g_vk.shader_float16 ? "shaderFloat16"
                      : !f.shaderStorageImageExtendedFormats ? "shaderStorageImageExtendedFormats"
-                     : !f.shaderStorageImageWriteWithoutFormat ? "shaderStorageImageWriteWithoutFormat"
-                     : !g_vk.null_desc ? "null descriptors (VK_EXT_robustness2)" : NULL;
+                     : !f.shaderStorageImageWriteWithoutFormat ? "shaderStorageImageWriteWithoutFormat" : NULL;
+    // (no null descriptors - VK_EXT_robustness2, missing on Mali r44: the chain binds a blank image instead, lsfg_chain.c;
+    // BOTWRecomp e3ccd7a, #402 there)
+    if (!miss && !g_vk.null_desc) LOG("[lsfg] no null descriptors on this GPU: a blank image in the unbound slots\n");
     const VkFormat fmts[3] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8_UNORM, VK_FORMAT_R16G16B16A16_SFLOAT};
     for (int i = 0; i < 3 && !miss; i++) {
         VkFormatProperties fp;
@@ -104,9 +107,12 @@ static bool is_dll(const char *p) {
     return ok;
 }
 
-// The user's Lossless.dll: LARECOMP_LSFG_DLL, else the first of the usual places that has one (the access to all files
-// reaches the storage's folders; the app's data folder, Android/data/com.totkrecompandroid/files, always)
-static bool find_dll(char *out, size_t n) {
+// The user's Lossless.dll: LARECOMP_LSFG_DLL, else the first of the usual places that has one the app can open (the access
+// to all files reaches the storage's folders; the app's data folder, Android/data/com.totkrecompandroid/files, where
+// Video > Frame generation > Import Lossless.dll puts its copy, always). *seen: one there that the app may not open -
+// Android shows a file in Download/ to an app without All files access and then refuses it (BOTWRecomp e3ccd7a).
+static bool find_dll(char *out, size_t n, char *seen, size_t sn) {
+    seen[0] = 0;
     const char *e = getenv("LARECOMP_LSFG_DLL");
     if (e && *e) { snprintf(out, n, "%s", e); return is_dll(out); }
     static const char *const known[] = {"/storage/emulated/0/LSFG/Lossless.dll", "/storage/emulated/0/Download/Lossless.dll",
@@ -117,18 +123,32 @@ static bool find_dll(char *out, size_t n) {
     for (size_t i = 0; i < sizeof known / sizeof *known; i++) {
         snprintf(out, n, "%s", known[i]);
         if (is_dll(out)) return true;
+        if (!seen[0] && access(known[i], F_OK) == 0) {  // (there, but not a DLL the app could read: can it open it?)
+            FILE *f = fopen(known[i], "rb");
+            if (f) fclose(f);
+            else snprintf(seen, sn, "%s", known[i]);
+        }
     }
     return false;
 }
 
+// After Video > Frame generation > Import Lossless.dll put a copy in the app's files (ui/launcher.mm): look again
+static int g_dll_reload;
+void vk_fg_dll_imported(void) { __atomic_store_n(&g_dll_reload, 1, __ATOMIC_RELEASE); }
+
 static bool load(void) {
+    if (__atomic_exchange_n(&g_dll_reload, 0, __ATOMIC_ACQ_REL) && F.state < 0) F.state = 0;
     if (F.state) return F.state > 0;
     if (!device_ok()) return false;
-    char path[512];
-    if (!find_dll(path, sizeof path)) {
-        char b[256];
-        snprintf(b, sizeof b, "unavailable: no Lossless.dll (put yours in LSFG/ or Download/ on the phone's storage, or in %s)",
-                 rt_data_root());
+    char path[512], seen[512];
+    if (!find_dll(path, sizeof path, seen, sizeof seen)) {
+        char b[700];
+        if (seen[0])
+            snprintf(b, sizeof b, "unavailable: Android doesn't let the app open %s (no All files access): import it with "
+                     "Import Lossless.dll below, or allow TOTKDroid All files access in Android's settings", seen);
+        else
+            snprintf(b, sizeof b, "unavailable: no Lossless.dll (put yours in LSFG/ or Download/ on the phone's storage, "
+                     "or import it with Import Lossless.dll below)");
         unavailable(b);
         return false;
     }

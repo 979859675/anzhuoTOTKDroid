@@ -32,6 +32,7 @@ struct lsfg_chain {
     VkSampler samp, samp_border, samp_edge;
     VkBuffer ubuf; VkDeviceMemory umem; uint8_t *umap; VkDeviceSize ustride; lubo ubo[MAX_UBO]; int nubo;
     limg imgs[MAX_IMAGES]; int nimg;
+    limg *blank;  // (a 1x1 image of zeros in the unbound slots, for GPUs without null descriptors: Mali r44, BOTWRecomp #402)
     limg *frames[2];
     // mipmaps
     lpass mip_pass; VkDescriptorSet mip_sets[2]; VkExtent2D flow_ext; limg *mip[MIPS];
@@ -148,6 +149,7 @@ typedef struct { lsfg_chain *c; VkDescriptorSet set; uint32_t n; VkWriteDescript
 static void w_begin(lwriter *w, lsfg_chain *c, VkDescriptorSet s) { w->c = c; w->set = s; w->n = 0; }
 static void w_image(lwriter *w, VkDescriptorType t, VkSampler s, VkImageView v) {
     if (w->n >= 32) return;
+    if (!v && t != VK_DESCRIPTOR_TYPE_SAMPLER && w->c->blank) v = w->c->blank->view;  // (no null descriptors: the blank image)
     w->ii[w->n] = (VkDescriptorImageInfo){s, v, v ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED};
     w->w[w->n] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = w->set, .dstBinding = w->n, .descriptorCount = 1, .descriptorType = t, .pImageInfo = &w->ii[w->n]};
     w->n++;
@@ -212,6 +214,7 @@ lsfg_chain *lsfg_chain_new(const lsfg_modules *mods, VkExtent2D ext, float flow_
     if (!r) r = vk.vkBindBufferMemory(V.dev, c->ubuf, c->umem, 0);
     void *map = NULL; if (!r) r = vk.vkMapMemory(V.dev, c->umem, 0, VK_WHOLE_SIZE, 0, &map);
     if (r) { VRED("lsfg: uniform buffer: %d", r); c->bad = 1; } else c->umap = map;
+    if (!g_vk.null_desc || getenv("LARECOMP_LSFG_BLANK")) c->blank = img_new(c, (VkExtent2D){1, 1}, LSFG_MOTION_FORMAT);  // (=1: as if none, a test)
 
     // Inputs
     for (int i = 0; i < 2; i++) c->frames[i] = img_new(c, ext, LSFG_FORMAT);
@@ -366,6 +369,12 @@ lsfg_chain *lsfg_chain_new(const lsfg_modules *mods, VkExtent2D ext, float flow_
         if (!r) r = vk.vkBeginCommandBuffer(cb, &cbi);
         if (!r) {
             for (int i = 0; i < c->nimg; i++) vka_img_barrier(cb, c->imgs[i].img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+            if (c->blank) {  // (zeros, as a null descriptor reads; BOTWRecomp e3ccd7a)
+                VkClearColorValue z = {{0, 0, 0, 0}};
+                VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdClearColorImage(cb, c->blank->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rr);
+                barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+            }
             for (int t = 0; t < LSFG_MAX_GENERATIONS; t++) vka_img_barrier(cb, outs[t], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
             r = vk.vkEndCommandBuffer(cb);
         }
