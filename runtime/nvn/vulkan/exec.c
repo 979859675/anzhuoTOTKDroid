@@ -6272,7 +6272,11 @@ static uint64_t vc_budget(void) {
     return b;
 }
 #define VC_BUDGET vc_budget()
-typedef struct { uint64_t lo, hi, used_seq; uint32_t gen, epoch; VkBuffer buf; VmaAllocation mem; bool gpu; } VcEnt;
+// (frame: the presented frame it was last drawn from. An entry drawn from in this frame or the last isn't evicted: with
+// more ranges in use than the budget holds, the least recently used went every frame and came back copied whole - on a
+// Dimensity 9500 in 0.3.1's copy mode, 5-8 GB a 2 s window, 2-3 fps. Those draws are copied per draw instead.)
+typedef struct { uint64_t lo, hi, used_seq, frame; uint32_t gen, epoch; VkBuffer buf; VmaAllocation mem; bool gpu; } VcEnt;
+#define VC_KEEP_FRAMES 2
 static VcEnt vc_tab[VC_TAB];
 static uint32_t vc_pend[VC_TAB];  // entries the pending submission draws from (vc_flush brings them up to date)
 static int vc_npend;
@@ -6397,7 +6401,7 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
     bool in_alias = cpu_fill && addr >= ALIAS_BASE && addr + size <= ALIAS_BASE + ALIAS_SIZE && ALIAS_BASE >= VC_BASE;
     if (!in_heap && !in_alias) return false;
     uint64_t lo = (addr - VC_BASE) & ~(VC_PAGE - 1), hi = (addr - VC_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
-    uint64_t pend = vk_pending_seq();
+    uint64_t pend = vk_pending_seq(), frame = renderer_present_count();
     uint64_t h = (lo * 0x9E3779B97F4A7C15ull) ^ (hi * 0xC2B2AE3D27D4EB4Full);
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (VC_TAB - 1), free_slot = ~0u, old_slot = ~0u;
     VcEnt *e = NULL;
@@ -6405,7 +6409,8 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         VcEnt *c = &vc_tab[slot];
         if (c->buf && c->lo == lo && c->hi == hi) { e = c; break; }
         if (!c->buf && free_slot == ~0u) free_slot = slot;
-        if (c->buf && c->used_seq < pend && (old_slot == ~0u || c->used_seq < vc_tab[old_slot].used_seq)) old_slot = slot;
+        if (c->buf && c->used_seq < pend && c->frame + VC_KEEP_FRAMES <= frame &&
+            (old_slot == ~0u || c->used_seq < vc_tab[old_slot].used_seq)) old_slot = slot;
     }
     if (!e) {  // a new range: its own device-local buffer (gen 0: copied whole at the submission)
         if (vc_npend == VC_TAB) return false;
@@ -6417,7 +6422,8 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         while (vc_bytes + (hi - lo) > VC_BUDGET) {  // over budget: the least recently used entry goes
             int lru = -1;
             for (int i = 0; i < VC_TAB; i++)
-                if (vc_tab[i].buf && vc_tab[i].used_seq < pend && (lru < 0 || vc_tab[i].used_seq < vc_tab[lru].used_seq)) lru = i;
+                if (vc_tab[i].buf && vc_tab[i].used_seq < pend && vc_tab[i].frame + VC_KEEP_FRAMES <= frame &&
+                    (lru < 0 || vc_tab[i].used_seq < vc_tab[lru].used_seq)) lru = i;
             if (lru < 0 || !vc_drop(&vc_tab[lru])) return false;
         }
         e = &vc_tab[free_slot];
@@ -6438,6 +6444,7 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         e->used_seq = pend;
         vc_pend[vc_npend++] = (uint32_t)(e - vc_tab);
     }
+    e->frame = frame;
     prof_vc_hits++;
     *buf = e->buf;
     *off = addr - VC_BASE - lo;

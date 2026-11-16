@@ -832,8 +832,13 @@ static bool tex_discard(void) {
     static int on = -1;
     if (on < 0) {
         extern bool vk_low_ram(void);
+        // Off unless asked since 0.3.1 (BOTW's, on with low RAM): TOTK makes new textures over the memory of others it
+        // still has - mip views, streamed pools - and those were first uploaded from the zeros left there, ASTC's error
+        // colour: magenta squares over the Sky Islands with RAM saving on (#57, Mali-G615 MC2; "[discard] ... first
+        // uploaded over the discarded" ~100 times a run, also in #50 #54).
         const char *e = getenv("LARECOMP_TEX_DISCARD");
-        on = e ? atoi(e) != 0 : vk_low_ram();
+        on = e ? atoi(e) != 0 : false;
+        (void)vk_low_ram;
         if (on) LOG("[vk] textures: guest bytes given back after upload (low RAM)\n");
     }
     return on;
