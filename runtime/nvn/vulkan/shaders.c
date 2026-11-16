@@ -310,6 +310,64 @@ static const char *builtin_src(const char *name, int *stage) {
     // differences; the edge is walked both ways until its luma leaves the edge's mean, and the pixel is moved across it
     // by how near it is to the nearer end (or by the 3x3 neighbourhood's sub-pixel blend, whichever is more). a = (1 /
     // size, size).
+    // The default since 2026-11-16 is a lighter one: the colour math mediump (GLSL ES: RelaxedPrecision, fp16 where the
+    // driver does it; texture coordinates highp), FXAA 3.11's default threshold for skipping a pixel (contrast under
+    // 1/16 or under 1/8 of its brightest neighbour; it was the "ultra" 1/32, which sent every faint edge down the slow
+    // path) and its fastest search, preset 12 (5 steps of 1, 1.5, 2, 4, 12 instead of 10). LARECOMP_FXAA_FULL=1: the
+    // previous one below.
+    static int fxaa_full = -1;
+    if (fxaa_full < 0) fxaa_full = getenv("LARECOMP_FXAA_FULL") && atoi(getenv("LARECOMP_FXAA_FULL")) != 0;
+    if (!strcmp(name, "fxaa.frag") && !fxaa_full) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 310 es\n"
+               "precision mediump float;\n"
+               "precision highp int;\n"
+               "layout(set = 0, binding = 0) uniform highp sampler2D t0;\n"
+               "layout(push_constant) uniform P { highp vec4 a; highp vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "float lu(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }\n"
+               "vec3 at(highp vec2 uv) { return textureLod(t0, uv, 0.0).rgb; }\n"
+               "float la(highp vec2 uv) { return lu(at(uv)); }\n"
+               "const float steps[5] = float[](1.0, 1.5, 2.0, 4.0, 12.0);\n"
+               "void main() {\n"
+               "  highp vec2 px = pc.a.xy, uv = gl_FragCoord.xy * px;\n"
+               "  vec3 cM = at(uv);\n"
+               "  float lM = lu(cM), lN = la(uv + vec2(0.0, -px.y)), lS = la(uv + vec2(0.0, px.y));\n"
+               "  float lE = la(uv + vec2(px.x, 0.0)), lW = la(uv + vec2(-px.x, 0.0));\n"
+               "  float mx = max(lM, max(max(lN, lS), max(lE, lW))), mn = min(lM, min(min(lN, lS), min(lE, lW)));\n"
+               "  float range = mx - mn;\n"
+               "  if (range < max(0.0625, mx * 0.125)) { o = vec4(cM, 1.0); return; }\n"
+               "  float lNW = la(uv - px), lSE = la(uv + px);\n"
+               "  float lNE = la(uv + vec2(px.x, -px.y)), lSW = la(uv + vec2(-px.x, px.y));\n"
+               "  float sub = (2.0 * (lN + lS + lE + lW) + lNW + lNE + lSW + lSE) / 12.0;\n"
+               "  float subBlend = smoothstep(0.0, 1.0, clamp(abs(sub - lM) / range, 0.0, 1.0));\n"
+               "  subBlend = subBlend * subBlend * 0.75;\n"
+               "  float hor = 2.0 * abs(lN + lS - 2.0 * lM) + abs(lNE + lSE - 2.0 * lE) + abs(lNW + lSW - 2.0 * lW);\n"
+               "  float ver = 2.0 * abs(lE + lW - 2.0 * lM) + abs(lNE + lNW - 2.0 * lN) + abs(lSE + lSW - 2.0 * lS);\n"
+               "  bool isH = hor >= ver;\n"
+               "  float pL = isH ? lS : lE, nL = isH ? lN : lW;\n"
+               "  float pG = abs(pL - lM), nG = abs(nL - lM);\n"
+               "  highp float stepLen = isH ? px.y : px.x;\n"
+               "  float opp = pL, grad = pG;\n"
+               "  if (pG < nG) { stepLen = -stepLen; opp = nL; grad = nG; }\n"
+               "  highp vec2 uvE = uv + (isH ? vec2(0.0, stepLen * 0.5) : vec2(stepLen * 0.5, 0.0));\n"
+               "  highp vec2 es = isH ? vec2(px.x, 0.0) : vec2(0.0, px.y);\n"
+               "  float edgeL = (lM + opp) * 0.5, thr = grad * 0.25;\n"
+               "  highp vec2 puv = uvE + es, nuv = uvE - es;\n"
+               "  float pD = la(puv) - edgeL, nD = la(nuv) - edgeL;\n"
+               "  bool pEnd = abs(pD) >= thr, nEnd = abs(nD) >= thr;\n"
+               "  for (int i = 1; i < 5 && !(pEnd && nEnd); i++) {\n"
+               "    if (!pEnd) { puv += es * steps[i]; pD = la(puv) - edgeL; pEnd = abs(pD) >= thr; }\n"
+               "    if (!nEnd) { nuv -= es * steps[i]; nD = la(nuv) - edgeL; nEnd = abs(nD) >= thr; }\n"
+               "  }\n"
+               "  highp float pDist = isH ? puv.x - uv.x : puv.y - uv.y, nDist = isH ? uv.x - nuv.x : uv.y - nuv.y;\n"
+               "  highp float shortest = min(pDist, nDist);\n"
+               "  bool sgn = pDist <= nDist ? pD >= 0.0 : nD >= 0.0;\n"
+               "  float edgeBlend = sgn == (lM - edgeL >= 0.0) ? 0.0 : float(0.5 - shortest / (pDist + nDist));\n"
+               "  float f = max(subBlend, edgeBlend);\n"
+               "  o = vec4(at(uv + (isH ? vec2(0.0, stepLen * f) : vec2(stepLen * f, 0.0))), 1.0);\n"
+               "}\n";
+    }
     if (!strcmp(name, "fxaa.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"

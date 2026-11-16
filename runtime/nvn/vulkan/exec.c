@@ -8834,6 +8834,7 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
         post_pass(cb, "fxaa.frag", in, 1, out, m, false);
         v = post_view(out);
     }
+    if (fsr) gp_mark(cb, "present: upscale");  // ([gpuprof]: the AA pass's own row above, the upscale's here)
     if (fsr && up == UPSCALE_SGSR1) {
         float iw = (float)b->width, ih = (float)b->height;
         TexBackend *o = post_image(3, ow, oh, VK_FORMAT_R8G8B8A8_UNORM);
@@ -8854,6 +8855,7 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     }
     vk_full_barrier(cb);
     vk_frame_resume();
+    gp_mark(cb, "present: the final image drawn to the window");  // ([gpuprof]: apart from the AA / upscale passes)
     {
         static uint32_t piw, pih, pow_, poh;
         static int psm = -1, pfs = -1;
