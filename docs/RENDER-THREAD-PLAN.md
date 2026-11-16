@@ -227,7 +227,7 @@ default for any Turnip, and no longer signals the timeline.
 So the texture checks have little left that is cheap. The big remaining item is (c): moving the Vulkan recording to a
 replay thread. It needs the user's go-ahead, because of its size and risk.
 
-## (c) The replay thread: first stages (2026-11-15, morning; work in progress)
+## (c) The replay thread: first stages (2026-11-15, morning; no gain measured, off by default)
 
 The user gave the go-ahead. `runtime/nvn/vulkan/replay.h` / `replay.c`, off by default (`LARECOMP_VK_REPLAY=1`;
 `LARECOMP_AB=<frames>:replay` alternates it between submissions; `LARECOMP_VK_REPLAY_LOG=1`: packets, the replay thread's
@@ -276,8 +276,30 @@ time per packet type, the render thread's waits for the ring and where they come
     game's threads hold the frame at the cap.
   - Also whether the spinning core costs fps through the phone's power budget: some blocks hinted at it.
 
-**Next, in order**:
-1. Uncapped and capped A/Bs with the phone charged.
+**With the phone charged (100%, on the charger; 08:48-09:08)**: no gain, capped or uncapped. Three runs of 170 s on the
+surface seed, `LARECOMP_AB=300:replay`, the first 2700 frames skipped:
+
+| Run | Off (side 0) | Replay (side 1) |
+|---|---|---|
+| forced 60 (`rp_ab8`) | 46.8 fps, render 19.35 ms | 46.5 fps, render 19.10 ms |
+| uncapped (`rp_unc2`: `PRESENT_WAIT=0`, mailbox) | 42.7 fps, render 21.50 ms | 42.1 fps, render 21.27 ms |
+
+- The pairs split both ways. Replay saves ~0.25 ms of `render` and gives no fps.
+- **Heat is the limit in this scene.** The SoC reached ~93 °C within a minute of each run, with the prime cores
+  capped at 1.8-2.0 GHz. It dropped to 43 °C within minutes after.
+  - Hot, the frame doesn't follow the render thread's own work: the replay thread takes ~11.5 ms a frame of Turnip
+    recording off it, yet `render` stays ~20 ms on both sides.
+  - Splitting the work over two cores costs power: encoding plus decoding, the 2 ms spin, ~24 waits a frame
+    (~2.7 ms). Under a power cap, that power is what the frame lacks.
+- **An event in the seed holds 30 fps.** A cutscene mark from ~50 s (`[totk] cutscene: presents held at 30 fps`,
+  never "over") held the first run (`rp_ab7`) at 30 fps from ~40 s. That is the "event from ~95 s" seen before. A/Bs
+  on this seed need `LARECOMP_CUTSCENE_FPS30=0`.
+- What that leaves for (c): the next stages would only shave waits (~2.7 ms a frame) from a thread that, hot, isn't
+  what holds the frame. The ~5 ms of render-thread CPU it saves would show only on a cool phone, or on one whose
+  render thread holds the frame at its clocks.
+
+**Next, in order** (1 done: no gain):
+1. ~~Uncapped and capped A/Bs with the phone charged.~~
 2. Clears inside passes as packets (`vkCmdClearAttachments`, the clear draw's binds).
 3. The submission itself on the replay thread (end, submit), so the render thread stops waiting at each of the
    ~10 submissions a frame.
