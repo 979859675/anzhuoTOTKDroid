@@ -25,6 +25,9 @@
 #define LOG(...) fprintf(stderr, __VA_ARGS__)
 #endif
 
+// The bytes written to the engine's uniform buffers since the start: what the generated frames upload (the [device] line)
+static uint64_t g_fg_uploaded;
+
 namespace winfg {
 namespace {
 
@@ -459,12 +462,15 @@ bool winfg_build(VkExtent2D e, const WinfgOpts *o, const VkImageView *outs, int 
     {
         FlowUBO eu{S.opts.flow_scale, 0, 0.6f, 1.6f};
         std::memcpy(S.expandU.ptr, &eu, sizeof eu);
+        g_fg_uploaded += sizeof eu;
         for (int l = 0; l < kLevels; ++l) {
             FlowUBO fu{S.opts.flow_scale, (uint32_t)l, 0.6f, 1.6f};
             std::memcpy(S.flowU[l].ptr, &fu, sizeof fu);
+            g_fg_uploaded += sizeof fu;
         }
         FlowRegUBO ru{kFrDt, kFrLambda, kFrEdge, kFrEps};
         std::memcpy(S.flowRegU.ptr, &ru, sizeof ru);
+        g_fg_uploaded += sizeof ru;
     }
 
     // ── descriptor sets (all fixed; the frame's own images are chosen by its ring slot) ──
@@ -597,6 +603,7 @@ void winfg_record(VkCommandBuffer cmd, uint64_t count, int ngen) {
             g.appT[0] = (float)S.gmRun[4]; g.appT[1] = (float)S.gmRun[5];
         }
         std::memcpy(S.gmU[k].ptr, &g, sizeof g);
+        g_fg_uploaded += sizeof g;
     }
     static unsigned long long lastLog = 0;
     static int lastEng = -1;
@@ -611,6 +618,7 @@ void winfg_record(VkCommandBuffer cmd, uint64_t count, int ngen) {
         SynthUBO su{S.opts.flow_scale, (float)(g + 1) / (float)(ngen + 1), kBeta, kLambda, kEpsilon, kPhotoScale, 0, 0,
                     0, 0, 0, 0};
         std::memcpy(S.synthU[k][g].ptr, &su, sizeof su);
+        g_fg_uploaded += sizeof su;
     }
     const bool frEng = S.opts.fr != 2 && S.opts.fr_iters > 0;
 
@@ -708,6 +716,7 @@ bool winfg_built(void) { return winfg::winfg_built(); }
 void winfg_begin(uint64_t count) { winfg::winfg_begin(count); }
 VkImage winfg_input(VkCommandBuffer cb, uint64_t count) { return winfg::winfg_input(cb, count); }
 void winfg_record(VkCommandBuffer cb, uint64_t count, int ngen) { winfg::winfg_record(cb, count, ngen); }
+uint64_t winfg_upload_bytes(void) { return g_fg_uploaded; }
 }
 
 #endif  // __ANDROID__

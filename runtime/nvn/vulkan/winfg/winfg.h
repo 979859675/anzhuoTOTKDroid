@@ -37,6 +37,7 @@ bool winfg_init(VkDevice dev, VkPhysicalDevice phys, const WinfgSync *sync);
 bool winfg_build(VkExtent2D e, const WinfgOpts *o, const VkImageView *outs, int nout);
 void winfg_free(void);       // the size's resources; the caller has made the device idle
 bool winfg_built(void);
+uint64_t winfg_upload_bytes(void);  // the bytes written to its uniform buffers since the start
 
 // Before a game frame's work: waits for the ring slot's previous submission (the slot is reused).
 void winfg_begin(uint64_t count);

@@ -51,6 +51,16 @@ static int fg_engine(void) {
 static bool fg_on(void) { return fg_engine() == FG_LSFG; }
 bool vk_fg_built(void) { return true; }  // (Win-FG is in every build; LSFG reports its absence in the status)
 
+// The bytes the frame generation wrote to the GPU since the start: its uniform blocks (the [device] line)
+uint64_t vk_fg_upload_bytes(void) {
+#ifdef TOTK_LSFG
+    extern uint64_t lsfg_upload_bytes(void);  // (lsfg/lsfg_chain.c)
+    return winfg_upload_bytes() + lsfg_upload_bytes();
+#else
+    return winfg_upload_bytes();
+#endif
+}
+
 // The panel's refresh period (s), 0 when unknown
 static double refresh_s(void) {
     const SDL_DisplayMode *m = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
