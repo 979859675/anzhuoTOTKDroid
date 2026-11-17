@@ -239,6 +239,7 @@ static int winfg_frame(TexBackend *b, double *hold, TexBackend *gen[3]) {
 }
 
 #ifndef TOTK_LSFG
+bool vk_fg_lsfg_dll_present(void) { return false; }  // (no LSFG in this build)
 static void lsfg_idle(void) {}
 static int lsfg_frame(TexBackend *b, double *hold, TexBackend *gen[3]) {
     (void)b; (void)gen;
@@ -337,7 +338,6 @@ void vk_fg_dll_imported(void) { __atomic_store_n(&g_dll_reload, 1, __ATOMIC_RELE
 // The menu's frame generation list: is a Lossless.dll there that the app can open? (looked again at most once a second:
 // the menu draws every frame)
 bool vk_fg_lsfg_dll_present(void) {
-#ifdef TOTK_LSFG
     static uint64_t at;
     static bool have;
     uint64_t now = SDL_GetTicksNS();
@@ -347,9 +347,6 @@ bool vk_fg_lsfg_dll_present(void) {
         at = now;
     }
     return have;
-#else
-    return false;
-#endif
 }
 
 static bool load(void) {

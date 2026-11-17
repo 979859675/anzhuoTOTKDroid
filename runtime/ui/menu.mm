@@ -68,6 +68,7 @@ bool menu_is_open(void) { return g_open.load(); }
 extern "C" bool touch_controls_visible(void);  // ui/touch_controls.mm
 extern "C" const char *vk_fg_status(void);      // nvn/vulkan/framegen.c
 extern "C" bool vk_fg_built(void);
+extern "C" bool vk_fg_lsfg_dll_present(void);  // nvn/vulkan/framegen.c
 extern "C" void touch_controls_draw(ImVec2 display, ImFont *font);
 #endif
 static void set_open(bool open);
@@ -614,7 +615,6 @@ static void tab_display(void) {
         // and turned the generation off)
         void launcher_pick_lsfg_dll(void);
         std::string launcher_lsfg_import_msg(void);
-        bool vk_fg_lsfg_dll_present(void);
         static bool fg_list;
         static const char *engines[] = {"Off", "Win-FG", "LSFG"};
         static const char *engine_desc[] = {
