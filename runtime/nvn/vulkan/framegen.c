@@ -334,6 +334,24 @@ static bool find_dll(char *out, size_t n, char *seen, size_t sn) {
 static int g_dll_reload;
 void vk_fg_dll_imported(void) { __atomic_store_n(&g_dll_reload, 1, __ATOMIC_RELEASE); }
 
+// The menu's frame generation list: is a Lossless.dll there that the app can open? (looked again at most once a second:
+// the menu draws every frame)
+bool vk_fg_lsfg_dll_present(void) {
+#ifdef TOTK_LSFG
+    static uint64_t at;
+    static bool have;
+    uint64_t now = SDL_GetTicksNS();
+    if (!at || now - at > 1000000000ull) {
+        char p[512], seen[512];
+        have = find_dll(p, sizeof p, seen, sizeof seen);
+        at = now;
+    }
+    return have;
+#else
+    return false;
+#endif
+}
+
 static bool load(void) {
     if (__atomic_exchange_n(&g_dll_reload, 0, __ATOMIC_ACQ_REL) && F.state < 0) F.state = 0;
     if (F.state) return F.state > 0;

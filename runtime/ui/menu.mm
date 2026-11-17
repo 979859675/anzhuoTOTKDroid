@@ -609,12 +609,39 @@ static void tab_display(void) {
 
 #ifdef __ANDROID__
     if (g_settings.fps_mode == 4) ImGui::TextWrapped("%s", tr("40 fps on a 120 Hz display, 45 on 90 Hz, 30 on 60 Hz."));
-    {   // Frame generation (nvn/vulkan/framegen.c): Win-FG (built in) or LSFG (the player's own Lossless.dll)
+    {   // Frame generation (nvn/vulkan/framegen.c): Win-FG (built in) or LSFG (the player's own Lossless.dll). The row
+        // opens the list of the three: a tap on the row no longer steps through them (a quick second tap picked LSFG
+        // and turned the generation off)
+        void launcher_pick_lsfg_dll(void);
+        std::string launcher_lsfg_import_msg(void);
+        bool vk_fg_lsfg_dll_present(void);
+        static bool fg_list;
         static const char *engines[] = {"Off", "Win-FG", "LSFG"};
-        opt_choice("Frame generation", &g_settings.fg_engine, engines, 3, FG_OFF,
-                   "Shows frames made between the game's own, for smoother motion. Win-FG: built in (win-fg, MIT), "
-                   "needs a spare GPU. LSFG: Lossless Scaling's frame generation, with your own Lossless.dll in the LSFG or "
-                   "Download folder of the phone's storage. Both add a little delay; 2x on 30 fps shows 60.");
+        static const char *engine_desc[] = {
+            "No frame generation.",
+            "Built in (win-fg, MIT). Needs a spare GPU. Adds a little delay.",
+            "Lossless Scaling's frame generation. Needs your own Lossless.dll: import it below, or put it in the LSFG or "
+            "Download folder of the phone's storage."};
+        int eng = g_settings.fg_engine >= FG_OFF && g_settings.fg_engine <= FG_LSFG ? g_settings.fg_engine : FG_OFF;
+        if (opt_action("Frame generation", engines[eng], fg_list ? "Tap an engine to choose it."
+                                                                 : "Tap to choose Off, Win-FG or LSFG."))
+            fg_list = !fg_list;
+        if (fg_list) {
+            opt_indent(1);
+            bool dll = vk_fg_lsfg_dll_present();
+            for (int i = 0; i < 3; i++) {
+                bool no_dll = i == FG_LSFG && !dll;
+                const char *d = no_dll ? "Not available: no Lossless.dll yet. Import it below, or put it in the LSFG or "
+                                         "Download folder of the phone's storage."
+                                       : engine_desc[i];
+                if (no_dll) opt_disable_next();
+                if (opt_radio(engines[i], g_settings.fg_engine == i, d) && !no_dll) {
+                    g_settings.fg_engine = i;
+                    fg_list = false;
+                }
+            }
+            opt_indent(-1);
+        }
         if (g_settings.fg_engine) {
             static const char *mults[] = {"2x", "3x", "4x"};
             int m = g_settings.fg_mult - 2;
@@ -637,8 +664,6 @@ static void tab_display(void) {
                            "Auto: the game's own."))
                 g_settings.lsfg_flow = flv[k];
             if (vk_fg_built()) {  // (a copy in the app's own files: read without All files access; BOTWRecomp e3ccd7a)
-                void launcher_pick_lsfg_dll(void);
-                std::string launcher_lsfg_import_msg(void);
                 std::string m = launcher_lsfg_import_msg();
                 char id[900];
                 snprintf(id, sizeof id, "%s%s%s", tr("Picks your Lossless.dll with Android's file picker and keeps a copy "

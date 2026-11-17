@@ -164,6 +164,17 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         plat_device_stats(&ds);
         read_caps();
         fg = vk_fg_state();
+        {   // once a minute: the phone's state for the log (the [vk] lines have the upload and texture counts every 2 s)
+            static uint64_t next_dev;
+            if (now >= next_dev) {
+                next_dev = now + 60000000000ull;
+                extern uint64_t vk_upload_total_bytes(void);  // (vulkan/exec.c)
+                fprintf(stderr, "[device] RAM %u MB (available %u MB), SoC %.1f C, battery %.1f C, thermal %d, headroom %.2f, "
+                        "game %.1f fps, shown %.1f fps, frame generation %d, uploaded %llu MB in all\n",
+                        ds.rss_mb, ds.avail_mb, ds.soc_temp_c, ds.batt_temp_c, ds.thermal, ds.headroom,
+                        (double)game_fps, (double)shown, fg, (unsigned long long)(vk_upload_total_bytes() >> 20));
+            }
+        }
         static bool said;
         if (!said) {  // (once: the overlay's items and frame generation's state, for the log)
             said = true;
@@ -227,7 +238,8 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     char a[16], b[16], s[160], f[48];
     // with frame generation on: the game's frames > the shown ones (the generated frames included), both always
     // (the two rates are what it is for); otherwise the one rate
-    if (gen && isfinite(presented)) snprintf(f, sizeof f, "%s > %s FPS", number(a, fps), number(b, presented));
+    if (fg == 2 && isfinite(fps)) snprintf(f, sizeof f, "%s > ... FPS", number(a, fps));  // (on, no generated frame yet)
+    else if (gen && isfinite(presented)) snprintf(f, sizeof f, "%s > %s FPS", number(a, fps), number(b, presented));
     else if (isfinite(presented) && presented > fps + 1) snprintf(f, sizeof f, "%s > %s FPS", number(a, fps), number(b, presented));
     else snprintf(f, sizeof f, "%s FPS", number(a, fps));
     char ram[24];
