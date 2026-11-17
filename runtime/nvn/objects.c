@@ -8,6 +8,7 @@
 #include "../settings.h"
 #include "../framepace.h"
 #include "../cheats.h"
+#include "../platform.h"
 #include "nvn.h"
 #include "vulkan/writeback_policy.h"
 
@@ -329,15 +330,33 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     // lag on from the start, some ponds stayed white for the whole session, and turned on later in play they were right
     // (2026-10-28, POCO F7 Ultra; issue #43 on an Adreno 740) - the water's colour taken once, while loading, from a GPU
     // result the lag made a frame old. So each load (the save, a fast travel) runs its first seconds without it.
+    // Away from the world for 15 s in a row before that, not at once: TOTK's menus can't be told from a load
+    // (framepace_in_menu is BOTW 1.8.2's; the inventory, the map and a loading screen all leave the 3D scene undrawn),
+    // so every menu counted as leaving the world and cost the next 300 frames their lag - after closing the inventory
+    // the CPU waited for the GPU, 21-25 fps for 12-14 s on the POCO F7 Ultra (#53 #24; on its own save copy 2026-11-16,
+    // a menu opened 3 times: 27.3-29.8 fps after each, steady 30.0 with LARECOMP_SYNC_LAG=1). After BOTWRecomp e7df205
+    // (45 frames there: its menus are known). The first load of a session settles as before; a load shorter than that
+    // keeps the lag. LARECOMP_LAG_AWAY_S=<s> (0: as before).
     if (lag > 0 && env_lag < 0) {
         enum { LAG_SETTLE = 300 };
+        static int away_s = -1;
+        if (away_s < 0) away_s = getenv("LARECOMP_LAG_AWAY_S") ? atoi(getenv("LARECOMP_LAG_AWAY_S")) : 15;
         extern uint64_t vk_scene_frame(void), renderer_present_count(void);
-        static uint64_t world_since;
-        uint64_t now = renderer_present_count(), seen = vk_scene_frame();
+        static uint64_t world_since, away_since_ns;
+        uint64_t now = renderer_present_count(), seen = vk_scene_frame(), now_ns = plat_now_ns();
         bool world = !framepace_on_title() && seen && (now - seen < 20 || framepace_in_menu());
-        if (!world) world_since = 0;
-        else if (!world_since) world_since = now;
-        if (!world_since || now - world_since < LAG_SETTLE) lag = 0;
+        if (!world) {
+            if (!away_since_ns) away_since_ns = now_ns;
+            if (world_since && now_ns - away_since_ns >= (uint64_t)away_s * 1000000000ull) {
+                LOG("[synclag] off until the world has been back for %d frames (away %d s: title %d, scene %llu frames "
+                    "ago)\n", (int)LAG_SETTLE, away_s, framepace_on_title(), (unsigned long long)(seen ? now - seen : 0));
+                world_since = 0;
+            }
+        } else {
+            away_since_ns = 0;
+            if (!world_since) world_since = now;
+        }
+        if (!world_since || !world || now - world_since < LAG_SETTLE) lag = 0;
     }
     extern int vk_ab(const char *what);
     int ab = vk_ab("synclag");
@@ -1120,6 +1139,11 @@ static void texels_region(Cpu *c, bool to_linear, bool strided) {
                           wb, hb, layers ? 1 : d, to_linear);
     }
     if (!to_linear) backend_pool_written(t->addr, tegra_total_size(&t->layout));
+    if (!to_linear) {  // (into a texture the GPU drew in: its image gets the rectangle on its next use - vulkan/textures.c)
+        extern void renderer_texels_written(NvnTexture *t, uint32_t level, uint32_t layer0, uint32_t nlayers, uint32_t xb,
+                                            uint32_t yb, uint32_t wb, uint32_t hb);
+        renderer_texels_written(t, level, layers ? layer0 + (uint32_t)r[2] : 0, layers ? d : 1, x0, y0, wb, hb);
+    }
     if (nvn_watch_texaddr() && t->addr <= nvn_watch_texaddr() && nvn_watch_texaddr() < t->addr + tegra_total_size(&t->layout))
         LOG("[watch] %s %ux%u fmt %#x level %u region %d,%d,%d %dx%dx%d, first bytes %02x %02x %02x %02x\n",
             to_linear ? "ReadTexels" : "WriteTexels", t->width, t->height, t->format, level, r[0], r[1], r[2], r[3], r[4],
@@ -1674,6 +1698,15 @@ void rt_cutscene_tick(int which) {
 // A movie's video frame handed to the game (hle/movie.c): pre-rendered scenes (TOTK's DmT_OP_GanonWakeUp_PreRender)
 // call none of the marks, and at 60 fps the picture ran ahead of the sound.
 void rt_movie_frame(void) { atomic_store_explicit(&cutscene_ns, plat_now_ns(), memory_order_relaxed); }
+// The scripted camera animation finished (native.c fix_camera_done): no 200 ms tail. Another mark still running
+// once or twice a frame sets the hold again at the next present.
+void rt_cutscene_done(void) {
+    atomic_store_explicit(&cutscene_frame_hits[3], 0, memory_order_relaxed);
+    atomic_store_explicit(&cutscene_ns, 0, memory_order_relaxed);
+    static _Atomic uint32_t n;
+    uint32_t k = atomic_fetch_add_explicit(&n, 1, memory_order_relaxed);
+    if (k < 8 || getenv("LARECOMP_LOG_CUTSCENE")) LOG("[totk] cutscene: camera animation done\n");
+}
 static void rt_cutscene_present(void) {  // (each present: the marks of the frame it ends)
     for (int i = 0; i < 4; i++) {
         uint32_t n = atomic_exchange_explicit(&cutscene_frame_hits[i], 0, memory_order_relaxed);
@@ -1719,13 +1752,63 @@ bool rt_totk_auto(void) {
     return on && g_game_version == GAME_V_143 && !g_settings.fps_mode && rt_fps60();
 }
 bool rt_totk_auto60(void) { return rt_totk_auto() && totk_auto60; }
+// ... and a hot phone holds 30 (the idea of totk-android's TOTK_THERMAL_STEP): Android's thermal status SEVERE (3) or
+// more, or its 10 s headroom forecast at 1.0 (throttling begins), brings 30 before the clocks fall; 60 is tried again
+// only after 30 s in a row under MODERATE (2) with the headroom under 0.8 (or none reported). Read once a second
+// from what the activity reports (platform/android.c). LARECOMP_THERMAL_HOLD=0: off. (In the log: "[pace] Auto: the phone is
+// hot" and "cooled down".)
+static bool totk_thermal_hold(uint64_t now) {
+    static int on = -1;
+    if (on < 0) on = !getenv("LARECOMP_THERMAL_HOLD") || atoi(getenv("LARECOMP_THERMAL_HOLD")) != 0;
+    static uint64_t checked, cool_since;
+    static bool held;
+    if (!on || now - checked < 1000000000ull) return held;
+    checked = now;
+    PlatDeviceStats s = {.thermal = -1, .headroom = -1};
+#ifdef __ANDROID__
+    plat_device_stats(&s);
+#endif
+    // (LARECOMP_THERMAL_TEST=<status>[,<headroom>][@<seconds>]: that reading instead, for the first <seconds> - tests)
+    static const char *test = (const char *)1;
+    if (test == (const char *)1) test = getenv("LARECOMP_THERMAL_TEST");
+    if (test) {
+        static uint64_t t0;
+        if (!t0) t0 = now;
+        const char *at = strchr(test, '@');
+        if (!at || now - t0 < (uint64_t)(atof(at + 1) * 1e9)) {
+            s.thermal = atoi(test);
+            const char *c = strchr(test, ',');
+            s.headroom = c && (!at || c < at) ? (float)atof(c + 1) : -1;
+        }
+    }
+    bool hot = s.thermal >= 3 || s.headroom >= 1.0f, cool = s.thermal >= 0 && s.thermal < 2 && s.headroom < 0.8f;
+    if (hot) cool_since = 0;
+    if (!held && hot) {
+        held = true;
+        LOG("[pace] Auto: the phone is hot (thermal status %d, headroom %.2f): 30 fps until it cools\n", s.thermal, s.headroom);
+    } else if (held) {
+        if (!cool) cool_since = 0;
+        else if (!cool_since) cool_since = now;
+        else if (now - cool_since >= 30000000000ull) {
+            held = false, cool_since = 0;
+            LOG("[pace] Auto: cooled down (thermal status %d, headroom %.2f)\n", s.thermal, s.headroom);
+        }
+    }
+    return held;
+}
 static void totk_auto_present(uint64_t now) {
     static uint64_t last, win_start, retry_at, trial_at, backoff = 20000000000ull;
     static uint64_t sum;
     static int n, bad;
     uint64_t p = last ? now - last : 0;
     last = now;
-    if (!rt_totk_auto() || !p || p > 100000000ull || rt_cutscene()) return;
+    if (!rt_totk_auto()) return;
+    if (totk_thermal_hold(now)) {
+        if (totk_auto60) totk_auto60 = false, trial_at = 0, bad = 0, sum = n = 0, win_start = 0;
+        retry_at = now;  // (60 tried as soon as it has cooled)
+        return;
+    }
+    if (!p || p > 100000000ull || rt_cutscene()) return;
     if (!totk_auto60 && now >= retry_at) {
         totk_auto60 = true, trial_at = now, bad = 0;
         sum = n = 0, win_start = now;
@@ -1775,6 +1858,36 @@ static int realtime_on(void) {
     return on;
 }
 bool rt_realtime(void) { return realtime_on(); }  // (tools/patches.py: the equipment-switch cooldown)
+
+// The optional rendering reductions (native.c fix_shadow_size / fix_game_fxaa / fix_far_clamp): shadow map size 0 (the
+// game's) or 288 / 256; the game's own FXAA on / off; the render far plane capped at that many metres (0: not). The
+// Video tab's choices (g_settings, read each time: they apply at once), or LARECOMP_SHADOW_RES=<0|288|256>,
+// LARECOMP_GAME_FXAA=<0|1>, LARECOMP_FAR_CLAMP=<metres> over them.
+void rt_render_opts(int *shadow, int *fxaa, float *far_cap) {
+    static int es = -2, ef = -2;
+    static float efc = -2;
+    if (es == -2) {
+        const char *e = getenv("LARECOMP_SHADOW_RES");
+        es = e ? (atoi(e) == 288 || atoi(e) == 256 ? atoi(e) : 0) : -1;
+        e = getenv("LARECOMP_GAME_FXAA");
+        ef = e ? atoi(e) != 0 : -1;
+        e = getenv("LARECOMP_FAR_CLAMP");
+        efc = e ? (float)atof(e) : -1;
+    }
+    int s = es >= 0 ? es : g_settings.shadow_res, f = ef >= 0 ? ef : g_settings.game_fxaa;
+    float fc = efc >= 0 ? efc : (float)g_settings.far_clip;
+    if (s != 288 && s != 256) s = 0;
+    static int ls = -1, lf = -1;
+    static float lfc = -1;
+    if (s != ls || f != lf || fc != lfc) {  // (each change, once)
+        ls = s, lf = f, lfc = fc;
+        char far[32] = "the game's", shadows[16] = "the game's";
+        if (fc > 0) snprintf(far, sizeof far, "at most %.0f m", fc);
+        if (s) snprintf(shadows, sizeof shadows, "%d", s);
+        LOG("[totk] rendering: shadow maps %s, the game's FXAA %s, far plane %s\n", shadows, f ? "on" : "off", far);
+    }
+    *shadow = s, *fxaa = f, *far_cap = fc;
+}
 static void frame_step_update(uint64_t now_ns) {
     static uint64_t last;
     static double samples[5];
@@ -1924,9 +2037,68 @@ NVN(nvnQueueAcquireTexture) {
     RET(0);
 }
 uint64_t g_present_vsync_wait_ns;  // (the last present's wait for the vsync grid: the ADPF report, vulkan/exec.c)
+#ifdef __ANDROID__
+// The app in the background (Home, the recent apps, another app on top: vulkan/device.c gets SDL's background and
+// foreground events): the game stops at its next present until it is back. Before, it kept running unseen, without
+// its pace (nothing presented): 55-60 fps on a POCO F7 Ultra, 232% of a core against 178% in play, the world going on.
+// A save being written goes on first (services/fs.c fs_save_pending: until its Commit), so Android killing the app in
+// the background doesn't cut it in half. The presenting thread gives core 0 back while it waits (kernel.c), as for
+// the renderer. LARECOMP_BG_PAUSE=0: off.
+bool fs_save_pending(void);
+static pthread_mutex_t bg_m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t bg_cv = PTHREAD_COND_INITIALIZER;
+static bool bg_paused;  // (bg_m)
+void nvn_background(bool on) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = !getenv("LARECOMP_BG_PAUSE") || atoi(getenv("LARECOMP_BG_PAUSE"));
+    if (!enabled) return;
+    pthread_mutex_lock(&bg_m);
+    bg_paused = on;
+    pthread_cond_broadcast(&bg_cv);
+    pthread_mutex_unlock(&bg_m);
+}
+static void bg_wait(void) {
+    if (!__atomic_load_n(&bg_paused, __ATOMIC_RELAXED)) return;
+    uint64_t t0 = plat_now_ns();
+    bool waited = false;
+    pthread_mutex_lock(&bg_m);
+    // (a save written meanwhile - the save's own thread, which may need the game's frames to finish it: let them go
+    // on until its Commit, checked every 100 ms)
+    while (bg_paused && !fs_save_pending()) {
+        if (!waited) {
+            waited = true;
+            pthread_mutex_unlock(&bg_m);
+            LOG("[pace] in the background: the game stopped at its present\n");
+            kernel_blocking_begin();
+            pthread_mutex_lock(&bg_m);
+            continue;
+        }
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += 100000000;
+        if (until.tv_nsec >= 1000000000) until.tv_sec++, until.tv_nsec -= 1000000000;
+        pthread_cond_timedwait(&bg_cv, &bg_m, &until);
+    }
+    bool still = bg_paused;
+    pthread_mutex_unlock(&bg_m);
+    if (still) {  // (a save being written)
+        static int logged;
+        if (logged++ < 5) LOG("[pace] in the background, a save being written: the game goes on until it is committed\n");
+    }
+    if (waited) {
+        kernel_blocking_end();
+        LOG("[pace] %s after %.1f s\n", still ? "the game goes on for a save" : "back in the foreground: the game goes on",
+            (plat_now_ns() - t0) / 1e9);
+    }
+}
+#endif
+
 NVN(nvnQueuePresentTexture) {
     NvnWindow *w = HOST(NvnWindow, A(1));
     int i = (int)A(2);
+#ifdef __ANDROID__
+    bg_wait();
+#endif
     cheats_frame();   // the data cheats that are on (cheats.c; nothing before the game runs)
     {   // (which guest thread presents: LARECOMP_PROF_SVC_TID, kernel.c)
         static uint64_t last_id = ~0ull;

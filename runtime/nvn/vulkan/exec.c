@@ -9,6 +9,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef __ANDROID__
@@ -22,6 +23,7 @@
 #include "vk.h"
 #include "buffer_copy.h"
 #include "timing_trace.h"
+#include "replay.h"
 #include "../renderer.h"
 #include "../../settings.h"
 #include "../../paths.h"
@@ -50,6 +52,7 @@ static uint64_t cum_exec, cum_wait, cum_draws, cum_submits;  // (profiling) neve
 #ifdef __ANDROID__
 uint64_t vk_cum_wait_ns(void) { return cum_wait; }  // (the performance overlay: time spent waiting on the GPU)
 #endif
+static uint32_t prof_dirty[4];  // (LARECOMP_VK_PROF) passes restarted: in-place read, feedback copy, unbound slot, other targets
 static uint32_t prof_end_line[4096];  // passes ended, by the exec.c line that ended them (0: submit / present)
 uint64_t prof_views_created;  // textures.c vk_image_view cache misses
 uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
@@ -74,6 +77,7 @@ void vk_collect_dead(void);
 typedef struct {
     VkCommandBuffer main, upload;
     VkCommandPool cpool;  // (their own pool, reset whole when the slot is reused - begin_cb)
+    VkCommandPool upool;  // (with the replay thread, replay.h: the upload buffer's own - it records while the main one does)
     bool main_begun, upload_begun, ts;  // ts: GPU timestamps written (profiling)
     uint64_t seq;
     VkDescriptorPool pools[16];
@@ -102,9 +106,149 @@ static int nlclear;
 static uint32_t pass_written;  // (the attachments this pass's draws wrote so far: draw_writes)
 static uint32_t pass_dup_null;  // (color slots left unbound: their image is bound in another slot - begin_pass)
 
+// (diagnosis) LARECOMP_DRV_TIMES=1: time in the driver calls around submissions, per frame every 120 frames ("[drvt]")
+enum { DT_RESET_DS, DT_RESET_CMD, DT_BEGIN, DT_END, DT_SUBMIT, DT_COMPLETED, DT_ALLOC_SET, DT_AFTER, DT_N };
+static uint64_t drvt_ns[DT_N], drvt_n[DT_N];
+static int drvt_on = -1;
+static inline uint64_t drvt_t0(void) {
+    if (drvt_on < 0) drvt_on = getenv("LARECOMP_DRV_TIMES") != NULL;
+    return drvt_on ? plat_now_ns() : 0;
+}
+static inline void drvt_add(int k, uint64_t t0) { if (t0) drvt_ns[k] += plat_now_ns() - t0, drvt_n[k]++; }
+uint64_t drvt_tex_full[3], drvt_tex_full_bytes;  // (textures.c upload_texture: whole hashes by size, and their bytes)
+// The last submission the GPU finished. With the waiter thread (seq_thread_on, below) it is read from what that
+// thread saw; else asked of the driver, at most every LARECOMP_SEQ_CACHE_US (default 0: every time) - the value in
+// between is the last one read: it only grows, and a lower one only makes a caller free or reuse a little later.
+// Turnip on KGSL (Galaxy Tab A9+, Adreno 619, v26.0.0 R8) emulates the timeline with a binary sync per submission,
+// and reading its value waits in the kernel: asked at every submission (vk_collect_dead, the ring, the caches), it
+// was 73% of the render thread's time there (2026-11-13).
+static _Atomic uint64_t done_cached, done_asked;  // (vk_completed_seq's last answer, and when it asked)
+static void done_note(uint64_t v) {
+    uint64_t c = atomic_load_explicit(&done_cached, memory_order_relaxed);
+    while (v > c && !atomic_compare_exchange_weak(&done_cached, &c, v)) {}
+}
+// A thread of its own waits on the GPU, submission after submission, and keeps done_cached: what the GPU finished is
+// then read without asking the driver. On Turnip over KGSL (Galaxy Tab A9+) reading the timeline's value waited in
+// the kernel until the GPU had finished what was submitted - the render thread stopped after every submission until
+// the GPU caught up, so the two never worked at the same time (half of its time; 2026-11-13). Default: on with Turnip
+// (any phone: its timeline is emulated over KGSL) and on low RAM (exec.c vk_low_ram); LARECOMP_SEQ_THREAD=1 / 0.
+// It waits on a fence per submission (SEQ_FENCES of them, reused in turn), not on the timeline: Mesa emulates the
+// timeline there (vk_sync_timeline) behind one mutex, and its waits held it - every vkQueueSubmit2 (which signals the
+// timeline) stopped on that mutex until the GPU had finished, ~13% of the render thread's time and ~15 ms of an idle
+// GPU inside each world frame (simpleperf --trace-offcpu, 2026-11-14). The others' waits (vk_wait_seq) go by what it
+// found (done_cv), so no thread but the submitting one touches the timeline. LARECOMP_SEQ_FENCES=0: the timeline, as
+// before.
+#define SEQ_FENCES 64
+static int seq_thread = -1;
+static bool seq_thread_broken, seq_fences_on;
+static VkFence seq_fence[SEQ_FENCES];
+static pthread_mutex_t sw_m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sw_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t done_cv = PTHREAD_COND_INITIALIZER;  // (sw_m: done_cached grew, or the thread broke)
+static _Atomic uint64_t sw_submitted;
+static void *seq_waiter(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&sw_m);
+        uint64_t done;
+        while ((done = atomic_load(&done_cached)) >= atomic_load(&sw_submitted)) pthread_cond_wait(&sw_cv, &sw_m);
+        pthread_mutex_unlock(&sw_m);
+        uint64_t want = done + 1;
+        VkResult r;
+        if (seq_fences_on) r = vkWaitForFences(g_vk.dev, 1, &seq_fence[want % SEQ_FENCES], VK_TRUE, 1000000000ull);
+        else {
+            VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+                                      .pSemaphores = &g_vk.timeline, .pValues = &want};
+            r = vkWaitSemaphores(g_vk.dev, &wi, 1000000000ull);
+        }
+        if (r == VK_SUCCESS) {
+            pthread_mutex_lock(&sw_m);
+            done_note(want);
+            pthread_cond_broadcast(&done_cv);
+            pthread_mutex_unlock(&sw_m);
+        } else if (r != VK_TIMEOUT) {  // (device lost: the callers' own waits report it)
+            pthread_mutex_lock(&sw_m);
+            seq_thread_broken = true;
+            pthread_cond_broadcast(&done_cv);
+            pthread_mutex_unlock(&sw_m);
+            return NULL;
+        }
+    }
+}
+static bool seq_thread_on(void) {
+    if (seq_thread < 0) {
+        extern bool vk_low_ram(void);
+        const char *e = getenv("LARECOMP_SEQ_THREAD");
+        extern bool vk_driver_is_turnip(void);  // (device.c: Mesa's emulated timeline, KGSL - every Turnip phone)
+        seq_thread = e ? atoi(e) != 0 : vk_low_ram() || vk_driver_is_turnip();
+        if (seq_thread) {
+            const char *f = getenv("LARECOMP_SEQ_FENCES");
+            seq_fences_on = !f || atoi(f) != 0;
+            VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            for (int i = 0; i < SEQ_FENCES && seq_fences_on; i++)
+                if (vkCreateFence(g_vk.dev, &fi, NULL, &seq_fence[i]) != VK_SUCCESS) seq_fences_on = false;
+            pthread_t th;
+            if (pthread_create(&th, NULL, seq_waiter, NULL)) seq_thread = 0;
+            else pthread_detach(th);
+            LOG("[vk] GPU progress: %s\n", !seq_thread ? "asked of the driver"
+                                           : seq_fences_on ? "a thread of its own waits on a fence per submission"
+                                                           : "a thread of its own waits on the timeline");
+        }
+    }
+    return seq_thread && !seq_thread_broken;
+}
+static void seq_submitted(uint64_t s) {
+    if (!seq_thread_on()) return;
+    pthread_mutex_lock(&sw_m);
+    atomic_store(&sw_submitted, s);
+    pthread_cond_signal(&sw_cv);
+    pthread_mutex_unlock(&sw_m);
+}
+// The waiter thread has seen submission seq finish (false: it broke - device lost - or 10 s went by)
+static bool seq_wait_done(uint64_t seq) {
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += 10;
+    pthread_mutex_lock(&sw_m);
+    int r = 0;
+    while (atomic_load(&done_cached) < seq && !seq_thread_broken && r != ETIMEDOUT) r = pthread_cond_timedwait(&done_cv, &sw_m, &until);
+    bool ok = atomic_load(&done_cached) >= seq;
+    pthread_mutex_unlock(&sw_m);
+    return ok;
+}
+// The fence for submission seq, unsignalled: its slot's last user (seq - SEQ_FENCES) finished first
+static VkFence seq_fence_for(uint64_t seq) {
+    if (!seq_thread_on() || !seq_fences_on) return VK_NULL_HANDLE;
+    if (seq > SEQ_FENCES && !seq_wait_done(seq - SEQ_FENCES)) return VK_NULL_HANDLE;
+    VkFence f = seq_fence[seq % SEQ_FENCES];
+    vkResetFences(g_vk.dev, 1, &f);
+    return f;
+}
+
 uint64_t vk_completed_seq(void) {
-    uint64_t v = 0;
+    if (seq_thread_on()) return atomic_load_explicit(&done_cached, memory_order_acquire);
+    static int64_t every = -1;
+    if (every < 0) {
+        const char *e = getenv("LARECOMP_SEQ_CACHE_US");
+        every = (e ? atoll(e) : 0) * 1000;
+    }
+    uint64_t now = 0;
+    if (every) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        uint64_t at = atomic_load_explicit(&done_asked, memory_order_relaxed);
+        if (at && now - at < (uint64_t)every) return atomic_load_explicit(&done_cached, memory_order_acquire);
+    }
+    uint64_t v = 0, t0 = drvt_t0();
     vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v);
+    drvt_add(DT_COMPLETED, t0);
+    if (every) {
+        done_note(v);
+        atomic_store_explicit(&done_asked, now, memory_order_relaxed);
+        uint64_t c = atomic_load_explicit(&done_cached, memory_order_acquire);
+        if (v < c) v = c;
+    }
     return v;
 }
 
@@ -126,6 +270,17 @@ static void wb_apply(uint64_t done);
 
 #ifdef __ANDROID__
 static bool gcopy_mode;   // (no heap import: global memory copied by the CPU, gcopy_prepare)
+// Page write tracking and the vertex cache's page tables (vcache_lookup) span [VC_BASE, HEAP_BASE + HEAP_MAX). On
+// Android that starts at the physical memory region (ALIAS_BASE), below the heap: TOTK keeps its vertices there, and
+// without placed memory (Mali, Xclipse) 1.25 GB of them were copied every 2 s, for want of tracking to cache them by
+// (2026-11-15, the copy mode on the POCO). Heap offsets are VC_HEAP_OFF further in.
+#ifdef __ANDROID__
+#define VC_BASE ALIAS_BASE
+#else
+#define VC_BASE HEAP_BASE
+#endif
+#define VC_HEAP_OFF (HEAP_BASE - VC_BASE)
+#define VC_SPAN (VC_HEAP_OFF + HEAP_MAX)
 #ifdef __ANDROID__
 static bool gwin_mode;    // (heap placed, larger than a storage buffer reaches, no pointer: draws get a window of it, gwin_prepare)
 static uint64_t gmem_bda;  // the placed heap's device address when shaders reach it by pointer (vk_heap_place), else 0
@@ -142,7 +297,10 @@ void vk_wait_seq(uint64_t seq) {
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
                               .pValues = &seq};
     uint64_t t0 = SDL_GetTicksNS();
-    VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
+    VkResult r = seq_thread_on() && atomic_load(&done_cached) >= seq ? VK_SUCCESS  // (finished already: no driver call)
+                 : seq_thread_on() && seq_fences_on ? (seq_wait_done(seq) ? VK_SUCCESS  // (the waiter thread's word)
+                                                       : seq_thread_broken ? VK_ERROR_DEVICE_LOST : VK_TIMEOUT)
+                 : vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
     stat_wait_ns += SDL_GetTicksNS() - t0;
     cum_wait += SDL_GetTicksNS() - t0;
     wait_account(SDL_GetTicksNS() - t0);
@@ -150,7 +308,7 @@ void vk_wait_seq(uint64_t seq) {
     if (vk_timing_trace_on()) vk_timing_trace_wait(VK_TIMING_TIMELINE, SDL_GetTicksNS() - t0);
 #endif
     if (r == VK_TIMEOUT) LOG("[vk] GPU did not finish submission %llu within 10 s (device lost?)\n", (unsigned long long)seq);
-    else if (r == VK_SUCCESS) cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
+    else if (r == VK_SUCCESS) done_note(seq), cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
 #ifdef __ANDROID__
     if (r == VK_SUCCESS) gcopy_retire(seq);
 #endif
@@ -316,7 +474,7 @@ static _Atomic int pace_on = -1;
 void vk_pace_frame(void) {
     {   // (write-backs of passes the GPU has finished since: the game may read them this frame)
         uint64_t v = 0;
-        if (vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v) == VK_SUCCESS) wb_apply(v);
+        if ((v = vk_completed_seq())) wb_apply(v);
     }
     if (pace_on < 0) { const char *e = getenv("LARECOMP_PACE"); pace_on = !e || atoi(e) != 0; }
     static uint64_t last, last_wait;
@@ -395,8 +553,9 @@ void vk_pace_frame(void) {
             if (renderer_present_count() >= hot_at) {
                 hot_at = renderer_present_count() + 600;
                 extern int kernel_hot_tids(int32_t *out, int max);
-                int32_t tids[8];
+                int32_t tids[9];
                 int n = kernel_hot_tids(tids, 8);
+                if (vk_rp_tid()) tids[n++] = vk_rp_tid();  // (the replay thread's work is on the frame's path too)
                 if (n) plat_adpf_extra_threads(tids, n);
             }
         }
@@ -726,8 +885,13 @@ static Sub *sub(void) {
                 prof_gpu += (uint64_t)((double)(t[1] - t[0]) * g_vk.props.limits.timestampPeriod);
             s->ts = false;
         }
+        uint64_t t0 = drvt_t0();
         for (int i = 0; i < s->npools; i++) vkResetDescriptorPool(g_vk.dev, s->pools[i], 0);
+        drvt_add(DT_RESET_DS, t0);
+        t0 = drvt_t0();
         if (s->cpool) vkResetCommandPool(g_vk.dev, s->cpool, 0);
+        if (s->upool) vkResetCommandPool(g_vk.dev, s->upool, 0);
+        drvt_add(DT_RESET_CMD, t0);
         s->cur_pool = 0;
         s->seq = submit_seq + 1;
         s->main_begun = s->upload_begun = false;
@@ -740,17 +904,22 @@ static Sub *sub(void) {
 // allocated it again while recording (vkBeginCommandBuffer ~6% of the render thread, plus malloc / munmap).
 static void begin_cb(Sub *s, VkCommandBuffer *cb, bool *begun) {
     if (*begun) return;
-    if (!s->cpool) {
+    // (a command pool's buffers may not record on two threads at once: with the replay thread the upload buffer has
+    // a pool of its own)
+    VkCommandPool *pool = cb == &s->upload && vk_rp_installed() ? &s->upool : &s->cpool;
+    if (!*pool) {
         VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = g_vk.qfam};
-        VK_CHECK(vkCreateCommandPool(g_vk.dev, &pi, NULL, &s->cpool));
+        VK_CHECK(vkCreateCommandPool(g_vk.dev, &pi, NULL, pool));
     }
     if (!*cb) {
-        VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = s->cpool,
+        VkCommandBufferAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = *pool,
                                           .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
         VK_CHECK(vkAllocateCommandBuffers(g_vk.dev, &ai, cb));
     }
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    uint64_t t0 = drvt_t0();
     VK_CHECK(vkBeginCommandBuffer(*cb, &bi));
+    drvt_add(DT_BEGIN, t0);
     *begun = true;
 }
 
@@ -779,7 +948,16 @@ static void upload_begin_barrier(VkCommandBuffer cb) {
 #endif
     vk_full_barrier(cb);
 }
+// vk_cmd_rp: the main buffer for packets (replay.h) - its caller records only through rpCmd*; vk_cmd: for recording
+// here, after the replay thread has caught up
+static VkCommandBuffer vk_cmd_rp(void);
 VkCommandBuffer vk_cmd(void) {
+#ifdef __ANDROID__
+    if (atomic_load_explicit(&rp_rpos, memory_order_acquire) != rp_w) vk_rp_drain_at(__builtin_return_address(0));
+#endif
+    return vk_cmd_rp();
+}
+static VkCommandBuffer vk_cmd_rp(void) {
     Sub *s = sub();
     if (!s->main_begun) {
         begin_cb(s, &s->main, &s->main_begun);
@@ -924,7 +1102,16 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     }
 #endif
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
-    VK_CHECK(vkEndCommandBuffer(s->main));
+    uint64_t te = drvt_t0();
+    VK_CHECK(vkEndCommandBuffer(s->main));  // (after the replay thread's packets: replay.c's check in front of it)
+    drvt_add(DT_END, te);
+    {   // the replay thread (replay.h) on or off from the next submission: LARECOMP_VK_REPLAY / LARECOMP_AB=<frames>:replay
+        static int env = -1;
+        if (env < 0) env = getenv("LARECOMP_VK_REPLAY") && atoi(getenv("LARECOMP_VK_REPLAY")) != 0;
+        int ab = vk_rp_installed() ? AB("replay") : -1;
+        vk_rp_latch(ab >= 0 ? ab == 1 : env);
+        vk_rp_frame();
+    }
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
     VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
                                      .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
@@ -935,13 +1122,27 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = (uint32_t)n, .pCommandBufferInfos = cbs,
                         .signalSemaphoreInfoCount = signal ? 2 : 1, .pSignalSemaphoreInfos = sig,
                         .waitSemaphoreInfoCount = wait ? 1 : 0, .pWaitSemaphoreInfos = &wt};
+    {   // With the waiter thread on fences nothing reads the timeline, so it isn't signalled: each signal of Mesa's
+        // emulated one (Turnip over KGSL) waited in the kernel for the GPU - Galaxy Tab A9+ 14.8 / 15.7 -> 19.7 fps in
+        // BOTW's world, the GPU's idle inside a frame ~14 -> ~7.5 ms (BOTWRecomp b8a1d05, 2026-11-14).
+        // LARECOMP_SEQ_NO_TIMELINE=0: signalled.
+        static int no_tl = -1;
+        if (no_tl < 0) no_tl = !getenv("LARECOMP_SEQ_NO_TIMELINE") || atoi(getenv("LARECOMP_SEQ_NO_TIMELINE")) != 0;
+        if (no_tl && seq_thread_on() && seq_fences_on) {
+            si.signalSemaphoreInfoCount = signal ? 1 : 0;
+            si.pSignalSemaphoreInfos = signal ? &sig[1] : NULL;
+        }
+    }
     {
         PROF_T0();
         dl_note("submit %llu", (unsigned long long)submit_seq + 1);
 #ifdef __ANDROID__
         uint64_t trace_start = vk_timing_trace_on() ? SDL_GetTicksNS() : 0;
 #endif
-        VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+        VkFence sfence = seq_fence_for(submit_seq + 1);  // (the waiter thread's)
+        uint64_t ts = drvt_t0();
+        VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, sfence);
+        drvt_add(DT_SUBMIT, ts);
 #ifdef __ANDROID__
         tl_add((int64_t)plat_now_ns(), wait || signal ? "render: submitted (present)" : "render: submitted", submit_seq + 1, 0);
         if (trace_start) vk_timing_trace_wait(VK_TIMING_SUBMIT, SDL_GetTicksNS() - trace_start);
@@ -952,6 +1153,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     }
     pthread_mutex_lock(&seq_lock);
     submit_seq++;
+    seq_submitted(submit_seq);
 #ifdef __ANDROID__
     last_submit_ns = SDL_GetTicksNS();
     if (game_pending) work_seq = submit_seq;  // (cleared when backend_execute is done: flushes inside it come first)
@@ -965,9 +1167,50 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     cur_sub = (cur_sub + 1) % SUBS;
     stat_flushes++;
     cum_submits++;
+    uint64_t ta = drvt_t0();
     ring_retire();
     vk_collect_dead();
     pipe_evict();
+    drvt_add(DT_AFTER, ta);
+    if (drvt_on > 0) {
+        static uint64_t at;
+        uint64_t f = renderer_present_count();
+        if (f >= at + 120) {
+            static const char *nm[DT_N] = {"reset ds pools", "reset cmd pool", "begin cb", "end cb", "submit", "completed seq", "alloc set", "after submit"};
+            uint64_t frames = at ? f - at : 1;
+            for (int k = 0; k < DT_N && at; k++)
+                LOG("[drvt] %-15s %6.3f ms/frame, %7.1f calls/frame, %6.1f us/call\n", nm[k], drvt_ns[k] / 1e6 / frames,
+                    (double)drvt_n[k] / frames, drvt_n[k] ? drvt_ns[k] / 1e3 / drvt_n[k] : 0.0);
+            extern uint64_t prof_tex_helper_jobs, prof_tex_helper_hits;
+            if (at) LOG("[drvt] texture checks on the helper: %.1f a frame, %.2f found differing\n", (double)prof_tex_helper_jobs / frames,
+                        (double)prof_tex_helper_hits / frames);
+            prof_tex_helper_jobs = prof_tex_helper_hits = 0;
+            if (at) LOG("[drvt] whole texture hashes a frame: %.1f under 256 KB, %.1f to 2 MB, %.1f larger; %.2f MB\n",
+                        (double)drvt_tex_full[0] / frames, (double)drvt_tex_full[1] / frames, (double)drvt_tex_full[2] / frames,
+                        drvt_tex_full_bytes / 1048576.0 / frames);
+            memset(drvt_tex_full, 0, sizeof drvt_tex_full), drvt_tex_full_bytes = 0;
+            {   extern uint64_t prof_tex_snap_bytes, prof_tex_checks;  // (textures.c: snapshot compares, upload checks)
+                static uint64_t snap0, checks0;
+                if (at) LOG("[drvt] texture upload checks a frame: %.1f; snapshot compares %.2f MB\n",
+                            (double)(prof_tex_checks - checks0) / frames, (prof_tex_snap_bytes - snap0) / 1048576.0 / frames);
+                snap0 = prof_tex_snap_bytes, checks0 = prof_tex_checks;
+            }
+            {   // the GPU waits by cause (wait_tab: every thread's)
+                char b[768];
+                int n = 0;
+                pthread_mutex_lock(&wait_tab_lock);
+                for (int i = 0; i < 12 && wait_tab[i].why && n < 700; i++) {
+                    if (at) n += snprintf(b + n, sizeof b - n, " %s %.1f/%.3fms", wait_tab[i].why, (double)wait_tab[i].n / frames,
+                                          wait_tab[i].ns / 1e6 / frames);
+                    wait_tab[i].n = wait_tab[i].ns = 0;
+                }
+                pthread_mutex_unlock(&wait_tab_lock);
+                if (at && n) LOG("[drvt] GPU waits a frame:%s\n", b);
+            }
+            memset(drvt_ns, 0, sizeof drvt_ns), memset(drvt_n, 0, sizeof drvt_n);
+            at = f;
+        }
+    }
 }
 
 void renderer_submit(void) { vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE); }
@@ -1036,7 +1279,9 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
         VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                                           .descriptorPool = s->pools[s->cur_pool], .descriptorSetCount = 1, .pSetLayouts = &layout};
         VkDescriptorSet set;
+        uint64_t t0 = drvt_t0();
         VkResult r = vkAllocateDescriptorSets(g_vk.dev, &ai, &set);
+        drvt_add(DT_ALLOC_SET, t0);
         if (r == VK_SUCCESS) return set;
         s->cur_pool++;
     }
@@ -1047,19 +1292,36 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
 // submission that allocated from it has completed, and given back after 10 s unused (down to RING_KEEP of them).
 // On 4 GB devices (a 4 GB tablet: ~1 GB free with the game running), 16 MB chunks and 2 kept - the 64 MB ones, 4
 // kept, were a quarter of the GPU memory the Android killed the game over, as the world loaded (Galaxy Tab A9+,
-// 2026-11-08). Devices with 6 GB or more keep the normal path. LARECOMP_LOW_RAM=1 / 0: test override.
-bool vk_low_ram(void) {
-    static int low = -1;
-    if (low < 0) {
-        const char *e = getenv("LARECOMP_LOW_RAM");
-        long total_kb = 0;
+// 2026-11-08). Leave 6 GB devices on the normal path. Video > "RAM saving" (g_settings.low_ram: Automatic / On / Off)
+// chooses, read once as the app starts; LARECOMP_LOW_RAM=1 / 0 overrides both.
+// What Automatic picks on this device, and its MemTotal in MB (the menu says it)
+bool vk_low_ram_auto(long *total_mb) {
+    static long total_kb = -1;
+    if (total_kb < 0) {
+        total_kb = 0;
         FILE *f = fopen("/proc/meminfo", "r");
         if (f) {
             if (fscanf(f, "MemTotal: %ld kB", &total_kb) != 1) total_kb = 0;
             fclose(f);
         }
-        low = e ? atoi(e) != 0 : total_kb > 0 && total_kb <= 4L * 1024 * 1024;
-        if (low) LOG("[vk] low on RAM (%ld MB): smaller buffers\n", total_kb >> 10);
+    }
+    if (total_mb) *total_mb = total_kb >> 10;
+    return total_kb && total_kb <= 4L * 1024 * 1024;  // (TOTK: up to 4 GB, the user's choice of 2026-11-13)
+}
+
+bool vk_low_ram(void) {
+    static int low = -1;
+    if (low < 0) {
+        const char *e = getenv("LARECOMP_LOW_RAM");
+        long total_mb = 0;
+        bool autolow = vk_low_ram_auto(&total_mb);
+        int set = -1;
+#ifdef __ANDROID__
+        set = g_settings.low_ram;
+#endif
+        low = e ? atoi(e) != 0 : set >= 0 ? set != 0 : autolow;
+        LOG("[vk] RAM saving %s (%ld MB; %s)\n", low ? "on: smaller buffers" : "off", total_mb,
+            e ? "LARECOMP_LOW_RAM" : set >= 0 ? "chosen in Video" : "automatic");
     }
     return low;
 }
@@ -1224,8 +1486,19 @@ static void guest_copy_invalidate(uint64_t lo, uint64_t hi) {
 static VkBuffer gmem_buf;  // (the heap's GPU buffer, below)
 static struct { uint64_t lo, hi, seq; } bcopy_pend[BCOPY_PEND];
 static int bcopy_npend;
+static uint64_t bcopy_done, bcopy_done_at;  // (bcopy_pending: the GPU's progress as last asked, and in which submission)
 static bool bcopy_pending(uint64_t lo, uint64_t hi) {  // (render thread) drops the done ones; is [lo, hi) still to land?
-    uint64_t done = vk_completed_seq();
+    // The GPU's progress is a driver call (vkGetSemaphoreCounterValue: an ioctl on Turnip / KGSL, ~0.8 us), and every
+    // guest_copy came here while any copy was pending: ~3000 a frame on the surface, 1.7 ms of the render thread's
+    // ~17 (POCO F7 Ultra, 2026-11-14). Asked once a submission instead (gpu_buffer_copy always asks): for guest_copy
+    // an older answer only keeps a landed copy's range bound in place in the heap, which holds its bytes all the same.
+    // LARECOMP_BCOPY_ASK_EVERY=1: asked every call, as before; LARECOMP_AB=<frames>:bcpoll alternates it.
+    static int every = -1;
+    if (every < 0) every = getenv("LARECOMP_BCOPY_ASK_EVERY") && atoi(getenv("LARECOMP_BCOPY_ASK_EVERY"));
+    int ab = AB("bcpoll");
+    uint64_t done;
+    if (bcopy_done_at == vk_pending_seq() && (ab >= 0 ? ab == 1 : !every)) done = bcopy_done;
+    else done = bcopy_done = vk_completed_seq(), bcopy_done_at = vk_pending_seq();
     bool hit = false;
     int k = 0;
     for (int i = 0; i < bcopy_npend; i++) {
@@ -1508,6 +1781,19 @@ const char *renderer_stats(void) {
         extern int vk_texture_count(void);
         size_t n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, ", gpu mem %.0fMB, %d textures", (double)used / 1048576.0, vk_texture_count());
+        if (vk_low_ram()) {  // (their guest bytes: in RAM or swap next to the images, unless discarded - textures.c)
+            extern uint64_t vk_texture_guest_bytes(uint64_t *discarded);
+            uint64_t disc = 0, g = vk_texture_guest_bytes(&disc);
+            n = strlen(stats_text);
+            snprintf(stats_text + n, sizeof stats_text - n, " (guest %.0fMB, discarded %.0fMB)", g / 1048576.0, disc / 1048576.0);
+            static int calls;
+            if (calls++ % 10 == 5) {  // (what the GPU memory holds, every ~20 s)
+                extern int vk_live_counts(char *out, int cap);
+                char vk[768] = "";
+                vk_live_counts(vk, sizeof vk);
+                LOG("[vk] low RAM: %s\n", vk);
+            }
+        }
     }
     {
         extern void vk_alias_stats(void);
@@ -1546,6 +1832,10 @@ const char *renderer_stats(void) {
         for (int i = 0; i < 16; i++)
             if (prof_gcopy_alias[i]) { n = strlen(stats_text); snprintf(stats_text + n, sizeof stats_text - n, " %d:%.0f", i, prof_gcopy_alias[i] / 1048576.0); }
         memset(prof_gcopy_alias, 0, sizeof prof_gcopy_alias);
+        n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, " | restarts: in-place %u feedback %u unbound %u targets %u",
+                 prof_dirty[0], prof_dirty[1], prof_dirty[2], prof_dirty[3]);
+        memset(prof_dirty, 0, sizeof prof_dirty);
         n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, " | pass ends:");
         for (int l = 0; l < 4096; l++)
@@ -1612,7 +1902,7 @@ void vk_exec_init(void) {
     // (for good, without placed memory: the vertex cache and the texture checks fed by write tracking - vc_flush)
     // (nor with an exported file to map there: vk_heap_place turns it on if that fails)
     extern bool vk_heap_file_asked(void);
-    if (gcopy_mode && !g_vk.map_placed && !vk_heap_file_asked()) plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX);
+    if (gcopy_mode && !g_vk.map_placed && !vk_heap_file_asked()) plat_write_tracking_enable(VC_BASE, HEAP_BASE + HEAP_MAX);
 #endif
     if (prof) {
         prof_up_ns = 0;
@@ -1860,16 +2150,13 @@ static void wb_queue(NvnTexture *t, uint32_t lv) {
             LOG("[wb-frame] %llu: %ux%u f%#x flags %#x at %llx, submission %llu\n", (unsigned long long)renderer_present_count(),
                 t->width, t->height, t->format, t->flags, (unsigned long long)t->addr, (unsigned long long)e->seq);
     }
-    VkCommandBuffer cb = vk_cmd();
-    vk_full_barrier(cb);
+    VkCommandBuffer cb = vk_cmd_rp();  // (packets for the replay thread while rp_on, replay.h)
+    rpFullBarrier(cb);
     VkBufferImageCopy c = {.bufferOffset = (VkDeviceSize)off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, 1},
                            .imageExtent = {lvw, lvh, 1}};
-    vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, wb_buf, 1, &c);
-    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
-                           .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
-    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
-    vkCmdPipelineBarrier2(cb, &di);
+    rpCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, wb_buf, &c);
+    rpMemBarrier(cb, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
+                 VK_ACCESS_2_HOST_READ_BIT);
     stat_wb++;
     static int nlog;  // LARECOMP_LOG_WRITEBACK=1: the targets written back
     static int lw = -2;  // (=<w> > 1: only targets that wide)
@@ -2030,7 +2317,8 @@ void vk_end_pass(void) { vk_end_pass_at(0); }
 static void vk_end_pass_at(int line) {
     if (!in_pass) return;
     if (prof && line < 4096) prof_end_line[line]++;
-    vk_end_rendering(vk_cmd());
+    if (g_vk.dyn_render && rp_on) rpCmdEndRendering(vk_cmd_rp());  // (a packet for the replay thread, replay.h)
+    else vk_end_rendering(vk_cmd());
     in_pass = false;
     {   extern TexBackend *g_dump_sampled;
         if (g_dump_sampled) { TexBackend *db = g_dump_sampled; g_dump_sampled = NULL; dump_layers_raw(db); }
@@ -2103,6 +2391,17 @@ static volatile uint64_t g_scene_frame;
 uint64_t vk_scene_frame(void) { return g_scene_frame; }
 
 static VkRect2D scissor_rect(void);
+// No submissions in the middle of a frame (LARECOMP_VK_CHUNK_US, LARECOMP_VK_SPLIT_US) while a menu is up (inventory, map,
+// pause: hle/framepace.c framepace_in_menu): each one has the vertex cache read the game's memory again (vc_flush), and
+// by then the game was writing its next frame's text - the menus' letters were those of other words, a frame at a time
+// (Galaxy Tab A9+, 2026-11-13: none in 640 frames without them; the map's flickering buttons, #304 too). In the world
+// they keep the GPU busy while the frame is still being translated. LARECOMP_MENU_CHUNKS=1: kept in menus too.
+static bool no_chunks_now(void) {
+    static int keep = -1;
+    if (keep < 0) keep = getenv("LARECOMP_MENU_CHUNKS") && atoi(getenv("LARECOMP_MENU_CHUNKS"));
+    extern bool framepace_in_menu(void);
+    return !keep && framepace_in_menu();
+}
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     pipeline_dirty = true;
@@ -2157,7 +2456,7 @@ static void begin_pass(void) {
         }
         extern int vk_ab(const char *what);
         long ch = chunk > 0 && AB("chunk") == 1 ? 500 : chunk;
-        if (ch > 0 && vk_async_on() && last_submit_ns && SDL_GetTicksNS() - last_submit_ns > (uint64_t)ch * 1000)
+        if (ch > 0 && vk_async_on() && last_submit_ns && SDL_GetTicksNS() - last_submit_ns > (uint64_t)ch * 1000 && !no_chunks_now())
             renderer_submit();
     }
 #endif
@@ -2166,11 +2465,11 @@ static void begin_pass(void) {
     vk_bc_shadows_resolve(st.rt.color, st.rt.cview, st.rt.has_cview, st.rt.ncolor);  // (BC textures drawn into before: decoded, unless this pass draws on)
 #endif
     st.rt_dirty = false;
-    VkCommandBuffer cb = vk_cmd();
+    VkCommandBuffer cb = vk_cmd_rp();  // (the barrier and the begin: packets for the replay thread while rp_on, replay.h)
     static int no_barrier = -1;  // (LARECOMP_VK_NO_PASS_BARRIER=1: none - unsafe, a measurement of what it costs)
     if (no_barrier < 0) no_barrier = getenv("LARECOMP_VK_NO_PASS_BARRIER") != NULL;
     extern int vk_ab(const char *what);
-    if (!no_barrier && AB("nobarrier") != 1) vk_full_barrier(cb);  // passes, copies and dispatches see each other's results
+    if (!no_barrier && AB("nobarrier") != 1) rpFullBarrier(cb);  // passes, copies and dispatches see each other's results
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
@@ -2378,8 +2677,9 @@ static void begin_pass(void) {
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {minw, minh}}, .layerCount = 1,
                           .colorAttachmentCount = pass_ncolor, .pColorAttachments = ca,
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
-    vk_begin_rendering(cb, &ri, pass_color, pass_depth != VK_FORMAT_UNDEFINED ? pass_depth : pass_stencil,
-                       (VkSampleCountFlagBits)pass_samples);
+    if (!g_vk.dyn_render || !rpCmdBeginRendering(cb, &ri))
+        vk_begin_rendering(cb, &ri, pass_color, pass_depth != VK_FORMAT_UNDEFINED ? pass_depth : pass_stencil,
+                           (VkSampleCountFlagBits)pass_samples);
     if (g_debug_frame) {  // (LARECOMP_DEBUG_RT=<n>: the pass's color target n where it has one, else its first)
         static int rt_i = -1;
         if (rt_i < 0) rt_i = getenv("LARECOMP_DEBUG_RT") ? atoi(getenv("LARECOMP_DEBUG_RT")) & 7 : 0;
@@ -2499,7 +2799,7 @@ static void apply_scissor(void) {
     VkRect2D r = scissor_rect();
     if (!ss_need(SS_SC, !memcmp(&r, &ss.sc, sizeof r))) return;
     ss.sc = r;
-    vkCmdSetScissor(vk_cmd(), 0, 1, &r);
+    rpCmdSetScissor(vk_cmd_rp(), 0, 1, &r);
 }
 
 // Metal convention (y up in NDC, origin top-left) through a negative-height viewport.
@@ -2509,7 +2809,7 @@ static void set_viewport(float x, float y, float w, float h, float zn, float zf)
     VkViewport vp = {x, y + h, w, -h, fminf(fmaxf(zn, 0), 1), fminf(fmaxf(zf, 0), 1)};
     if (!ss_need(SS_VP, !memcmp(&vp, &ss.vp, sizeof vp))) return;
     ss.vp = vp;
-    vkCmdSetViewport(vk_cmd(), 0, 1, &vp);
+    rpCmdSetViewport(vk_cmd_rp(), 0, 1, &vp);
 }
 
 // ================================================================== clears
@@ -3245,7 +3545,9 @@ static int pipe_keep(void) {
     if (keep < 0) {
         extern bool vk_low_ram(void);
         const char *e = getenv("LARECOMP_PIPE_KEEP");
-        keep = e ? atoi(e) : (g_vk.props.vendorID == 0x13B5 || vk_low_ram()) ? 1500 : 0;
+        // (every GPU but Adreno's, BOTWRecomp a3db759: an Xclipse 530 reached 8165 pipelines and 1.6 GB of malloc in an
+        // hour, BOTW #327)
+        keep = e ? atoi(e) : (g_vk.props.vendorID != 0x5143 || vk_low_ram()) ? 1500 : 0;
         if (keep > 0) LOG("[vk] pipelines kept: at most %d (the least recently used ones destroyed)\n", keep);
     }
     return keep;
@@ -3444,9 +3746,15 @@ static bool snap_ok[8];
 static bool snap_fb_dirty[8];
 static const char *snap_why[8];
 static const char *snap_reason = "?";
+static bool snap_any;  // (some snap_ok set: the invalidations each draw makes for its targets look no further without one)
 static void snapshots_invalidate(NvnTexture *t) {
-    for (int i = 0; i < 8; i++)
+    if (!snap_any) return;
+    bool any = false;
+    for (int i = 0; i < 8; i++) {
         if ((!t || snap_tex[i] == t) && snap_ok[i]) { snap_ok[i] = false; snap_fb_dirty[i] = false; snap_why[i] = snap_reason; }
+        any |= snap_ok[i];
+    }
+    snap_any = any;
 }
 static void snapshots_mark_fb_dirty(NvnTexture *t) {
     for (int i = 0; i < 8; i++) if (snap_tex[i] == t && snap_ok[i]) snap_fb_dirty[i] = true;
@@ -3930,9 +4238,9 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
                     int si = -1;
                     for (int k = 0; k < 8; k++) if (snap_tex[k] == t) si = k;
                     if (si < 0 || !snap_ok[si]) {
-                        if (in_pass && !st.rt_dirty && (pass_written & bit)) st.rt_dirty = true, stat_inplace_breaks++;
+                        if (in_pass && !st.rt_dirty && (pass_written & bit)) st.rt_dirty = true, stat_inplace_breaks++, prof_dirty[0]++;
                         if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
-                        snap_ok[si] = true;
+                        snap_ok[si] = true, snap_any = true;
                         snap_fb_dirty[si] = false;
                     }
                     if (ninplace < 4) inplace_tex[ninplace++] = t;
@@ -3984,8 +4292,9 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
             feedback_snap[nfeedback] = dst;
             feedback_view[nfeedback++] = vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
             if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
-            snap_ok[si] = true;
+            snap_ok[si] = true, snap_any = true;
             snap_fb_dirty[si] = false;
+            if (in_pass && !st.rt_dirty) prof_dirty[1]++;
             st.rt_dirty = true;
         }
 }
@@ -4470,6 +4779,7 @@ static VkBuffer gmem_buf;
 static VkDeviceMemory gmem_mem;
 static uint64_t gmem_size;
 #ifdef __ANDROID__
+static bool gmem_file;    // (placed through a shared file / the driver's map moved: Driver compatibility's heap_file)
 static bool gmem_placed;  // (gmem_buf is the guest heap itself, usable as a uniform buffer: vk_heap_place)
 
 // CopyBufferToBuffer within the heap's GPU buffer, done by the GPU in its place in the queue. The CPU copy waited for
@@ -4482,6 +4792,8 @@ static bool gmem_placed;  // (gmem_buf is the guest heap itself, usable as a uni
 static bool gpu_buffer_copy(uint64_t src, uint64_t dst, uint64_t size) {
     static int on = -1;
     if (on < 0) on = !getenv("LARECOMP_VK_GPU_BUFCOPY") || atoi(getenv("LARECOMP_VK_GPU_BUFCOPY"));
+    bcopy_done_at = 0;  // (below: the GPU's progress asked afresh - an old answer would send the copy to the CPU's wait)
+    if (bcopy_npend >= BCOPY_PEND) bcopy_pending(0, 0);  // (full: the done ones dropped first)
     if (!on || AB("bufcopy") == 0 || !gmem_placed || !size || size > 4096 || bcopy_npend >= BCOPY_PEND) return false;
     if (src < HEAP_BASE || src + size > HEAP_BASE + gmem_size || dst < HEAP_BASE || dst + size > HEAP_BASE + gmem_size) return false;
     if (src < dst + size && dst < src + size) return false;
@@ -4607,6 +4919,7 @@ static bool gmem_import(uint64_t size) {
     if (vkCreateBuffer(g_vk.dev, &bi, NULL, &buf) != VK_SUCCESS) { vkFreeMemory(g_vk.dev, mem, NULL); return false; }
     vkBindBufferMemory(g_vk.dev, buf, mem, 0);
     if (gmem_buf) {  // the heap grew: the old import may still be in use by submitted work
+        vk_rp_drain();  // (and by packets the replay thread hasn't recorded yet: replay.h)
         vk_wait_seq(submit_seq);
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
         vkFreeMemory(g_vk.dev, gmem_mem, NULL);
@@ -4706,9 +5019,63 @@ static bool gaddr_write(uint64_t a);
 // unmaps it; runtime/main.c then remaps the whole window). LARECOMP_VK_NO_PLACED=1: off (CPU copies).
 bool vk_heap_file_possible(void) { return g_vk.mem_fd; }  // (the start screen's Driver compatibility)
 
+// The heap as an Android hardware buffer (memfd_probe.c: a gralloc BLOB, its dma-buf mapped at the heap's address by
+// mmap and the buffer imported into Vulkan), after the driver's own memory: the Mali-G720's stock driver exports none
+// of it ("not exportable" as an opaque file and as a dma-buf) and won't move its map (EINVAL), so the setting did
+// nothing there (POCO X7 Pro, 2026-11-13). Taken only when the GPU and the CPU see each other's bytes through it.
+// Opt-in for now (LARECOMP_VK_MEMFD_AHB=1: after the other ways; 2: only it): the POCO's gralloc refused the 2,144 MB
+// BLOB, and asking it for such sizes again and again restarted its system_server (2026-11-14) - untried on a Mali yet.
+#include <android/hardware_buffer.h>
+int vk_ahb_alloc(uint64_t size, AHardwareBuffer **out, const char **why);
+bool vk_ahb_import(AHardwareBuffer *ahb, uint64_t size, VkBufferUsageFlags usage, bool bda, VkBuffer *pbuf,
+                   VkDeviceMemory *pmem, int *ptype, const char **why);
+bool vk_ahb_coherent(uint8_t *p, VkBuffer buf, VkDeviceMemory mem, uint64_t off, VkBufferUsageFlags usage, const char **why);
+static int heap_ahb_mode(void) {
+    const char *e = getenv("LARECOMP_VK_MEMFD_AHB");
+    return e ? atoi(e) : 0;
+}
+static bool heap_ahb_place(uint64_t size, VkBufferUsageFlags usage, bool bda, VkBuffer *pbuf, VkDeviceMemory *pmem, int *ptype) {
+    if (!g_vk.mem_ahb || !heap_ahb_mode()) return false;
+    AHardwareBuffer *ahb = NULL;
+    const char *why = NULL;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    int type = -1;
+    int fd = vk_ahb_alloc(size, &ahb, &why);
+    if (fd >= 0) {
+        void *p = mmap((void *)(uintptr_t)HEAP_BASE, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+        close(fd);
+        const VkBufferUsageFlags check = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        if (p != (void *)(uintptr_t)HEAP_BASE) why = "mmap of its file at the heap's address";
+        else if (!vk_ahb_import(ahb, size, usage, bda, &buf, &mem, &type, &why)) {}
+        else if (!vk_ahb_coherent((uint8_t *)(uintptr_t)HEAP_BASE, buf, mem, 8u << 20, check, &why)) {
+            vkDestroyBuffer(g_vk.dev, buf, NULL);
+            vkFreeMemory(g_vk.dev, mem, NULL);
+        } else {
+            AHardwareBuffer_release(ahb);  // (the import and the map hold it)
+            *pbuf = buf, *pmem = mem, *ptype = type;
+            return true;
+        }
+        plat_reset_guest(HEAP_BASE, HEAP_BASE + size);  // (the window's own pages back)
+        AHardwareBuffer_release(ahb);
+    }
+    LOG("[vk] game memory through an Android hardware buffer: failed at %s (errno %d)\n", why ? why : "?", errno);
+    return false;
+}
+
 // The heap through an exported file asked for (the setting, or LARECOMP_VK_MEMFD) and possible here (vk_heap_place)
+// Not with RADV unless forced: on the Xclipse 530 / 540 its exported memory, mapped at the heap's address, took a SIGBUS
+// at the game's first access (its first malloc, atomics on that memory: #234, #383, #387); the setting is ignored there
+// and said so, and CPU copies run (as they did with RADV and the setting off, #393).
 bool vk_heap_file_asked(void) {
     const char *e = getenv("LARECOMP_VK_MEMFD");
+    extern bool vk_driver_is_radv(void);
+    if (!e && g_settings.heap_file && g_vk.mem_fd && vk_driver_is_radv()) {
+        static int told;
+        if (!told++) LOG("[vk] game memory through a shared file: on in the settings, but not with RADV (the game crashed at "
+                         "its first access to it) - shader global memory through CPU copies\n");
+        return false;
+    }
     return g_vk.mem_fd && (e ? atoi(e) != 0 : g_settings.heap_file);
 }
 
@@ -4724,7 +5091,7 @@ bool vk_heap_place(uint64_t size) {
     // OS's write tracking - vk_exec_init turns it on only without placed memory at all, so a Turnip that has it but
     // isn't an Adreno 8xx (Automatic) had neither: every vertex and index buffer copied each frame, ~150 MB, 7-9 fps
     // on an Adreno 730 (issue #31). A page not tracked yet counts as written, so turning it on late is safe.
-#define NOT_PLACED() (gcopy_mode ? plat_write_tracking_enable(HEAP_BASE, HEAP_BASE + HEAP_MAX) : (void)0, false)
+#define NOT_PLACED() (gcopy_mode ? plat_write_tracking_enable(VC_BASE, HEAP_BASE + HEAP_MAX) : (void)0, false)
     // Without placed maps, the same through an exported file (VK_KHR_external_memory_fd, a dma-buf) mapped at the heap's
     // address by mmap (BOTWRecompAndroid ed53b68, after legendszaonandroid's VULKAN_BACKEND.md, MIT; memfd_probe.c tests
     // it): Mali and Xclipse have neither the placed map nor the import, and their CPU copies with write tracking upload
@@ -4788,6 +5155,14 @@ bool vk_heap_place(uint64_t size) {
     VkBuffer buf;
     VkMemoryRequirements mr;
     int type;
+    // (the driver's own memory refused every way: an Android hardware buffer, heap_ahb_place)
+#define MEMFD_FAILED()                                                                                                  \
+    do {                                                                                                               \
+        if (memfd && heap_ahb_place(size, bi.usage, bda, &buf, &mem, &type)) goto placed_ahb;                         \
+        return NOT_PLACED();                                                                                           \
+    } while (0)
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (memfd && heap_ahb_mode() == 2) MEMFD_FAILED();
     bool dedicated = false;  // (the driver exports this kind of memory only as a buffer's own allocation)
     const VkMemoryPropertyFlags need = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     for (;;) {
@@ -4796,7 +5171,7 @@ bool vk_heap_place(uint64_t size) {
         if (memfd && ht && !heap_export_ok(&bi, ht, &dedicated)) {  // (the driver says it can't export it: the next kind)
             ht = next_heap_kind(ht, can_move);
             if (ht || can_move) continue;
-            return NOT_PLACED();
+            MEMFD_FAILED();
         }
         VkResult cr = vkCreateBuffer(g_vk.dev, &bi, NULL, &buf);
         if (cr != VK_SUCCESS) {
@@ -4814,7 +5189,7 @@ bool vk_heap_place(uint64_t size) {
                 ht = next_heap_kind(ht, can_move);
                 if (ht || can_move) continue;
             }
-            return NOT_PLACED();
+            MEMFD_FAILED();
         }
         vkGetBufferMemoryRequirements(g_vk.dev, buf, &mr);
         type = -1;  // host-visible and coherent (the CPU writes, the GPU reads and writes); cached when there is one
@@ -4837,7 +5212,7 @@ bool vk_heap_place(uint64_t size) {
         const char *e = getenv("LARECOMP_VK_MEMFD_TYPE");
         if (memfd && e && atoi(e) >= 0 && (uint32_t)atoi(e) < mp.memoryTypeCount && (mr.memoryTypeBits & (1u << atoi(e)))) type = atoi(e);
     }
-    VkDeviceMemory mem = VK_NULL_HANDLE;
+    mem = VK_NULL_HANDLE;
     VkMemoryAllocateFlagsInfo af = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
     VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = bda ? &af : NULL,
                                          .buffer = buf};
@@ -4887,12 +5262,18 @@ bool vk_heap_place(uint64_t size) {
         vkDestroyBuffer(g_vk.dev, buf, NULL);
         if (mem) vkFreeMemory(g_vk.dev, mem, NULL);  // destroy the bound buffer first; freeing a placed map unmaps it
         if (p == (void *)(uintptr_t)HEAP_BASE) plat_reset_guest(HEAP_BASE, HEAP_BASE + size);
-        return NOT_PLACED();
+        MEMFD_FAILED();
+    }
+    const char *how = !memfd ? "placed" : !ht ? "the driver's map moved" : ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? "a dma-buf mapped" : "an exported file mapped";
+    if (0) {
+placed_ahb:  // (MEMFD_FAILED: the heap as an Android hardware buffer)
+        how = "an Android hardware buffer mapped";
     }
     gmem_buf = buf;
     gmem_mem = mem;
     gmem_size = size;
     gmem_placed = true;
+    gmem_file = memfd;
     gcopy_mode = false;
     gmem_bda = 0;
     if (bda && gmem_bda_wanted(size)) {
@@ -4904,7 +5285,7 @@ bool vk_heap_place(uint64_t size) {
     // which reaches only the storage buffers bound to the draw; by pointer every access reaches the whole heap)
     gwin_mode = !gmem_bda && size > g_vk.props.limits.maxStorageBufferRange && !getenv("LARECOMP_VK_NO_GWIN");
     LOG("[vk] guest heap %llu MB is GPU memory (%s at %llx, memory type %d, flags 0x%x): shaders reach it %s "
-        "(storage range %llu MB)\n", (unsigned long long)(size >> 20), !memfd ? "placed" : !ht ? "the driver's map moved" : ht == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT ? "a dma-buf mapped" : "an exported file mapped",
+        "(storage range %llu MB)\n", (unsigned long long)(size >> 20), how,
         (unsigned long long)HEAP_BASE, type,
         (unsigned)mp.memoryTypes[type].propertyFlags,
         gmem_bda ? "by pointer" : gwin_mode ? "through windows of a storage buffer" : "through a storage buffer",
@@ -4912,6 +5293,19 @@ bool vk_heap_place(uint64_t size) {
     return true;
 }
 #undef NOT_PLACED
+#undef MEMFD_FAILED
+
+// The crash message after an out-of-memory error says what to change: with the heap in GPU memory, the option that
+// put it there (an 8 GB Adreno 618 with it turned on by hand: vkEndCommandBuffer -2, #58 #60; Off ran).
+const char *vk_fatal_hint(VkResult r) {
+    if (r != VK_ERROR_OUT_OF_DEVICE_MEMORY && r != VK_ERROR_OUT_OF_HOST_MEMORY) return "";
+    if (gmem_placed)
+        return gmem_file ? "\n\nThe GPU ran out of memory. Turn off Settings > Driver compatibility > Game memory through "
+                           "a shared file: the game's memory then stays out of the GPU's."
+                         : "\n\nThe GPU ran out of memory. Set Settings > Driver compatibility > Game memory on the GPU "
+                           "to Off (or Automatic): the game's memory then stays out of the GPU's.";
+    return "\n\nThe GPU ran out of memory. Close other apps, or turn on Video > RAM saving.";
+}
 
 // Shaders reach the placed heap by pointer (translate.c maxwell_gmem_bda) where one storage buffer can't cover it: the
 // descriptor reaches maxStorageBufferRange from the heap's start, and Turnip on Adreno 7xx caps that at 128 MB - the
@@ -4948,6 +5342,8 @@ static bool gaddr_write(uint64_t a) {
 }
 
 static VkDescriptorBufferInfo gaddr_info(void) { return (VkDescriptorBufferInfo){gaddr_buf, 0, 16}; }
+#else
+const char *vk_fatal_hint(VkResult r) { (void)r; return ""; }
 #endif
 
 static VkDescriptorBufferInfo gmem_info(void) {
@@ -5876,7 +6272,11 @@ static uint64_t vc_budget(void) {
     return b;
 }
 #define VC_BUDGET vc_budget()
-typedef struct { uint64_t lo, hi, used_seq; uint32_t gen, epoch; VkBuffer buf; VmaAllocation mem; bool gpu; } VcEnt;
+// (frame: the presented frame it was last drawn from. An entry drawn from in this frame or the last isn't evicted: with
+// more ranges in use than the budget holds, the least recently used went every frame and came back copied whole - on a
+// Dimensity 9500 in 0.3.1's copy mode, 5-8 GB a 2 s window, 2-3 fps. Those draws are copied per draw instead.)
+typedef struct { uint64_t lo, hi, used_seq, frame; uint32_t gen, epoch; VkBuffer buf; VmaAllocation mem; bool gpu; } VcEnt;
+#define VC_KEEP_FRAMES 2
 static VcEnt vc_tab[VC_TAB];
 static uint32_t vc_pend[VC_TAB];  // entries the pending submission draws from (vc_flush brings them up to date)
 static int vc_npend;
@@ -5920,9 +6320,9 @@ static bool pt_init(void) {
     int n = plat_written_pages(HEAP_BASE, VC_PAGE, &one, 1, &pg);  // (is there write tracking?)
     pt_state = n >= 0 && pg == VC_PAGE;
     if (!pt_state) { LOG("[vk] no page write tracking (%d, page %llu)\n", n, (unsigned long long)pg); return false; }
-    vc_page_gen = calloc(HEAP_MAX / VC_PAGE, sizeof *vc_page_gen);
-    vc_page_gpu = calloc(HEAP_MAX / VC_PAGE, 1);
-    vc_page_gen[0] = ++vc_gen;  // (the probe took page 0's tracking)
+    vc_page_gen = calloc(VC_SPAN / VC_PAGE, sizeof *vc_page_gen);
+    vc_page_gpu = calloc(VC_SPAN / VC_PAGE, 1);
+    vc_page_gen[VC_HEAP_OFF / VC_PAGE] = ++vc_gen;  // (the probe took the heap's first page's tracking)
     return true;
 }
 
@@ -5931,14 +6331,14 @@ static bool pt_init(void) {
 // *now: the generation to pass next time.
 int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now) {
     if (!size || addr < HEAP_BASE || addr - HEAP_BASE + size > HEAP_MAX || !pt_init()) return -1;
-    uint64_t lo = (addr - HEAP_BASE) & ~(VC_PAGE - 1), hi = (addr - HEAP_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
+    uint64_t lo = (addr - VC_BASE) & ~(VC_PAGE - 1), hi = (addr - VC_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
     static uint64_t pages[4096];
     uint64_t pg = VC_PAGE;
-    int n = plat_written_pages(HEAP_BASE + lo, hi - lo, pages, 4096, &pg);
+    int n = plat_written_pages(VC_BASE + lo, hi - lo, pages, 4096, &pg);
     if (n < 0) return -1;
     uint32_t g = ++vc_gen;
     if (n >= 4096) for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE; p++) vc_page_gen[p] = g;
-    else for (int k = 0; k < n; k++) vc_page_gen[(pages[k] - HEAP_BASE) / VC_PAGE] = g;
+    else for (int k = 0; k < n; k++) vc_page_gen[(pages[k] - VC_BASE) / VC_PAGE] = g;
     *now = g;
     int changed = 0;
     for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE; p++) {
@@ -5951,7 +6351,8 @@ int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now
 // Heap pages [lo, hi) (offsets) written by the GPU: never cached from now on.
 static void vc_mark_gpu(uint64_t lo, uint64_t hi) {
     if (!pt_init()) return;
-    for (uint64_t p = lo / VC_PAGE; p < (hi + VC_PAGE - 1) / VC_PAGE && p < HEAP_MAX / VC_PAGE; p++) vc_page_gpu[p] = 1;
+    lo += VC_HEAP_OFF, hi += VC_HEAP_OFF;  // (heap offsets -> the page tables')
+    for (uint64_t p = lo / VC_PAGE; p < (hi + VC_PAGE - 1) / VC_PAGE && p < VC_SPAN / VC_PAGE; p++) vc_page_gpu[p] = 1;
     vc_epoch++;
 }
 
@@ -5995,9 +6396,12 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
     bool cpu_fill = false;
 #endif
     if (!vc_on || (!gmem_buf && !cpu_fill) || size > VC_MAX_RANGE) return false;
-    uint64_t lo = (addr - HEAP_BASE) & ~(VC_PAGE - 1), hi = (addr - HEAP_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
-    if (hi > (gmem_buf ? gmem_size : HEAP_MAX)) return false;
-    uint64_t pend = vk_pending_seq();
+    // (the heap; with CPU fills also the physical memory region, where TOTK keeps its vertices - VC_BASE)
+    bool in_heap = addr >= HEAP_BASE && addr + size <= HEAP_BASE + (gmem_buf ? gmem_size : HEAP_MAX);
+    bool in_alias = cpu_fill && addr >= ALIAS_BASE && addr + size <= ALIAS_BASE + ALIAS_SIZE && ALIAS_BASE >= VC_BASE;
+    if (!in_heap && !in_alias) return false;
+    uint64_t lo = (addr - VC_BASE) & ~(VC_PAGE - 1), hi = (addr - VC_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
+    uint64_t pend = vk_pending_seq(), frame = renderer_present_count();
     uint64_t h = (lo * 0x9E3779B97F4A7C15ull) ^ (hi * 0xC2B2AE3D27D4EB4Full);
     uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (VC_TAB - 1), free_slot = ~0u, old_slot = ~0u;
     VcEnt *e = NULL;
@@ -6005,7 +6409,8 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         VcEnt *c = &vc_tab[slot];
         if (c->buf && c->lo == lo && c->hi == hi) { e = c; break; }
         if (!c->buf && free_slot == ~0u) free_slot = slot;
-        if (c->buf && c->used_seq < pend && (old_slot == ~0u || c->used_seq < vc_tab[old_slot].used_seq)) old_slot = slot;
+        if (c->buf && c->used_seq < pend && c->frame + VC_KEEP_FRAMES <= frame &&
+            (old_slot == ~0u || c->used_seq < vc_tab[old_slot].used_seq)) old_slot = slot;
     }
     if (!e) {  // a new range: its own device-local buffer (gen 0: copied whole at the submission)
         if (vc_npend == VC_TAB) return false;
@@ -6017,7 +6422,8 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         while (vc_bytes + (hi - lo) > VC_BUDGET) {  // over budget: the least recently used entry goes
             int lru = -1;
             for (int i = 0; i < VC_TAB; i++)
-                if (vc_tab[i].buf && vc_tab[i].used_seq < pend && (lru < 0 || vc_tab[i].used_seq < vc_tab[lru].used_seq)) lru = i;
+                if (vc_tab[i].buf && vc_tab[i].used_seq < pend && vc_tab[i].frame + VC_KEEP_FRAMES <= frame &&
+                    (lru < 0 || vc_tab[i].used_seq < vc_tab[lru].used_seq)) lru = i;
             if (lru < 0 || !vc_drop(&vc_tab[lru])) return false;
         }
         e = &vc_tab[free_slot];
@@ -6038,9 +6444,10 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         e->used_seq = pend;
         vc_pend[vc_npend++] = (uint32_t)(e - vc_tab);
     }
+    e->frame = frame;
     prof_vc_hits++;
     *buf = e->buf;
-    *off = addr - HEAP_BASE - lo;
+    *off = addr - VC_BASE - lo;
     return true;
 }
 
@@ -6064,10 +6471,10 @@ void vc_flush(void) {
         for (; j < vc_npend && vc_tab[vc_pend[j]].lo <= hi + 64 * VC_PAGE; j++)
             if (vc_tab[vc_pend[j]].hi > hi) hi = vc_tab[vc_pend[j]].hi;
         uint64_t pg = VC_PAGE;
-        int n = plat_written_pages(HEAP_BASE + lo, hi - lo, pages, 4096, &pg);
+        int n = plat_written_pages(VC_BASE + lo, hi - lo, pages, 4096, &pg);
         prof_vc_queries++;
         if (n < 0 || n >= 4096) for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE; p++) vc_page_gen[p] = g;  // (all)
-        else for (int k = 0; k < n; k++) vc_page_gen[(pages[k] - HEAP_BASE) / VC_PAGE] = g;
+        else for (int k = 0; k < n; k++) vc_page_gen[(pages[k] - VC_BASE) / VC_PAGE] = g;
         if (n > 0) prof_vc_scan_pages += (uint64_t)n;
         i = j;
     }
@@ -6084,13 +6491,16 @@ void vc_flush(void) {
             if (nc == 64) { nc = 1; cp[0] = (VkBufferCopy){e->lo, 0, e->hi - e->lo}; break; }  // (scattered: the whole range)
             cp[nc++] = (VkBufferCopy){o, o - e->lo, VC_PAGE};
         }
-        if (nc && gmem_buf) copy_buffer(cb, gmem_buf, e->buf, (uint32_t)nc, cp);
+        if (nc && gmem_buf) {  // (heap entries only: their offsets from the page tables' base -> the heap buffer's)
+            for (int k = 0; k < nc; k++) cp[k].srcOffset -= VC_HEAP_OFF;
+            copy_buffer(cb, gmem_buf, e->buf, (uint32_t)nc, cp);
+        }
         else if (nc) {  // (copy mode: no heap buffer - the written pages go through the upload ring)
             uint64_t tot = 0, o = 0;
             for (int k = 0; k < nc; k++) tot += cp[k].size;
             VkSpan sp = vk_transient(tot, 256);
             for (int k = 0; k < nc; k++) {
-                memcpy((uint8_t *)sp.ptr + o, (const void *)(uintptr_t)(HEAP_BASE + cp[k].srcOffset), cp[k].size);
+                memcpy((uint8_t *)sp.ptr + o, (const void *)(uintptr_t)(VC_BASE + cp[k].srcOffset), cp[k].size);
                 cp[k].srcOffset = sp.off + o;
                 o += cp[k].size;
             }
@@ -6112,10 +6522,11 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
 #ifdef __ANDROID__
     if (!copy && vk_vamm_buffer(addr, size, buf, off)) return true;
 #endif
-    if (copy || addr < HEAP_BASE) return false;
+    if (copy) return false;
 #ifdef __ANDROID__
-    if (gcopy_mode && !gmem_buf) return addr + size <= HEAP_BASE + HEAP_MAX && vcache_lookup(addr, size, buf, off);  // (else copied)
+    if (gcopy_mode && !gmem_buf) return vcache_lookup(addr, size, buf, off);  // (heap or physical memory region; else copied)
 #endif
+    if (addr < HEAP_BASE) return false;
     if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
     if (vcache_lookup(addr, size, buf, off)) return true;
@@ -6157,7 +6568,7 @@ void vk_exec_reset(void) {
     vc_npend = 0;
     vc_free_dead(true);
     vc_bytes = 0;
-    if (vc_page_gpu) memset(vc_page_gpu, 0, HEAP_MAX / VC_PAGE);
+    if (vc_page_gpu) memset(vc_page_gpu, 0, VC_SPAN / VC_PAGE);
     vc_epoch++;
     st_defaults();
 }
@@ -6607,10 +7018,10 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
 #ifdef __ANDROID__
     vk_bc_shadows_resolve(NULL, NULL, NULL, 0);  // (BC textures drawn into: decoded before anything outside a pass reads them)
 #endif
-    VkCommandBuffer cb = vk_cmd();
+    VkCommandBuffer cb = vk_cmd_rp();  // (the barrier, binds and dispatch: packets for the replay thread while rp_on)
     bool chained = dchain && cb == dchain_cb && dchain_ok();
     if (chained) stat_dchained++;
-    else vk_full_barrier(cb);
+    else rpFullBarrier(cb);
     dchain = false;
     dchain_after = false;
     gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx gmem %d", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
@@ -6631,9 +7042,9 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
 #endif
     if (cp->si->uses_gmem_map) gfast_prepare(cb);
     VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL, NULL, NULL);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
-    vkCmdDispatch(cb, gx, gy, gz);
+    rpCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
+    rpCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
+    rpCmdDispatch(cb, gx, gy, gz);
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
     if (cp->si->uses_gmem_store) vc_mark_sbufs(5), note_gmem_store(5);
     stat_dispatches++;
@@ -7107,7 +7518,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (fb) snapshots_mark_fb_dirty(st.rt.depth);
         else snapshots_invalidate(st.rt.depth);
     }
-    if (in_pass && (draw_w & pass_dup_null)) st.rt_dirty = true;  // (writes a slot begin_pass left unbound)
+    if (in_pass && (draw_w & pass_dup_null)) st.rt_dirty = true, prof_dirty[2]++;  // (writes a slot begin_pass left unbound)
     snap_reason = "draw-colorwrite";
     for (int i = 0; i < st.rt.ncolor; i++) {
         if ((draw_w >> i) & 1) {
@@ -7128,7 +7539,7 @@ static void draw_(CmdRec *r, bool indexed) {
         gres_premerge((pr->vi->uses_gmem_map ? 1u : 0u) | (pr->fi->uses_gmem_map ? 2u : 0u));  // (before the pass opens)
 #endif
     begin_pass();
-    VkCommandBuffer cb = vk_cmd();
+    VkCommandBuffer cb = vk_cmd_rp();  // (the draw's commands: packets for the replay thread while rp_on, replay.h)
 
     uint32_t mode = (uint32_t)r->x[0];
     VkPrimitiveTopology topo;
@@ -7309,36 +7720,36 @@ static void draw_(CmdRec *r, bool indexed) {
         return;
     }
     ss_enabled();
-    if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; stat_pipe_binds++; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
+    if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; stat_pipe_binds++; rpCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
     pp->used = SDL_GetTicksNS(), pp->seq = vk_pending_seq();  // (pipe_evict)
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_key += prof_td_ - prof_tk_;
 
     // ---- depth / stencil (dynamic; without extended dynamic state the calls but the masks' do nothing - device.c - and
     // the pipeline has them, PipeKey.fx)
-    if (ss_need(SS_DT, ss.dt == (VkBool32)dt)) { ss.dt = dt; vkCmdSetDepthTestEnable(cb, dt); }
-    if (ss_need(SS_DW, ss.dw == dw)) { ss.dw = dw; vkCmdSetDepthWriteEnable(cb, dw); }
-    if (ss_need(SS_DOP, ss.dop == dop)) { ss.dop = dop; vkCmdSetDepthCompareOp(cb, dop); }  // (EQUAL's tolerance: above)
-    if (ss_need(SS_STEN, ss.sten == (VkBool32)sten)) { ss.sten = sten; vkCmdSetStencilTestEnable(cb, sten); }
+    if (ss_need(SS_DT, ss.dt == (VkBool32)dt)) { ss.dt = dt; rpCmdSetDepthTestEnable(cb, dt); }
+    if (ss_need(SS_DW, ss.dw == dw)) { ss.dw = dw; rpCmdSetDepthWriteEnable(cb, dw); }
+    if (ss_need(SS_DOP, ss.dop == dop)) { ss.dop = dop; rpCmdSetDepthCompareOp(cb, dop); }  // (EQUAL's tolerance: above)
+    if (ss_need(SS_STEN, ss.sten == (VkBool32)sten)) { ss.sten = sten; rpCmdSetStencilTestEnable(cb, sten); }
     if (sten) {
         for (int f = 0; f < 2; f++) {
             VkStencilFaceFlags face = f ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT;
             const uint32_t *v = sface[f];
             if (!ss_need(f ? SS_SFACE1 : SS_SFACE0, !memcmp(v, ss.sface[f], sizeof sface[f]))) continue;
             memcpy(ss.sface[f], v, sizeof sface[f]);
-            vkCmdSetStencilOp(cb, face, (VkStencilOp)v[0], (VkStencilOp)v[1], (VkStencilOp)v[2], (VkCompareOp)v[3]);
-            vkCmdSetStencilCompareMask(cb, face, v[4]);
-            vkCmdSetStencilWriteMask(cb, face, v[5]);
-            vkCmdSetStencilReference(cb, face, v[6]);
+            rpCmdSetStencilOp(cb, face, (VkStencilOp)v[0], (VkStencilOp)v[1], (VkStencilOp)v[2], (VkCompareOp)v[3]);
+            rpCmdSetStencilCompareMask(cb, face, v[4]);
+            rpCmdSetStencilWriteMask(cb, face, v[5]);
+            rpCmdSetStencilReference(cb, face, v[6]);
         }
     }
-    if (ss_need(SS_BC, !memcmp(ss.bc, st.blend_color, sizeof ss.bc))) { memcpy(ss.bc, st.blend_color, sizeof ss.bc); vkCmdSetBlendConstants(cb, st.blend_color); }
+    if (ss_need(SS_BC, !memcmp(ss.bc, st.blend_color, sizeof ss.bc))) { memcpy(ss.bc, st.blend_color, sizeof ss.bc); rpCmdSetBlendConstants(cb, st.blend_color); }
 
     // ---- rasterizer (as above: computed before the pipeline)
-    if (ss_need(SS_CULL, ss.cull == cm)) { ss.cull = cm; vkCmdSetCullMode(cb, cm); }
-    if (ss_need(SS_FF, ss.ff == ff)) { ss.ff = ff; vkCmdSetFrontFace(cb, ff); }
-    if (ss_need(SS_TOPO, ss.topo == tp)) { ss.topo = tp; vkCmdSetPrimitiveTopology(cb, tp); }
-    if (g_vk.eds2 && ss_need(SS_PRE, ss.pre == pre)) { ss.pre = pre; vkCmdSetPrimitiveRestartEnable(cb, pre); }
+    if (ss_need(SS_CULL, ss.cull == cm)) { ss.cull = cm; rpCmdSetCullMode(cb, cm); }
+    if (ss_need(SS_FF, ss.ff == ff)) { ss.ff = ff; rpCmdSetFrontFace(cb, ff); }
+    if (ss_need(SS_TOPO, ss.topo == tp)) { ss.topo = tp; rpCmdSetPrimitiveTopology(cb, tp); }
+    if (g_vk.eds2 && ss_need(SS_PRE, ss.pre == pre)) { ss.pre = pre; rpCmdSetPrimitiveRestartEnable(cb, pre); }
     {
         float f[3] = {0, 0, 0};
         static int off = -1;
@@ -7369,8 +7780,8 @@ static void draw_(CmdRec *r, bool indexed) {
             }
         }
         if (equal_tol) { f[1] -= 8; on = true; }  // (see the EQUAL comment above: a few depth ulps nearer)
-        if (g_vk.eds2 && ss_need(SS_DBE, ss.dbe == (VkBool32)on)) { ss.dbe = on; vkCmdSetDepthBiasEnable(cb, on); }
-        if (ss_need(SS_DB, !memcmp(ss.db, f, sizeof f))) { memcpy(ss.db, f, sizeof f); vkCmdSetDepthBias(cb, f[1], f[2], f[0]); }
+        if (g_vk.eds2 && ss_need(SS_DBE, ss.dbe == (VkBool32)on)) { ss.dbe = on; rpCmdSetDepthBiasEnable(cb, on); }
+        if (ss_need(SS_DB, !memcmp(ss.db, f, sizeof f))) { memcpy(ss.db, f, sizeof f); rpCmdSetDepthBias(cb, f[1], f[2], f[0]); }
     }
 
     // ---- textures first (their scales feed the widescreen decision and the rscale table), then the viewport
@@ -7482,7 +7893,7 @@ static void draw_(CmdRec *r, bool indexed) {
         ss.layout = pr->layout, ss.sets[0] = vset, ss.sets[1] = fset;
         ss.ndyn = nd;
         memcpy(ss.dyn, dyn, nd * sizeof dyn[0]);
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, nd, dyn);
+        rpCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, nd, dyn);
         stat_set_binds++;
     }
     if (pr->vi->uses_gmem_store) vc_mark_sbufs(0), note_gmem_store(0);
@@ -7570,7 +7981,7 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     if (use_index && ss_need(SS_IB, ss.ib == ib.buf && ss.io == ib.off && ss.it == itype_vk)) {
         ss.ib = ib.buf; ss.io = ib.off; ss.it = itype_vk;
-        vkCmdBindIndexBuffer(cb, ib.buf, ib.off, itype_vk);
+        rpCmdBindIndexBuffer(cb, ib.buf, ib.off, itype_vk);
     }
 
     // ---- vertex streams: the range this draw can read, copied once per submission
@@ -7598,7 +8009,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 VkDeviceSize zoff = sp.off;
                 if (!(ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == sp.buf && ss.vo[s] == zoff)) {
                     ss.vb[s] = sp.buf; ss.vo[s] = zoff; ss.vb_known |= 1u << s;
-                    vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &sp.buf, &zoff);
+                    rpCmdBindVertexBuffers(cb, (uint32_t)s, 1, &sp.buf, &zoff);
                 }
                 continue;
             }
@@ -7623,7 +8034,7 @@ static void draw_(CmdRec *r, bool indexed) {
             if (v.addr && v.size && guest_direct(v.addr, v.size, &dbuf, &doff)) {
                 if (ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == dbuf && ss.vo[s] == doff) continue;
                 ss.vb[s] = dbuf; ss.vo[s] = doff; ss.vb_known |= 1u << s;
-                vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &dbuf, &doff);
+                rpCmdBindVertexBuffers(cb, (uint32_t)s, 1, &dbuf, &doff);
                 continue;
             }
             if (scan_src) {  // copying after all: the index scan bounds the copy
@@ -7653,7 +8064,7 @@ static void draw_(CmdRec *r, bool indexed) {
         VkDeviceSize off = sp.off;
         if (ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == sp.buf && ss.vo[s] == off) continue;
         ss.vb[s] = sp.buf; ss.vo[s] = off; ss.vb_known |= 1u << s;
-        vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &sp.buf, &off);
+        rpCmdBindVertexBuffers(cb, (uint32_t)s, 1, &sp.buf, &off);
     }
 
     if (prof) prof_vtx += SDL_GetTicksNS() - prof_t2_;
@@ -7705,8 +8116,8 @@ static void draw_(CmdRec *r, bool indexed) {
         }
     }
     // ---- draw
-    if (!use_index) vkCmdDraw(cb, count, inst, first, base_inst);
-    else vkCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
+    if (!use_index) rpCmdDraw(cb, count, inst, first, base_inst);
+    else rpCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
     if (g_debug_frame) pick_after_draw();
     pass_written |= draw_w;
     stat_draws++;
@@ -8423,6 +8834,7 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
         post_pass(cb, "fxaa.frag", in, 1, out, m, false);
         v = post_view(out);
     }
+    if (fsr) gp_mark(cb, "present: upscale");  // ([gpuprof]: the AA pass's own row above, the upscale's here)
     if (fsr && up == UPSCALE_SGSR1) {
         float iw = (float)b->width, ih = (float)b->height;
         TexBackend *o = post_image(3, ow, oh, VK_FORMAT_R8G8B8A8_UNORM);
@@ -8443,6 +8855,7 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     }
     vk_full_barrier(cb);
     vk_frame_resume();
+    gp_mark(cb, "present: the final image drawn to the window");  // ([gpuprof]: apart from the AA / upscale passes)
     {
         static uint32_t piw, pih, pow_, poh;
         static int psm = -1, pfs = -1;
@@ -8665,7 +9078,7 @@ static void split_long_pass(void) {
     extern bool vk_async_on(void);
     static unsigned n;  // (the clock every 32 draws: a clock read per draw showed up in the profile)
     if (split > 0 && in_pass && !(++n & 31) && AB("split") != 1 && vk_async_on() && last_submit_ns &&
-        SDL_GetTicksNS() - last_submit_ns > (uint64_t)split * 1000)
+        SDL_GetTicksNS() - last_submit_ns > (uint64_t)split * 1000 && !no_chunks_now())
         renderer_submit();
 #endif
 }
@@ -8710,7 +9123,7 @@ static void exec_list(uint64_t handle, int depth) {
         }
         if (dchain && r->op != CMD_DISPATCH && !dchain_keeps(r->op)) {  // (the dispatches' run ends)
             dchain = false;
-            if (dchain_after) vk_full_barrier(vk_cmd());
+            if (dchain_after) rpFullBarrier(vk_cmd_rp());
             dchain_after = false;
         }
         switch (r->op) {
@@ -8799,6 +9212,7 @@ static void exec_list(uint64_t handle, int depth) {
             static int always = -1;
             if (always < 0) always = getenv("LARECOMP_VK_PASS_RESTART") != NULL;
             if (always || memcmp(&prev, &st.rt, sizeof prev)) {
+                if (in_pass && !st.rt_dirty) prof_dirty[3]++;
                 st.rt_dirty = true;
                 snapshots_flush_fb_dirty("rt-change");
             }

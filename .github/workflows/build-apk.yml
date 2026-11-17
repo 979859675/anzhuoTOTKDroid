@@ -1,5 +1,5 @@
 # Builds the debug APK (arm64-v8a) on GitHub's runner and uploads it as the "totkdroid-debug-apk" artifact.
-# The APK is built without the GPL LSFG folder (-PtotkLsfg=false, MIT as a whole; see NOTICE.md). The game's files
+# The APK includes the GPL-3.0-or-later LSFG folder (the default; see NOTICE.md). The game's files
 # are not in the APK: they are pushed to the phone separately (README: push_game.sh).
 name: Build debug APK
 
@@ -85,7 +85,7 @@ jobs:
         run: |
           LOG="$RUNNER_TEMP/gradle.log"
           set +e
-          ./gradlew assembleDebug -PtotkLsfg=false --no-daemon > "$LOG" 2>&1
+          ./gradlew assembleDebug --no-daemon > "$LOG" 2>&1
           status=$?
           set -e
           tail -n 60 "$LOG"

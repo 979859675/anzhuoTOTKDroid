@@ -12,6 +12,7 @@
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "vk.h"
+#include "replay.h"
 #include "timing_trace.h"
 #include "device_compat.h"
 #include "../output_scale.h"
@@ -558,6 +559,17 @@ static void create_device(void) {
     // (a dma-buf, the other file type: where the opaque one takes no memory the CPU can use - Xclipse 530, #234)
     g_vk.mem_dmabuf = g_vk.mem_fd && has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
     if (g_vk.mem_dmabuf) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+    // (an Android hardware buffer: the heap allocated by gralloc and imported, for the drivers that export none of their
+    // own memory - the Mali-G720's stock driver, "not exportable" as fd or dma-buf; exec.c heap_ahb_place)
+    // Only when asked for (LARECOMP_VK_MEMFD_AHB, LARECOMP_MEMFD_PROBE), as the heap through it is (exec.c
+    // heap_ahb_place): a device the game doesn't need it on stays as before
+    g_vk.mem_ahb = (getenv("LARECOMP_VK_MEMFD_AHB") || getenv("LARECOMP_MEMFD_PROBE")) && g_vk.api >= VK_API_VERSION_1_1 &&
+                   has_ext(ep, ne, VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME) &&
+                   has_ext(ep, ne, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+    if (g_vk.mem_ahb) {
+        ext[n_ext++] = VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME;
+        ext[n_ext++] = VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME;
+    }
     // (which ways this driver could export memory at all: a report from a Mali or an Xclipse says what to try next -
     // the option did nothing on a Mali-G720 r49p1 with no word in the log, #249)
     LOG("[vk-cap] memory export: fd %s, dma-buf %s, Android hardware buffer %s, placed maps %s, host import %s\n",
@@ -882,6 +894,7 @@ static void create_device(void) {
 #ifdef __ANDROID__
     volkLoadDevice(g_vk.dev);
     compat_aliases();
+    vk_rp_install();  // (LARECOMP_VK_REPLAY: the draws' recording on a thread of its own - replay.h)
     LOG("[vk] Vulkan %u.%u device, %u extensions\n", VK_API_VERSION_MAJOR(g_vk.api), VK_API_VERSION_MINOR(g_vk.api), n_ext);
 #endif
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
@@ -1101,9 +1114,50 @@ static void android_create_surface(struct ANativeWindow *aw) {
     surface_aw = aw;
 }
 
+// The window says what frame rate its content has, so the system can pick a refresh that fits (BOTWRecomp's, with
+// 409829c): 40 / 45 fps (Frame rate "40 / 45": a 120 Hz screen that offers 90 may switch for 45), and with frame
+// generation on, the chosen frame rate times its multiplier (60 fps x 2: 120 Hz) - Android leaves a game at 60 Hz unless
+// asked, and then a 40-50 fps game left no refresh between its frames and none was generated (framegen.c's refresh cap;
+// a ROG Phone 8, 165 Hz screen, in BOTW). Otherwise the system's own choice. Asked again for a new window (from the
+// background). libnativewindow's functions looked up, not linked: Android 12+ with the change strategy ALWAYS (the plain
+// call changes the refresh only when it's seamless).
+#include <android/native_window.h>
+#include <dlfcn.h>
+int vk_between_fps(void);
+static void android_frame_rate(struct ANativeWindow *aw) {
+    static struct ANativeWindow *asked_aw;
+    static float asked = -1;
+    int mode = g_settings.fps_mode;
+    float want = mode == 4 && vk_between_fps() != 30 ? (float)vk_between_fps() : 0.0f;
+    bool fg = false;
+    extern int vk_fg_state(void);
+    if (vk_fg_state() > 0) {  // (1 generating, 2 waiting, 3 no refresh left)
+        int base = mode == 1 ? 30 : mode == 3 ? 20 : mode == 4 ? vk_between_fps() : 60;
+        int mult = g_settings.fg_mult < 2 ? 2 : g_settings.fg_mult > 4 ? 4 : g_settings.fg_mult;
+        want = (float)(base * mult), fg = true;
+    }
+    if (aw == asked_aw && want == asked) return;
+    static int (*set_rate)(struct ANativeWindow *, float, int8_t);
+    static int (*set_rate2)(struct ANativeWindow *, float, int8_t, int8_t);
+    static bool looked;
+    if (!looked) {
+        looked = true;
+        void *lib = dlopen("libnativewindow.so", RTLD_NOW);
+        set_rate = lib ? (int (*)(struct ANativeWindow *, float, int8_t))dlsym(lib, "ANativeWindow_setFrameRate") : NULL;
+        set_rate2 = lib ? (int (*)(struct ANativeWindow *, float, int8_t, int8_t))dlsym(lib, "ANativeWindow_setFrameRateWithChangeStrategy") : NULL;
+    }
+    int8_t compat = want > 0 && !fg ? ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE  // (generated: at least that rate)
+                                    : ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT;
+    int r = set_rate2 ? set_rate2(aw, want, compat, 1 /* ANATIVEWINDOW_CHANGE_FRAME_RATE_ALWAYS */)
+          : set_rate ? set_rate(aw, want, compat) : -1;
+    if (want != asked) LOG("[vk] the window asks for %.0f fps content (%d)\n", want, r);
+    asked_aw = aw, asked = want;
+}
+
 static bool android_surface_ready(void) {  // false: no window to draw into now
     struct ANativeWindow *aw = android_window();
     if (!aw) { surface_lost = true; return false; }
+    android_frame_rate(aw);
     if (aw == surface_aw && !surface_lost) return true;
     vkDeviceWaitIdle(g_vk.dev);
     for (uint32_t i = 0; i < g_vk.sc_count; i++) vk_rp_forget_view(g_vk.sc_views[i]), vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
@@ -1888,12 +1942,26 @@ const char *vk_driver_env_at_start(void) { return g_driver_env_at_start; }
 const char *vk_gpu_name(void) { return g_vk.props.deviceName; }
 #endif
 
+#ifdef __ANDROID__
+// The app to the background and back (SDL sends these from its event pump on this thread, as the activity pauses and
+// resumes, before it blocks: a watch sees them even then): the game stops at its next present meanwhile
+// (nvn/objects.c nvn_background)
+void nvn_background(bool on);
+static bool SDLCALL background_watch(void *user, SDL_Event *e) {
+    (void)user;
+    if (e->type == SDL_EVENT_DID_ENTER_BACKGROUND) nvn_background(true);
+    else if (e->type == SDL_EVENT_WILL_ENTER_FOREGROUND) nvn_background(false);
+    return true;
+}
+#endif
+
 void ui_window_init(void) {
     if (window) return;
     atexit(quick_exit_handler);
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 #ifdef __ANDROID__
     SDL_SetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON, "1");  // (the back button opens the menu: ui/touch_controls.mm)
+    SDL_AddEventWatch(background_watch, NULL);
 #endif
     settings_load();
 #ifdef __ANDROID__
@@ -1951,6 +2019,7 @@ void ui_window_init(void) {
     }
 #endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());
+    if (!SDL_InitSubSystem(SDL_INIT_HAPTIC)) LOG("[rumble] no haptics: %s\n", SDL_GetError());  // (the phone's vibrator: hle/input.c)
     int win_w = 1280, win_h = 720;
     if (getenv("LARECOMP_WINDOW")) sscanf(getenv("LARECOMP_WINDOW"), "%dx%d", &win_w, &win_h);
     SDL_WindowFlags wflags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
@@ -2074,6 +2143,19 @@ bool vk_driver_is_turnip(void) {
     }
     return t > 0;
 }
+
+// Mesa's RADV (the Xclipse builds players load: radv-xclipse): the game's memory through its exported file broke the
+// game's first access to it (exec.c vk_heap_file_asked)
+bool vk_driver_is_radv(void) {
+    static int r = -1;
+    if (r < 0 && g_vk.phys) {
+        VkPhysicalDeviceDriverProperties d = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &d};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p);
+        r = d.driverID == VK_DRIVER_ID_MESA_RADV;
+    }
+    return r > 0;
+}
 #endif
 
 void backend_init(void) {
@@ -2141,6 +2223,8 @@ int ui_run(void) {
         }
         extern void motion_open(void);  // (runtime/hle/motion.c: the phone's sensors, once the setting is on)
         motion_open();
+        extern void input_rumble_tick(void);  // (runtime/hle/input.c: the game's vibration on the motors)
+        input_rumble_tick();
         menu_apply_window_requests(window);
 #ifdef __ANDROID__
         {   // the pipeline cache to disk now and then while it grows: an app is killed rather than exited, so

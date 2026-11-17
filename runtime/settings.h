@@ -21,7 +21,7 @@ enum { AA_OFF = 0, AA_SMAA = 1, AA_FXAA = 2 };
 // System language served to the game (runtime/services/am.c GetDesiredLanguage, services/hid_set.c GetLanguageCode):
 // the game picks its text language from it, as it would from the Switch's own system setting. LANG_AUTO follows the
 // host locale ($LC_ALL / $LC_MESSAGES / $LANG); the rest are the codes of the languages the game has text for.
-enum { LANG_AUTO = 0, N_LANGUAGES = 13 };
+enum { LANG_AUTO = 0, N_LANGUAGES = 15 };
 extern const char *const g_language_codes[N_LANGUAGES];  // what the game is told: "ja", "en-US", "es", ...
 extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto", "Japanese", ..., "Spanish")
 
@@ -42,6 +42,10 @@ typedef struct {
     // quality, 1 balanced, 2 performance), LSFG's motion estimation resolution (0 the game's own, or 25-100 %)
     int fg_engine, fg_mult, fg_perf, lsfg_flow;
     bool motion;          // the phone's (or a controller's) gyroscope as the controller's motion sensor (hle/motion.c)
+    int rumble;           // the game's vibration, % strength (0 off) on the controller, or the phone without one (hle/input.c)
+    int shadow_res;       // the game's shadow map size: 0 its own, 288, 256 (native.c fix_shadow_size)
+    bool game_fxaa;       // the game's own FXAA pass (native.c fix_game_fxaa)
+    int far_clip;         // the render far plane capped at this many metres, 0: the game's (native.c fix_far_clamp)
     int motion_source;    // whose: 0 automatic (a controller's once its gyroscope is alive), 1 the phone's, 2 a controller's
     bool motion_flat;     // the phone's sensors as the Switch's screen in handheld mode, not a flat controller (hle/motion.c)
 #ifdef __ANDROID__
@@ -55,6 +59,8 @@ typedef struct {
     bool files_in_place;  // Android: a setup reads the picked romfs/ where it is, no copy (services/fs.c); off by default
     bool native_code;     // Android: the game's own code on the CPU, no build of it (runtime/native.c); off by default
     bool sync_lag;        // Android: the game's next frame overlaps the GPU's last (nvn/objects.c nvnSyncWait); on by default
+    int low_ram;          // RAM saving (vulkan/exec.c vk_low_ram): -1 automatic (devices up to 4 GB), 1 on, 0 off; read once,
+                          // as the app starts
     // Driver compatibility (the start screen's Settings > Prelaunch, ui/launcher.mm; from LASRecompAndroid), for GPUs
     // where a Turnip path draws wrong: read when the game starts (gpu_heap, inplace_reads) or when the app starts
     // (turnip_lrz, log_file). -1 Automatic: on for the Adreno 8xx GPUs these paths were made on, off elsewhere

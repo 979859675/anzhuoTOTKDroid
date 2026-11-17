@@ -8,7 +8,8 @@
 // its command list is), and a wait first waits for the render thread to reach it, then for the GPU as before.
 //
 // Requests: EXEC (a command list), PRESENT (the window's half of backend_present: the game's half - pacing, input,
-// tests - stays on the game's thread), FENCE (nvnQueueFenceSync). Everything else that reaches into the renderer from
+// tests - stays on the game's thread), FENCE (nvnQueueFenceSync), TEXREG (texture pool
+// slots registered, in order: objects.c). Everything else that reaches into the renderer from
 // the game's thread (a texture destroyed, a movie frame, the heap, a reset) first waits for the queue to empty
 // (vk_async_drain): those are rare, and so they run as before, with the render thread idle.
 #ifdef __ANDROID__
@@ -193,6 +194,9 @@ void vk_async_drain(void) {
     }
     while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
     pthread_mutex_unlock(&q_lock);
+    // and the replay thread done with the draws' packets (replay.h): what runs next here may destroy what they bind
+    extern void vk_rp_drain_at(void *ra);
+    vk_rp_drain_at(__builtin_return_address(0));
     if (waits) vk_tl("host: drain wait end", id, 0);
 }
 

@@ -169,7 +169,7 @@ void perf_overlay_draw(ImVec2 display, float scale) {
             said = true;
             fprintf(stderr, "[overlay] items %d style %s fg %d\n", items, g_settings.overlay_style == 0 ? "detailed" : "compact", fg);
         }
-        bool gen = fg == 1 || fg == 2;
+        bool gen = fg >= 1;  // (1 generating, 2 waiting, 3 no refresh left)
         float fps = gen ? game_fps : shown;
         if (last_sample && now - last_sample > 2000000000ull) hcount = hnext = 0;  // (hidden a while: a new history)
         last_sample = now;
@@ -181,7 +181,7 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     }
 
     // what is shown (an item switched off reads "--")
-    bool gen = fg == 1 || fg == 2;
+    bool gen = fg >= 1;  // (1 generating, 2 waiting, 3 no refresh left)
     float fps = NAN, presented = NAN, ms = NAN, gms = NAN, soc = NAN, bat = NAN;
     int level = -1, thermal = -1;
     long rss = -1, total = 0, avail = 0;

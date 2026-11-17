@@ -187,9 +187,15 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
             return false;
         }
         g_guest_lo = base;
+        const char *app = getenv("LARECOMP_APP");  // (the activity: version, versionCode, phone, Android)
+        if (app && *app) fprintf(stderr, "TOTKDroid %s\n", app);
         fprintf(stderr, "[android] guest window %#llx-%#llx\n", (unsigned long long)base, (unsigned long long)(base + hi - lo));
         const char *last = getenv("LARECOMP_LAST_EXIT");  // (the activity: ApplicationExitInfo)
         if (last && *last) fprintf(stderr, "[android] the last run ended: %s\n", last);
+        // The crash report from here on, not only once the game's threads run (BOTWRecomp ed930d4): a custom driver
+        // (RADV on an Xclipse, BOTW #234 #345 #383) crashed in the first frames, before the game loaded, and the log just
+        // stopped. (The handler is process-wide; the game's threads install it again for their own signal stacks.)
+        plat_crash_handler_install();
         return true;
     }
     void *p = mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE,
@@ -224,6 +230,15 @@ void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 void plat_discard(uint64_t addr, uint64_t size) {
     extern bool vk_vamm_clear(uint64_t addr, uint64_t size);
     if (vk_vamm_clear(addr, size)) return;
+    if (wt_state && size && addr < wt_hi && addr + size > wt_lo) {
+        // (tracked pages: what was read-only since asked turns to zeros now - counted as written, else the vertex cache
+        // kept the old bytes. Those pages stay read-only: a write faults and opens them, wt_fault's state-0 path.)
+        uint64_t a = (addr < wt_lo ? wt_lo : addr) & ~0xFFFull, e = addr + size > wt_hi ? wt_hi : addr + size;
+        wt_lock();
+        for (uint64_t p = (a - wt_lo) >> 12; p < (e - wt_lo + 0xFFF) >> 12; p++)
+            if (wt_state[p] == 1) wt_state[p] = 0;
+        wt_unlock();
+    }
     uint64_t pg = (uint64_t)sysconf(_SC_PAGESIZE), lo = (addr + pg - 1) & ~(pg - 1), hi = (addr + size) & ~(pg - 1);
     if (lo >= hi) {
         memset((void *)(uintptr_t)addr, 0, size);

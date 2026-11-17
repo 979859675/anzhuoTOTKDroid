@@ -32,6 +32,8 @@ Settings g_settings = {
     .fg_engine = FG_OFF,
     .fg_mult = 2,
     .fg_perf = 1,
+    .rumble = 100,
+    .game_fxaa = 1,
     .lsfg_flow = 75,
 #ifdef __ANDROID__
     .show_fps = true,  // (the performance overlay, ui/perf_overlay.mm: on until turned off in the menu)
@@ -53,6 +55,7 @@ Settings g_settings = {
     .touch_talk = true,
     .touch_minimap_top = true,
     .gpu_heap = -1,
+    .low_ram = -1,
     .inplace_reads = -1,
     .turnip_lrz = -1,
     .fps_mode = 1,  // (30: the game's own choice dropped the overworld to 20, where the GPU's clocks settled low)
@@ -83,11 +86,14 @@ Settings g_settings = {
 // the Switch reports them. TOTK has all of them, Brazilian Portuguese (USpt) included.
 // Chinese is zh-Hans / zh-Hant, as GetDesiredLanguage answers since system 4.0 (and Eden): the older zh-CN / zh-TW
 // gave Japanese text (BOTWRecompAndroid issue #15).
+// "es" / "fr" give Spain's and France's text (regionEU); Latin America's Spanish and Canada's French are the region US
+// ones (Pack/Bootup_USes.pack, Bootup_USfr.pack, in every version), told as es-419 / fr-CA (BOTWRecompAndroid issue #128).
 const char *const g_language_codes[N_LANGUAGES] = {"auto", "ja", "en-US", "es", "fr", "de", "it", "nl", "ru", "ko",
-                                                   "zh-Hans", "zh-Hant", "pt-BR"};
+                                                   "zh-Hans", "zh-Hant", "pt-BR", "es-419", "fr-CA"};
 const char *const g_language_names[N_LANGUAGES] = {"Auto", "Japanese", "English", "Spanish", "French", "German",
                                                    "Italian", "Dutch", "Russian", "Korean", "Chinese (Simplified)",
-                                                   "Chinese (Traditional)", "Portuguese (Brazil)"};
+                                                   "Chinese (Traditional)", "Portuguese (Brazil)",
+                                                   "Spanish (Latin America)", "French (Canada)"};
 
 // The app's own menus (ui/i18n.mm): the game's Language when one is chosen - one setting for both, read once (the menus
 // change when the app starts again) - else the phone's first preferred language, which is the app's own when Android
@@ -101,7 +107,7 @@ const char *settings_menu_language(void) {
         int chosen = g_settings.language;
         if (!(e && *e) && chosen > LANG_AUTO && chosen < N_LANGUAGES) {
             static const char *const menu[N_LANGUAGES] = {"en", "ja", "en", "es", "fr", "de", "it", "nl", "ru", "ko",
-                                                          "zh-Hans", "zh-Hant", "pt"};  // (g_language_codes' order)
+                                                          "zh-Hans", "zh-Hant", "pt", "es", "fr"};  // (g_language_codes' order)
             return lang = menu[chosen];
         }
         if (e && *e) {
@@ -164,8 +170,16 @@ static const char *host_language(void) {
     char l[8] = {0};
     size_t n = 0;
     for (const char *p = e; *p && *p != '.' && *p != '@' && *p != '_' && *p != '-' && n < sizeof l - 1; p++) l[n++] = *p;
+    // (the country after the language: "es-MX", "es_AR.UTF-8", "es-419")
+    char country[8] = {0};
+    const char *sep = e + n;
+    if (*sep == '_' || *sep == '-')
+        for (size_t k = 0; sep[k + 1] && sep[k + 1] != '.' && sep[k + 1] != '@' && sep[k + 1] != '-' && k < sizeof country - 1; k++)
+            country[k] = sep[k + 1];
+    if (!strcmp(l, "es")) return country[0] && strcmp(country, "ES") ? "es-419" : "es";  // (Spain's, else the Americas')
+    if (!strcmp(l, "fr")) return !strcmp(country, "CA") ? "fr-CA" : "fr";
     static const struct { const char *loc, *code; } map[] = {{"ja", "ja"}, {"ko", "ko"}, {"ru", "ru"}, {"nl", "nl"},
-                                                             {"de", "de"}, {"it", "it"}, {"fr", "fr"}, {"es", "es"}};
+                                                             {"de", "de"}, {"it", "it"}};
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
         if (!strcmp(l, map[i].loc)) return map[i].code;
     if (!strcmp(l, "zh"))  // (TW / HK, Hant: traditional)
@@ -208,6 +222,10 @@ void settings_reset_defaults(void) {
     g_settings.fg_perf = d->fg_perf;
     g_settings.lsfg_flow = d->lsfg_flow;
     g_settings.motion = d->motion;
+    g_settings.rumble = d->rumble;
+    g_settings.shadow_res = d->shadow_res;
+    g_settings.game_fxaa = d->game_fxaa;
+    g_settings.far_clip = d->far_clip;
     g_settings.motion_source = d->motion_source;
     g_settings.motion_flat = d->motion_flat;
 #ifdef __ANDROID__
@@ -219,6 +237,7 @@ void settings_reset_defaults(void) {
     g_settings.fps_mode = d->fps_mode;
     g_settings.shader_int32 = d->shader_int32;
     g_settings.sync_lag = d->sync_lag;
+    g_settings.low_ram = d->low_ram;
     g_settings.files_in_place = d->files_in_place;
     g_settings.native_code = d->native_code;
 #endif
@@ -232,7 +251,7 @@ void settings_load(void) {
     FILE *f = fopen(SETTINGS_FILE, "r");
     if (!f) return;
     char line[1200];  // (touch_layout: 24 numbers; cheats_on: up to 1024)
-    bool tip_key = false, aspect_key = false, output_key = false;
+    bool tip_key = false, aspect_key = false, output_key = false, fg_key = false;
     while (fgets(line, sizeof line, f)) {
         char key[64];
         char val[1100] = "";  // (a key with nothing after "=": mods_off when every mod is on)
@@ -251,6 +270,10 @@ void settings_load(void) {
         else if (!strcmp(key, "lsfg_mult")) g_settings.fg_mult = atoi(val) < 2 ? 2 : atoi(val) > 4 ? 4 : atoi(val);
         else if (!strcmp(key, "lsfg_flow")) g_settings.lsfg_flow = atoi(val) <= 0 ? 0 : atoi(val) < 25 ? 25 : atoi(val) > 100 ? 100 : atoi(val);
         else if (!strcmp(key, "motion")) g_settings.motion = atoi(val) != 0;
+        else if (!strcmp(key, "rumble")) g_settings.rumble = atoi(val) >= 0 && atoi(val) <= 300 ? atoi(val) : 100;
+        else if (!strcmp(key, "shadow_res")) g_settings.shadow_res = atoi(val) == 288 || atoi(val) == 256 ? atoi(val) : 0;
+        else if (!strcmp(key, "game_fxaa")) g_settings.game_fxaa = atoi(val) != 0;
+        else if (!strcmp(key, "far_clip")) g_settings.far_clip = atoi(val) >= 1000 && atoi(val) <= 100000 ? atoi(val) : 0;
         else if (!strcmp(key, "motion_source")) g_settings.motion_source = atoi(val) >= 0 && atoi(val) <= 2 ? atoi(val) : 0;
         else if (!strcmp(key, "motion_flat")) g_settings.motion_flat = atoi(val) != 0;
 #ifdef __ANDROID__
@@ -269,6 +292,7 @@ void settings_load(void) {
         else if (!strcmp(key, "native_code")) g_settings.native_code = atoi(val) != 0;
         else if (!strcmp(key, "gpu_heap")) g_settings.gpu_heap = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
         else if (!strcmp(key, "heap_file")) g_settings.heap_file = atoi(val) != 0;
+        else if (!strcmp(key, "low_ram")) g_settings.low_ram = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
         else if (!strcmp(key, "inplace_reads")) g_settings.inplace_reads = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
         else if (!strcmp(key, "turnip_lrz")) g_settings.turnip_lrz = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
         else if (!strcmp(key, "log_file")) g_settings.log_file = atoi(val) != 0;
@@ -343,11 +367,15 @@ void settings_load(void) {
         else if (!strcmp(key, "mods_off")) snprintf(g_settings.mods_off, sizeof g_settings.mods_off, "%s", val);
         else if (!strcmp(key, "cheats_on")) snprintf(g_settings.cheats_on, sizeof g_settings.cheats_on, "%s", val);
         else if (!strcmp(key, "aspect_asked")) g_settings.aspect_asked = atoi(val) != 0, aspect_key = true;
+        else if (!strcmp(key, "settings_version")) fg_key = atoi(val) >= 1;  // (frame generation starts off, see below)
         else bind_settings_load(key, val);  // bind_pad_* / bind_key_*: runtime/hle/bindings.c
     }
     fclose(f);
     if (!tip_key) g_settings.menu_tip_seen = true;  // (a settings file from before the note: not a first launch)
     if (!aspect_key) g_settings.aspect_asked = true;  // (likewise: the aspect ratio was chosen already)
+    // Frame generation starts off (Win-FG and LSFG both). A file from before this default: off once; the player's
+    // choice after that is kept (settings_save writes settings_version).
+    if (!fg_key) g_settings.fg_engine = FG_OFF;
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
@@ -357,6 +385,7 @@ void settings_save(void) {
     FILE *f = fopen(SETTINGS_FILE, "w");
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
     fprintf(f, "# TOTKDroid settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
+    fprintf(f, "settings_version = 1\n");  // (frame generation off by default: settings_load)
     fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original" : "unlocked");
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
@@ -365,6 +394,10 @@ void settings_save(void) {
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
     fprintf(f, "fg_engine = %d\nfg_mult = %d\nfg_perf = %d\nlsfg_flow = %d\n", g_settings.fg_engine, g_settings.fg_mult,
             g_settings.fg_perf, g_settings.lsfg_flow);
+    fprintf(f, "rumble = %d\n", g_settings.rumble);
+    fprintf(f, "shadow_res = %d\n", g_settings.shadow_res);
+    fprintf(f, "game_fxaa = %d\n", g_settings.game_fxaa);
+    fprintf(f, "far_clip = %d\n", g_settings.far_clip);
     fprintf(f, "motion = %d\nmotion_source = %d\nmotion_flat = %d\n", g_settings.motion, g_settings.motion_source,
             g_settings.motion_flat);
 #ifdef __ANDROID__
@@ -384,6 +417,7 @@ void settings_save(void) {
             TRI(g_settings.gpu_heap), g_settings.heap_file, TRI(g_settings.inplace_reads), TRI(g_settings.turnip_lrz),
             g_settings.log_file, g_settings.gpu_model);
     fprintf(f, "driver_env = %s\n", g_settings.driver_env);
+    fprintf(f, "low_ram = %s\n", TRI(g_settings.low_ram));
 #undef TRI
     fprintf(f, "touch_drag_camera = %d\ntouch_drag_sens = %.2f\ntouch_sticks_hidden = %d\ntouch_half_areas = %d\n",
             g_settings.touch_drag_camera, g_settings.touch_drag_sens, g_settings.touch_sticks_hidden,
