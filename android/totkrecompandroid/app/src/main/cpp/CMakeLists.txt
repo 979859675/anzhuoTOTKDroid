@@ -18,6 +18,10 @@ include(${R}/android/gamelib_id.cmake)  # (GAMELIB_ID: the same as totkgame.so's
 message(STATUS "GAMELIB_ID ${GAMELIB_ID}")
 
 add_subdirectory(${R}/third_party/libadrenotools ${CMAKE_BINARY_DIR}/adrenotools)
+# Qualcomm's custom drivers on Android 15: an API 36 Binder symbol they import, defined in the driver's namespace
+# (android/adreno_binder_compat.c; -z global so the driver's libraries find it)
+target_sources(hook_impl PRIVATE ${R}/android/adreno_binder_compat.c)
+target_link_options(hook_impl PRIVATE -z global)
 
 add_library(SDL3 SHARED IMPORTED)
 set_target_properties(SDL3 PROPERTIES IMPORTED_LOCATION ${DEPS}/lib/libSDL3.so)

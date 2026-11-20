@@ -7,6 +7,7 @@
 
 #include "shaders.h"
 #include "shader_cache.h"
+#include "vk_fpenv.h"
 
 void vk_shaders_init(void) {  // (compilers are per thread: check shaderc works at all)
     shaderc_compiler_t c = shaderc_compiler_initialize();
@@ -160,7 +161,9 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
 #endif
     shaderc_compile_options_set_optimization_level(o, optimized ? shaderc_optimization_level_performance
                                                                                   : shaderc_optimization_level_zero);
+    uint64_t fp = vk_fp_host("shaderc");  // (its optimizer folds constants in the host's FP mode: vk_fpenv.h)
     shaderc_compilation_result_t r = shaderc_compile_into_spv(comp, src, strlen(src), kind_of(stage), name, "main", o);
+    vk_fp_put(fp);
     shaderc_compile_options_release(o);
     if (shaderc_result_get_compilation_status(r) != shaderc_compilation_status_success) {
         static int nlog;
@@ -181,7 +184,9 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
 VkShaderModule vk_module(const uint32_t *spv, size_t nwords) {
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nwords * 4, .pCode = spv};
     VkShaderModule m;
+    uint64_t fp = vk_fp_host("a shader module");
     VkResult result = vkCreateShaderModule(g_vk.dev, &ci, NULL, &m);
+    vk_fp_put(fp);
     if (result != VK_SUCCESS) LOG("[shader] vkCreateShaderModule failed: %d (%zu words)\n", result, nwords);
     return result == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }

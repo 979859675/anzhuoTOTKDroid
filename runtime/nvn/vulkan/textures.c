@@ -4,6 +4,7 @@
 #include <float.h>
 #include <math.h>
 #include <pthread.h>
+#include "vk_fpenv.h"
 #include <stdlib.h>
 #include <string.h>
 #ifdef __ANDROID__
@@ -1032,6 +1033,7 @@ static sem_t hash_done;
 static int hash_par = -1;
 static void *hash_worker(void *arg) {
     int i = (int)(intptr_t)arg;
+    vk_fp_thread("vk-hash");
     for (;;) {
         sem_wait(&hash_job[i].go);
         hash_job[i].h = tex_hash_full(hash_job[i].p, hash_job[i].n);
@@ -1092,6 +1094,7 @@ static int tcheck_started;
 uint64_t prof_tex_helper_jobs, prof_tex_helper_hits;  // (LARECOMP_VK_PROF-style counters: queued, found differing)
 static void *tcheck_main(void *arg) {
     (void)arg;
+    vk_fp_thread("vk-tcheck");
     pthread_mutex_lock(&tcheck_lock);
     for (;;) {
         while (tcheck_head == tcheck_tail) pthread_cond_wait(&tcheck_more, &tcheck_lock);

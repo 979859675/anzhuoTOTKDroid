@@ -21,6 +21,7 @@
 #include "../../kernel.h"
 #include "shaders.h"
 #include "vk.h"
+#include "vk_fpenv.h"
 #include "buffer_copy.h"
 #include "timing_trace.h"
 #include "replay.h"
@@ -148,6 +149,7 @@ static pthread_cond_t done_cv = PTHREAD_COND_INITIALIZER;  // (sw_m: done_cached
 static _Atomic uint64_t sw_submitted;
 static void *seq_waiter(void *arg) {
     (void)arg;
+    vk_fp_thread("vk-seq");
     for (;;) {
         pthread_mutex_lock(&sw_m);
         uint64_t done;
@@ -281,6 +283,13 @@ static bool gcopy_mode;   // (no heap import: global memory copied by the CPU, g
 #endif
 #define VC_HEAP_OFF (HEAP_BASE - VC_BASE)
 #define VC_SPAN (VC_HEAP_OFF + HEAP_MAX)
+// LARECOMP_VC_ALIAS=0: the tracking and the cache on the heap alone, as in 0.3.0 (an A/B)
+static bool vc_alias_on(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("LARECOMP_VC_ALIAS") || atoi(getenv("LARECOMP_VC_ALIAS")) != 0;
+    return on;
+}
+#define VC_TRACK_LO (vc_alias_on() ? VC_BASE : HEAP_BASE)
 #ifdef __ANDROID__
 static bool gwin_mode;    // (heap placed, larger than a storage buffer reaches, no pointer: draws get a window of it, gwin_prepare)
 static uint64_t gmem_bda;  // the placed heap's device address when shaders reach it by pointer (vk_heap_place), else 0
@@ -1566,6 +1575,7 @@ static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
 static void *worker(void *a) {
     (void)a;
+    vk_fp_thread("vk-compile");  // (made from a game thread: its FPCR - vk_fpenv.h)
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
@@ -1593,6 +1603,7 @@ static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
+    vk_fp_thread("vk-translate");
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
         while (!tjobs_head) pthread_cond_wait(&tjobs_cond, &tjobs_lock);
@@ -1902,7 +1913,7 @@ void vk_exec_init(void) {
     // (for good, without placed memory: the vertex cache and the texture checks fed by write tracking - vc_flush)
     // (nor with an exported file to map there: vk_heap_place turns it on if that fails)
     extern bool vk_heap_file_asked(void);
-    if (gcopy_mode && !g_vk.map_placed && !vk_heap_file_asked()) plat_write_tracking_enable(VC_BASE, HEAP_BASE + HEAP_MAX);
+    if (gcopy_mode && !g_vk.map_placed && !vk_heap_file_asked()) plat_write_tracking_enable(VC_TRACK_LO, HEAP_BASE + HEAP_MAX);
 #endif
     if (prof) {
         prof_up_ns = 0;
@@ -2913,7 +2924,9 @@ static VkPipeline clear_pipeline(int index, int kind, uint32_t mask, bool depth,
         if (crp) pi.pNext = rinfo.pNext, pi.renderPass = crp;
     }
     VkPipeline p = VK_NULL_HANDLE;
+    uint64_t fp = vk_fp_host("a pipeline");  // (FPCR 0 around the compile: vk_fpenv.h)
     if (vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p) != VK_SUCCESS) LOG("[vk] clear pipeline failed\n");
+    vk_fp_put(fp);
     clear_tab[slot].key = key;
     clear_tab[slot].pipe = p;
     return p;
@@ -3689,7 +3702,9 @@ static void build_pipeline(void *arg) {
         if (logp) LOG("[pipe] compiling vs %llx fs %llx\n", (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
     }
 #endif
+    uint64_t fp = vk_fp_host("a pipeline");  // (FPCR 0 around the compile: vk_fpenv.h)
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
+    vk_fp_put(fp);
     if (r != VK_SUCCESS) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
@@ -4222,13 +4237,16 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
                 // bookkeeping) share that pass. Those passes of a few draws run in system memory on Turnip (~0.02 ms).
                 // Only the writes before the game's last barrier (NVN's rule) left the ground dark: its draws don't
                 // fence every write they then read. Sampling a target the pass writes is a feedback loop Vulkan leaves
-                // undefined (without VK_EXT_attachment_feedback_loop_layout): on Turnip only, where it was checked
-                // frame by frame on the Adreno 830 - Automatic keeps it to the Adreno 8xx (settings.h inplace_reads,
-                // the start screen's Driver compatibility; LARECOMP_FEEDBACK_INPLACE=1 on any driver).
+                // undefined (without VK_EXT_attachment_feedback_loop_layout): checked frame by frame on Turnip on the
+                // Adreno 830; Automatic keeps it to Turnip on the Adreno 7xx / 8xx and, since players ran it there
+                // without a fault (#73: a Mali-G720 in a shrine from 3 to 10.6 fps), Mali (settings.h inplace_reads,
+                // the start screen's Driver compatibility; On there or LARECOMP_FEEDBACK_INPLACE=1: any driver).
                 if (g_inplace_copy < 0) {
                     extern bool vk_driver_is_turnip(void);
-                    extern bool vk_inplace_reads_on(int setting);  // (Automatic: Adreno 7xx and 8xx - device.c, #48)
-                    bool inplace = getenv("LARECOMP_FEEDBACK_INPLACE") || (vk_driver_is_turnip() && vk_inplace_reads_on(g_settings.inplace_reads));
+                    extern bool vk_inplace_auto(void);  // (Adreno 7xx / 8xx and Mali - device.c, #48 #73)
+                    bool inplace = getenv("LARECOMP_FEEDBACK_INPLACE") || g_settings.inplace_reads > 0 ||
+                                   (g_settings.inplace_reads < 0 && vk_inplace_auto() &&
+                                    (vk_driver_is_turnip() || g_vk.props.vendorID == 0x13B5));
                     g_inplace_copy = getenv("LARECOMP_FEEDBACK_COPY") != NULL || !inplace;
                     LOG("[vk] targets a draw writes, sampled by it: %s (%s)\n", g_inplace_copy ? "copies" : "in place",
                         g_settings.inplace_reads < 0 ? "automatic" : "settings");
@@ -4267,6 +4285,21 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
                 continue;
             }
             stat_feedback_copies++;
+            {   // A frame with hundreds of these (a Mali-G615 in a shrine: ~4000 a frame, 1-2 fps, #65): once in 10 s, which
+                // target and which draw - the depth or a colour target, written by this draw or by one before it in the pass
+                static uint64_t fr, n, next_ns;
+                uint64_t f = renderer_present_count();
+                if (f != fr) fr = f, n = 0;
+                if (++n == 300 && SDL_GetTicksNS() >= next_ns) {
+                    next_ns = SDL_GetTicksNS() + 10000000000ull;
+                    uint32_t bit = t == st.rt.depth ? 1u << 8 : 0;
+                    for (int k = 0; k < st.rt.ncolor; k++) if (st.rt.color[k] == t) bit |= 1u << k;
+                    LOG("[vk] 300 target copies in frame %llu: now %ux%u format %d (%s), fs %016llx, written by this draw %d, "
+                        "earlier in the pass %d, in-place reads %s\n", (unsigned long long)f, src->width, src->height, src->format,
+                        bit & (1u << 8) ? "depth" : bit ? "colour target" : "not bound", (unsigned long long)g_cur_fs_hash,
+                        (draw_written & bit) != 0, (pass_written & bit) != 0, g_inplace_copy ? "off" : "on");
+                }
+            }
             if (ct_on()) LOG("[ct] snapshot %p %ux%u (was %s, si %d)\n", (void *)t, src->width, src->height, si >= 0 ? snap_why[si] : "new", si);
             vk_end_pass();
             TexBackend *dst = snapshot_image(t, src);
@@ -5091,7 +5124,7 @@ bool vk_heap_place(uint64_t size) {
     // OS's write tracking - vk_exec_init turns it on only without placed memory at all, so a Turnip that has it but
     // isn't an Adreno 8xx (Automatic) had neither: every vertex and index buffer copied each frame, ~150 MB, 7-9 fps
     // on an Adreno 730 (issue #31). A page not tracked yet counts as written, so turning it on late is safe.
-#define NOT_PLACED() (gcopy_mode ? plat_write_tracking_enable(VC_BASE, HEAP_BASE + HEAP_MAX) : (void)0, false)
+#define NOT_PLACED() (gcopy_mode ? plat_write_tracking_enable(VC_TRACK_LO, HEAP_BASE + HEAP_MAX) : (void)0, false)
     // Without placed maps, the same through an exported file (VK_KHR_external_memory_fd, a dma-buf) mapped at the heap's
     // address by mmap (BOTWRecompAndroid ed53b68, after legendszaonandroid's VULKAN_BACKEND.md, MIT; memfd_probe.c tests
     // it): Mali and Xclipse have neither the placed map nor the import, and their CPU copies with write tracking upload
@@ -6398,7 +6431,7 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
     if (!vc_on || (!gmem_buf && !cpu_fill) || size > VC_MAX_RANGE) return false;
     // (the heap; with CPU fills also the physical memory region, where TOTK keeps its vertices - VC_BASE)
     bool in_heap = addr >= HEAP_BASE && addr + size <= HEAP_BASE + (gmem_buf ? gmem_size : HEAP_MAX);
-    bool in_alias = cpu_fill && addr >= ALIAS_BASE && addr + size <= ALIAS_BASE + ALIAS_SIZE && ALIAS_BASE >= VC_BASE;
+    bool in_alias = cpu_fill && vc_alias_on() && addr >= ALIAS_BASE && addr + size <= ALIAS_BASE + ALIAS_SIZE && ALIAS_BASE >= VC_BASE;
     if (!in_heap && !in_alias) return false;
     uint64_t lo = (addr - VC_BASE) & ~(VC_PAGE - 1), hi = (addr - VC_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
     uint64_t pend = vk_pending_seq(), frame = renderer_present_count();
@@ -6888,7 +6921,9 @@ static void build_compute(void *arg) {
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main",
                                                 .pSpecializationInfo = &spec},
                                       .layout = cp->p.layout};
+    uint64_t fp = vk_fp_host("a pipeline");  // (FPCR 0 around the compile: vk_fpenv.h)
     VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
+    vk_fp_put(fp);
     atomic_fetch_add(&stat_compiles, 1);
     if (r == VK_SUCCESS) atomic_fetch_add(&live_cpipes, 1);
     atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
@@ -8615,7 +8650,9 @@ static VkPipeline present_pipeline_a(VkFormat fmt, bool alpha) {  // alpha: the 
         if (crp) pi.pNext = ri.pNext, pi.renderPass = crp;
     }
     VkPipeline p;
+    uint64_t fp = vk_fp_host("a pipeline");  // (FPCR 0 around the compile: vk_fpenv.h)
     VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
+    vk_fp_put(fp);
     for (int i = 0; i < 6; i++) if (!cache[i].p) { cache[i].f = fmt; cache[i].a = alpha; cache[i].p = p; break; }
     return p;
 }
@@ -8685,7 +8722,9 @@ static VkPipeline post_pipeline(const char *fs, VkFormat fmt) {
         if (crp) pi.pNext = ri.pNext, pi.renderPass = crp;
     }
     VkPipeline p;
+    uint64_t fp = vk_fp_host("a pipeline");  // (FPCR 0 around the compile: vk_fpenv.h)
     VK_CHECK(vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &p));
+    vk_fp_put(fp);
     for (int i = 0; i < 16; i++) if (!cache[i].p) { cache[i].fs = fs; cache[i].f = fmt; cache[i].p = p; break; }
     return p;
 }

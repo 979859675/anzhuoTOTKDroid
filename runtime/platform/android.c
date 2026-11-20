@@ -297,6 +297,9 @@ static bool wt_reopen_all(void) {
     return true;
 }
 
+// (counted for the log: plat_written_pages says them every 10 s - faults taken, pages made read-only, by region)
+static uint64_t wt_n_faults, wt_n_faults_alias, wt_n_protected, wt_n_protected_alias;
+#define WT_HEAP_LO HEAP_BASE  // (below it: the physical memory region, tracked since 0.3.1 - exec.c VC_BASE)
 static bool wt_fault(uint64_t a) {
     if (!wt_state || a < wt_lo || a >= wt_hi) return false;
     uint64_t p = (a - wt_lo) >> 12, np = (wt_hi - wt_lo) >> 12;
@@ -306,6 +309,8 @@ static bool wt_fault(uint64_t a) {
     else if (wt_odd_addr == a && ++wt_odd_repeats > 8) { wt_unlock(); return false; }  // (a real fault)
     else if (wt_odd_addr != a) wt_odd_addr = a, wt_odd_repeats = 0;
     if (wt_state[p] != 1) wt_odd++;
+    wt_n_faults++;
+    if (a < WT_HEAP_LO) wt_n_faults_alias++;
     // (2: another thread's fault on it got there first - writable already. The next page too: a store across the
     // boundary may report its first byte, in the page before the protected one)
     // (the next page only while still read-only: a real fault on this one must not retry forever)
@@ -437,6 +442,8 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
         if (!wt_broken) {
             // (state first, then the protection: a write in between lands before the caller copies the page)
             for (uint64_t k = p; k < q; k++) wt_state[k] = 1;
+            wt_n_protected += q - p;
+            if (wt_lo + (p << 12) < WT_HEAP_LO) wt_n_protected_alias += q - p;
             if (mprotect((void *)(uintptr_t)(wt_lo + (p << 12)), (q - p) << 12, PROT_READ)) {
                 if (errno == ENOMEM && wt_reopen_all()) { wt_unlock(); return -1; }  // (out of mappings: start over - all
                                                                                     // counts as written, wt_reopen_all)
@@ -449,6 +456,19 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
         p = q;
     }
     wt_unlock();
+    {   // (every 10 s: what the tracking cost)
+        static uint64_t next_ns, f0, fa0, p0, pa0, o0;
+        uint64_t now = plat_now_ns();
+        if (now >= next_ns) {
+            if (next_ns)
+                fprintf(stderr, "[android] page write tracking, last 10 s: %llu faults (%llu below the heap, %llu odd), "
+                        "%llu pages made read-only (%llu below the heap)\n", (unsigned long long)(wt_n_faults - f0),
+                        (unsigned long long)(wt_n_faults_alias - fa0), (unsigned long long)(wt_odd - o0),
+                        (unsigned long long)(wt_n_protected - p0), (unsigned long long)(wt_n_protected_alias - pa0));
+            next_ns = now + 10000000000ull;
+            f0 = wt_n_faults, fa0 = wt_n_faults_alias, p0 = wt_n_protected, pa0 = wt_n_protected_alias, o0 = wt_odd;
+        }
+    }
     return n > max ? max : n;
 }
 

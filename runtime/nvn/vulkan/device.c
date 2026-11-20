@@ -34,6 +34,34 @@ static const void *rt_memmem(const void *data, size_t size, const void *pattern,
     return NULL;
 }
 
+// ================================================================== the host's FPCR on Vulkan's side (vk_fpenv.h)
+#include "vk_fpenv.h"
+#if defined(__aarch64__)
+static inline uint64_t fp_get(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
+static inline void fp_set(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
+#else
+static inline uint64_t fp_get(void) { return 0; }
+static inline void fp_set(uint64_t v) { (void)v; }
+#endif
+bool vk_fp_guest_kept(void) {
+    static int kept = -1;
+    if (kept < 0) { const char *e = getenv("LARECOMP_VK_GUEST_FPCR"); kept = e && atoi(e) != 0; }
+    return kept;
+}
+uint64_t vk_fp_host(const char *where) {
+    uint64_t v = fp_get();
+    if (!v) return 0;
+    static atomic_int logged;
+    if (!atomic_exchange(&logged, 1))
+        LOG("[vk] %s: started with the game's FPCR 0x%llx, %s\n", where, (unsigned long long)v,
+            vk_fp_guest_kept() ? "kept (LARECOMP_VK_GUEST_FPCR)" : "the host's (0) set");
+    if (vk_fp_guest_kept()) return 0;
+    fp_set(0);
+    return v;
+}
+void vk_fp_put(uint64_t v) { if (v) fp_set(v); }
+void vk_fp_thread(const char *name) { (void)vk_fp_host(name); }
+
 // ================================================================== instance / device
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
                                                const VkDebugUtilsMessengerCallbackDataEXT *d, void *user) {
@@ -890,7 +918,9 @@ static void create_device(void) {
                                   .queueCount = 1, .pQueuePriorities = &prio};
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
+    uint64_t fpcr = vk_fp_host("vkCreateDevice");  // (the driver's threads made here inherit the FPCR: vk_fpenv.h)
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+    vk_fp_put(fpcr);
 #ifdef __ANDROID__
     volkLoadDevice(g_vk.dev);
     compat_aliases();
@@ -1914,7 +1944,11 @@ bool vk_adreno_7xx_8xx(const char *name) {
     int n = atoi(a);
     return n >= 700 && n < 900;
 }
-bool vk_inplace_reads_on(int setting) { return setting < 0 ? vk_adreno_7xx_8xx(g_vk.props.deviceName) : setting != 0; }
+// Mali too since 2026-11-20: in TOTK's shrines a draw reads the target it draws on ~4,000 times a frame, and the copies took a
+// Mali-G720 (Dimensity 9300+) to 3 fps; read in place (LARECOMP_FEEDBACK_INPLACE=1 through Driver variables, #73) the
+// copies went from 13,000 to 57 every 2 s (p90) and the slowest windows from 3 to 10.6 fps, with nothing reported wrong
+// (#65 #73 #27). In place is a feedback loop Vulkan leaves undefined: checked on Turnip frame by frame, on Mali by players.
+bool vk_inplace_auto(void) { return vk_adreno_7xx_8xx(g_vk.props.deviceName) || g_vk.props.vendorID == 0x13B5; }
 int vk_between_fps(void) {
     static int fps = 45;
     static uint64_t next;

@@ -13,6 +13,7 @@
 #if defined(__ANDROID__)
 #include "lsfg_host.h"  // (TOTKDroid: in place of Swap2-Native's vka.h)
 #include "lsfg.h"
+#include "../vk_fpenv.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -128,10 +129,12 @@ static void pass_new(lsfg_chain *c, lpass *p, const lsfg_modules *mods, uint32_t
     const lsfg_module *m = lsfg_module_get(mods, id);
     VkShaderModule sm = VK_NULL_HANDLE;
     VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = m ? m->nwords * 4u : 0, .pCode = m ? m->words : NULL};
+    uint64_t fp = vk_fp_host("lsfg");  // (FPCR 0 around the compiles: ../vk_fpenv.h)
     if (!r) r = m ? vk.vkCreateShaderModule(V.dev, &mi, NULL, &sm) : VK_ERROR_INITIALIZATION_FAILED;
     VkComputePipelineCreateInfo pi = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
         .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sm, .pName = "main"}, .layout = p->pl};
     if (!r) r = vk.vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &pi, NULL, &p->pipe);
+    vk_fp_put(fp);
     if (sm) vk.vkDestroyShaderModule(V.dev, sm, NULL);
     if (r) { VRED("lsfg: pipeline of shader %u: %d", id, r); c->bad = 1; }
 }

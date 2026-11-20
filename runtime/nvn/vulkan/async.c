@@ -25,6 +25,7 @@
 #include "../../platform.h"
 #include "../../rt.h"
 #include "../../kernel.h"
+#include "vk_fpenv.h"
 
 enum { REQ_EXEC, REQ_PRESENT, REQ_FENCE, REQ_TEXREG };
 typedef struct { int type; uint64_t a; void *p; uint64_t id; } Req;
@@ -79,6 +80,7 @@ static uint64_t render_cpu_ns(void) {
 
 static void *render_main(void *arg) {
     (void)arg;
+    vk_fp_thread("vk-render");  // (made from a game thread: its FPCR - vk_fpenv.h)
     extern void plat_thread_unpin(void);
     plat_thread_unpin();
 #ifdef __ANDROID__

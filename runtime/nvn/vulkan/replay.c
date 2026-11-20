@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "replay.h"
+#include "vk_fpenv.h"
 #include "../../platform.h"
 #include "../../rt.h"
 
@@ -206,6 +207,7 @@ static _Atomic int rp_tid;
 int vk_rp_tid(void) { return atomic_load_explicit(&rp_tid, memory_order_relaxed); }
 static void *rp_main(void *arg) {
     (void)arg;
+    vk_fp_thread("vk-replay");  // (made from a game thread: its FPCR - vk_fpenv.h)
     on_replay_thread = true;
     // as the render thread: its priority, and (exec.c) in the ADPF session - else the governor kept its core's clock low
     // and the render thread waited for it (~200 words queued, ~180 us a wait)
