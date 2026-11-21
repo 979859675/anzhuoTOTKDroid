@@ -606,6 +606,12 @@ static void tab_display(void) {
                            "either way). 30 fps: steady and cooler - the phone heats less. 60 fps: always aims for 60."
                          : "Auto: the game's own pacing, as on the Switch. 30 fps: never more than 30 frames a "
                            "second.");
+        // (the game's own 60 / 30 pick, where it decides - Auto, 60, 40 / 45: native.c fix_hyst_*, totk-android's)
+        if (sixty && g_settings.fps_mode != 1 && g_settings.fps_mode != 3)
+            opt_toggle("Hold 60 fps through short dips", &g_settings.fps60_hysteresis, false,
+                       "The game drops from 60 to 30 fps after 3 late frames in a row. On: only after 7 in a row, and it "
+                       "tries 60 again sooner, so short dips stay at 60. It measured worse on some devices: try it and keep "
+                       "it if the game feels smoother.");
     }
 #endif
 
@@ -752,6 +758,24 @@ static void tab_display(void) {
                        "How far the camera draws; the game's goes to 25 km. Shorter can cut the farthest scenery from view. "
                        "The world, its objects and their behavior are not changed, only what is drawn.", false))
             g_settings.far_clip = dist_m[di];
+        // The shadow passes the drawing thread records (native.c fix_shadow_cascades / fix_point_shadows): off by default, no
+        // measurement of their cost in looks or in frames yet (totk-android's patches)
+        static const char *casc[] = {"Game", "3", "2", "1"};
+        static const int casc_n[] = {0, 3, 2, 1};
+        int ci = g_settings.shadow_cascades == 3 ? 1 : g_settings.shadow_cascades == 2 ? 2 : g_settings.shadow_cascades == 1 ? 3 : 0;
+        if (opt_choice("Sun shadow cascades", &ci, casc, 4, 0,
+                       "The sun's shadow is drawn in 4 cascades, each a ring of the world around you at its own sharpness. Fewer "
+                       "cascades are fewer shadow draws for the CPU, but the shadow reaches less far and the farther ground "
+                       "goes unshadowed. It can help where the CPU is the limit.", false))
+            g_settings.shadow_cascades = casc_n[ci];
+        static const char *pts[] = {"Game", "4", "2", "1"};
+        static const int pts_n[] = {0, 4, 2, 1};
+        int pi = g_settings.point_shadows == 4 ? 1 : g_settings.point_shadows == 2 ? 2 : g_settings.point_shadows == 1 ? 3 : 0;
+        if (opt_choice("Point light shadows", &pi, pts, 4, 0,
+                       "How many torches, lamps and fires at once cast a shadow; the game's own number is the limit, this only "
+                       "lowers it. Fewer are fewer shadow draws for the CPU, and lights past the limit cast none. Applies the "
+                       "next time the game sets up its lights: restart TOTKDroid.", false))
+            g_settings.point_shadows = pts_n[pi];
     }
 #ifdef __ANDROID__
     opt_toggle("Sync lag", &g_settings.sync_lag, true,

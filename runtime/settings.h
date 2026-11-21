@@ -46,6 +46,8 @@ typedef struct {
     int shadow_res;       // the game's shadow map size: 0 its own, 288, 256 (native.c fix_shadow_size)
     bool game_fxaa;       // the game's own FXAA pass (native.c fix_game_fxaa)
     int far_clip;         // the render far plane capped at this many metres, 0: the game's (native.c fix_far_clamp)
+    int shadow_cascades;  // the sun's shadow cascades capped at 1..3, 0: the game's (4; native.c fix_shadow_cascades)
+    int point_shadows;    // the point light shadows' pool capped at this many (1..64), 0: the game's (native.c fix_point_shadows)
     int motion_source;    // whose: 0 automatic (a controller's once its gyroscope is alive), 1 the phone's, 2 a controller's
     bool motion_flat;     // the phone's sensors as the Switch's screen in handheld mode, not a flat controller (hle/motion.c)
 #ifdef __ANDROID__
@@ -55,6 +57,7 @@ typedef struct {
     int overlay_items;    // OVERLAY_* bits: what it shows (all by default)
     float overlay_pos[2]; // its top left, a share of the screen, dragged there with a finger (negative: the corner)
     int fps_mode;         // 0 Auto, 1 30 fps, 2 60 fps, 3 20 fps, 4 40/45 fps (display dependent)
+    bool fps60_hysteresis;  // the game's frame controller drops to 30 after 7 late frames, not 3 (native.c fix_hyst_*): off
     bool shader_int32;    // shader address math in 32-bit words even where the driver offers 64-bit (vulkan/exec.c)
     bool files_in_place;  // Android: a setup reads the picked romfs/ where it is, no copy (services/fs.c); off by default
     bool native_code;     // Android: the game's own code on the CPU, no build of it (runtime/native.c); off by default

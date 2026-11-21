@@ -24,6 +24,7 @@
 #include "vk_fpenv.h"
 #include "buffer_copy.h"
 #include "timing_trace.h"
+#include "object_cache.h"
 #include "replay.h"
 #include "../renderer.h"
 #include "../../settings.h"
@@ -62,7 +63,9 @@ uint64_t prof_up_cum;  // (the same, never reset)
 #define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
 static _Atomic int stat_compiles;
 static _Atomic int live_programs, live_gpipes, live_cpipes;  // (made so far: the memory mappings log, vk_live_counts)
-static void pipe_evict(void);
+static void pipe_evict(void);  // (graphics pipelines: below)
+static void prog_evict(void);  // (their programs: below)
+static uint32_t g_exec_s;  // seconds, updated at each submission (Prog.used_s, Pipe.used_s: no clock read per draw; from BOTWRecomp fd7ec98)
 static uint64_t op_counts[CMD_COUNT];
 bool g_debug_frame;
 static char stats_text[2048];
@@ -1179,7 +1182,9 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     uint64_t ta = drvt_t0();
     ring_retire();
     vk_collect_dead();
+    g_exec_s = (uint32_t)(SDL_GetTicksNS() / 1000000000ull);  // (Prog.used_s, Pipe.used_s)
     pipe_evict();
+    prog_evict();
     drvt_add(DT_AFTER, ta);
     if (drvt_on > 0) {
         static uint64_t at;
@@ -1573,18 +1578,118 @@ static Job *jobs_head, *jobs_tail;
 static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
+// Admission gate: how many compiles run at once (from Swap2-Native's vka_psogate.h / vka_pso.c gate_slots). A compile
+// takes the driver hundreds of MB and, on Turnip, thousands of memory mappings (Swap2: three long ones took 58,619 of
+// the 65,530 vm.max_map_count and a fourth lost the device), so with the workers all busy a phone low on memory, or
+// near the mappings limit, could die in a burst of builds. The workers still number min(cores / 2, 4) (or
+// LARECOMP_SHADER_WORKERS, which also switches the gate off, as does LARECOMP_COMPILE_GATE=0); the gate lets fewer
+// of them run at once: 1 under 600 MB MemAvailable or from 75% of the mappings limit, 2 under 1.2 GB or from 60%.
+// It is read at most every 250 ms by the worker that finds it stale, outside the lock (/proc/self/maps takes
+// milliseconds). No driver is held to one beyond that: Swap2 serialises Turnip, but TOTK has no mappings history
+// saying so, and the headroom clause already does it when the count climbs. A build the render thread waits for
+// (wait_built: g_urgent) always starts - the gate never stands between a draw and its shader.
+static int g_gate_workers = 1;     // (the worker count; the gate off when 1)
+static bool g_gate_off = true;     // (set before the workers start)
+static int g_gate_active;          // (jobs running; jobs_lock)
+static _Atomic int g_gate_slots = 1 << 20;  // (compiles allowed at once)
+static _Atomic uint64_t g_gate_t;  // (when the limits were last read)
+static _Atomic int g_urgent;       // (waited-on builds: wait_built)
+
+#ifdef __ANDROID__
+static uint64_t gate_mem_avail_mb(void) {
+    char b[2048];
+    FILE *f = fopen("/proc/meminfo", "re");
+    if (!f) return 0;
+    size_t n = fread(b, 1, sizeof b - 1, f);
+    fclose(f);
+    b[n] = 0;
+    const char *p = strstr(b, "MemAvailable:");
+    return p ? (uint64_t)(atoll(p + 13) / 1024) : 0;
+}
+
+// (the lines of /proc/self/maps, counted in a stack buffer; vm.max_map_count read once)
+static long gate_maps(long *max) {
+    static long mx;
+    if (!mx) {
+        char b[32] = {0};
+        FILE *f = fopen("/proc/sys/vm/max_map_count", "re");
+        if (f) { if (fread(b, 1, sizeof b - 1, f) == 0) b[0] = 0; fclose(f); }
+        mx = atol(b) > 0 ? atol(b) : 65530;  // (the kernel's default when it can't be read)
+    }
+    *max = mx;
+    // (every 2 s, not every refresh: reading tens of thousands of lines holds the process's mmap lock, which the page
+    // write tracking's mprotects and every page fault also need)
+    static uint64_t t_last;
+    static long last_n = -1;
+    uint64_t now = SDL_GetTicksNS();
+    if (last_n >= 0 && now - t_last < 2000000000ull) return last_n;
+    t_last = now;
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (!f) return -1;
+    char b[16384];
+    size_t k;
+    long n = 0;
+    while ((k = fread(b, 1, sizeof b, f)) > 0)
+        for (size_t i = 0; i < k; i++) n += b[i] == '\n';
+    fclose(f);
+    return last_n = n;
+}
+
+static void gate_refresh(void) {
+    uint64_t now = SDL_GetTicksNS(), last = atomic_load(&g_gate_t);
+    if (last && now - last < 250000000ull) return;
+    if (!atomic_compare_exchange_strong(&g_gate_t, &last, now ? now : 1)) return;  // (another worker is reading them)
+    long mx = 0, maps = gate_maps(&mx);
+    uint64_t av = gate_mem_avail_mb();
+    int n = g_gate_workers;
+    if (av) n = av < 600 ? 1 : av < 1200 && n > 2 ? 2 : n;
+    if (mx > 0 && maps >= 0) {
+        if (maps * 100 >= mx * 75) n = 1;
+        else if (maps * 100 >= mx * 60 && n > 2) n = 2;
+    }
+    if (n < 1) n = 1;
+    int was = atomic_exchange(&g_gate_slots, n);
+    static int logged;  // (only this thread, one at a time: the exchange above)
+    if (n != was && (n < g_gate_workers || logged) && logged++ < 12)
+        LOG("[vk] compiles: %d at a time (MemAvailable %llu MB, maps %ld/%ld)\n", n, (unsigned long long)av, maps, mx);
+}
+#else
+static void gate_refresh(void) {}
+#endif
+
 static void *worker(void *a) {
     (void)a;
     vk_fp_thread("vk-compile");  // (made from a game thread: its FPCR - vk_fpenv.h)
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
+        if (!g_gate_off) {
+            pthread_mutex_unlock(&jobs_lock);
+            gate_refresh();  // (rate-limited; the /proc reads outside the lock)
+            pthread_mutex_lock(&jobs_lock);
+            if (!jobs_head) { pthread_mutex_unlock(&jobs_lock); continue; }  // (another worker took it)
+            if (!atomic_load(&g_urgent) && g_gate_active >= atomic_load(&g_gate_slots)) {
+                // (timed: memory freed elsewhere raises the slots without a job finishing)
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 100000000;
+                if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+                pthread_cond_timedwait(&jobs_cond, &jobs_lock, &ts);
+                pthread_mutex_unlock(&jobs_lock);
+                continue;
+            }
+        }
         Job *j = jobs_head;
         jobs_head = j->next;
         if (!jobs_head) jobs_tail = NULL;
+        g_gate_active++;
         pthread_mutex_unlock(&jobs_lock);
         j->fn(j->arg);
         free(j);
+        pthread_mutex_lock(&jobs_lock);
+        g_gate_active--;
+        if (!g_gate_off) pthread_cond_broadcast(&jobs_cond);  // (gated workers: a slot is free)
+        pthread_mutex_unlock(&jobs_lock);
     }
     return NULL;
 }
@@ -1646,6 +1751,11 @@ static void run_job(void (*fn)(void *), void *arg) {
         if (workers) n = atoi(workers);
         if (n < 1) n = 1;
         if (n > 16) n = 16;
+        g_gate_workers = n;
+#ifdef __ANDROID__
+        const char *gate = getenv("LARECOMP_COMPILE_GATE");  // (=0: off; an explicit worker count wins too)
+        g_gate_off = n < 2 || workers || (gate && atoi(gate) == 0);
+#endif
         for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, NULL); }
     }
     Job *j = malloc(sizeof *j);
@@ -1665,7 +1775,12 @@ static uint64_t stat_build_wait_ns;
 static void wait_built(_Atomic int *state) {
     if (atomic_load(state)) return;
     uint64_t t0 = plat_now_ns();
+    atomic_fetch_add(&g_urgent, 1);  // (the compile gate lets every build start meanwhile)
+    pthread_mutex_lock(&jobs_lock);
+    pthread_cond_broadcast(&jobs_cond);
+    pthread_mutex_unlock(&jobs_lock);
     while (!atomic_load(state)) usleep(200);
+    atomic_fetch_sub(&g_urgent, 1);
     stat_build_wait_ns += plat_now_ns() - t0;
 }
 static bool rt_is_persistent(NvnTexture *t) {
@@ -3036,6 +3151,9 @@ typedef struct {
                            // render thread on the POCO F7 Ultra: draw_writes)
     uint8_t fs_gather;  // (up_fix) the fragment stage's first gathered texture: 0 not looked yet, 1 none, 2 + its slot
     _Atomic int state;  // 0 building, 1 ready, 2 failed
+    uint8_t evict;      // (prog_evict, vk_exec_reset) 1: to be freed, 2: kept - a pipeline of its still building
+    uint32_t used_s;    // when a draw last used it (g_exec_s), and that submission (prog_evict)
+    uint64_t used_seq;
 } Prog;
 
 static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, VkShaderStageFlags s1) {
@@ -3259,8 +3377,14 @@ static void translate_program(void *arg) {
     run_job(compile_program, p);
 }
 
-#define PROG_TAB 4096
-static struct { uint64_t key; Prog *prog; } prog_tab[PROG_TAB];
+// Growable (object_cache.h, from BOTWRecomp 848e08c): the fixed 4096-entry table's probe never ended once full.
+static VkObjectCache prog_cache;
+static Prog *last_prog;  // (get_program's: the previous draw's - file scope, cleared when programs are freed)
+
+static Prog *prog_used(Prog *p) {
+    p->used_s = g_exec_s, p->used_seq = vk_pending_seq();  // (prog_evict)
+    return p;
+}
 
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
@@ -3269,10 +3393,9 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     static NvnProgram *last_np;
     static uint64_t last_code[2];
     static ShaderKey last_vkey, last_fkey;
-    static Prog *last_prog;
     if (last_prog && np == last_np && last_code[0] == np->stages[0].code_addr && last_code[1] == np->stages[1].code_addr &&
         !memcmp(vkey, &last_vkey, sizeof *vkey) && !memcmp(fkey, &last_fkey, sizeof *fkey))
-        return last_prog;
+        return prog_used(last_prog);
     last_np = np, last_code[0] = np->stages[0].code_addr, last_code[1] = np->stages[1].code_addr;
     last_vkey = *vkey, last_fkey = *fkey;
     uint64_t h = 0xcbf29ce484222325ull;
@@ -3283,13 +3406,11 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (fkey->no_ds_write) { h ^= 0xE1; h *= 0x100000001B3ull; }  // (keys without it hash as before)
 #endif
     if (!h) h = 1;
-    uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
-    while (prog_tab[slot].key && prog_tab[slot].key != h) slot = (slot + 1) & (PROG_TAB - 1);
-    if (prog_tab[slot].key) return last_prog = prog_tab[slot].prog;
+    VkObjectEntry *entry = vk_object_slot(&prog_cache, h);
+    if (entry->object) return prog_used(last_prog = entry->object);
     Prog *p = calloc(1, sizeof *p);
-    last_prog = p;
-    prog_tab[slot].key = h;
-    prog_tab[slot].prog = p;
+    last_prog = prog_used(p);
+    entry->object = p;
     for (int i = 0; i < 2; i++) {
         p->code[i] = np->stages[i].code_addr;
         p->cmax[i] = np->stages[i].const_offset ? np->stages[i].const_offset : 0x10000;
@@ -3541,11 +3662,11 @@ typedef struct {
     uint64_t hash;
     VkPipeline pipe;
     _Atomic int state;   // 0 building, 1 ready, 2 failed
-    uint64_t used, seq;  // when it was last bound (ns), and that submission (pipe_evict)
+    uint32_t used_s;     // when it was last bound (g_exec_s: no clock read per draw, BOTWRecomp fd7ec98)
+    uint64_t seq;        // and that submission (pipe_evict)
     bool evicted;        // its VkPipeline destroyed by pipe_evict: built again at its next use
 } Pipe;
-#define PIPE_TAB 8192
-static struct { uint64_t key; Pipe *pipe; } pipe_tab[PIPE_TAB];
+static VkObjectCache pipe_cache;  // (growable, BOTWRecomp 848e08c: the fixed 8192-entry table's probe never ended once full)
 static Pipe *last_pipeline;  // (draw_'s: the previous draw's, reused when nothing changed)
 
 // Pipelines kept: on a Mali (and on low RAM) at most this many, the ones unused longest destroyed. Its driver keeps
@@ -3567,27 +3688,26 @@ static int pipe_keep(void) {
 }
 
 static void pipe_evict(void) {
-    static uint64_t next;
-    uint64_t now = SDL_GetTicksNS();
+    static uint32_t next;
     int keep = pipe_keep();
-    if (keep <= 0 || now < next) return;
-    next = now + 10000000000ull;  // (every 10 s)
+    if (keep <= 0 || g_exec_s < next) return;
+    next = g_exec_s + 10;  // (every 10 s)
     int live = 0;
-    for (int i = 0; i < PIPE_TAB; i++) {
-        Pipe *p = pipe_tab[i].pipe;
+    for (size_t i = 0; i < pipe_cache.capacity; i++) {
+        Pipe *p = pipe_cache.entries[i].object;
         if (p && !p->evicted && atomic_load(&p->state) == 1) live++;
     }
     if (live <= keep) return;
     uint64_t done = vk_completed_seq();
     int target = keep * 4 / 5, gone = 0;
     // oldest first: two passes, the unused for 2 minutes, then for 30 s
-    static const uint64_t ages[2] = {120000000000ull, 30000000000ull};
+    static const uint32_t ages[2] = {120, 30};  // (s)
     for (int pass = 0; pass < 2 && live > target; pass++) {
-        uint64_t age = ages[pass];
-        for (int i = 0; i < PIPE_TAB && live > target; i++) {
-            Pipe *p = pipe_tab[i].pipe;
+        uint32_t age = ages[pass];
+        for (size_t i = 0; i < pipe_cache.capacity && live > target; i++) {
+            Pipe *p = pipe_cache.entries[i].object;
             if (!p || p->evicted || p == last_pipeline || atomic_load(&p->state) != 1) continue;
-            if (p->used + age > now || p->seq > done) continue;
+            if (g_exec_s - p->used_s < age || p->seq > done) continue;
             vkDestroyPipeline(g_vk.dev, p->pipe, NULL);
             p->pipe = VK_NULL_HANDLE;
             atomic_store(&p->state, 0);
@@ -3598,6 +3718,107 @@ static void pipe_evict(void) {
     }
     static int nlog;
     if (gone && nlog++ < 20) LOG("[vk] pipelines: %d unused ones destroyed, %d kept\n", gone, live);
+}
+
+// ---- freeing programs and their pipelines (render thread; nothing building with them, the GPU done with them).
+// From BOTWRecomp 0780cb6. No drain of the worker queues is needed: a program whose state is 0 (translating or
+// compiling) or that has a pipeline still building is never freed here - those jobs hold the object - it stays
+// allocated (vk_exec_reset) or is tried again at the next check (prog_evict). A job's last act is its state store.
+static void pipe_free(Pipe *pp) {
+    if (pp == last_pipeline) last_pipeline = NULL;
+    if (pp->pipe) {
+        vkDestroyPipeline(g_vk.dev, pp->pipe, NULL);
+        if (!pp->evicted && atomic_load(&pp->state) == 1) atomic_fetch_sub(&live_gpipes, 1);
+    }
+    free(pp);
+}
+
+// (a graphics program; compute ones: cs_free)
+static void prog_free(Prog *p) {
+    if (p == last_prog) last_prog = NULL;
+    if (p->vs) vkDestroyShaderModule(g_vk.dev, p->vs, NULL);
+    if (p->fs) vkDestroyShaderModule(g_vk.dev, p->fs, NULL);
+    if (p->layout) {
+        vkDestroyPipelineLayout(g_vk.dev, p->layout, NULL);
+        atomic_fetch_sub(&live_programs, 1);  // (counted where compile_program made it)
+    }
+    for (int i = 0; i < 2; i++)
+        if (p->set_layout[i]) vkDestroyDescriptorSetLayout(g_vk.dev, p->set_layout[i], NULL);
+    maxwell_free(p->vi);
+    maxwell_free(p->fi);
+    free(p);
+}
+
+// Drops the entries whose object gone() says goes (the index rebuilt: lookups only on the render thread)
+static void cache_drop(VkObjectCache *c, bool (*gone)(void *)) {
+    VkObjectCache n = {0};
+    for (size_t i = 0; i < c->capacity; i++) {
+        VkObjectEntry e = c->entries[i];
+        if (!e.key || (e.object && gone(e.object))) continue;
+        vk_object_slot(&n, e.key)->object = e.object;
+    }
+    free(c->entries);
+    *c = n;
+}
+static bool pipe_gone(void *o) { Pipe *pp = o; if (pp->k.prog->evict != 1) return false; pipe_free(pp); return true; }
+static bool prog_gone(void *o) { Prog *p = o; if (p->evict != 1) return false; prog_free(p); return true; }
+
+// Programs kept: like the pipelines (pipe_keep), on a Mali and on low RAM the ones unused for minutes are freed once
+// more than this many are alive - their shader modules, layouts, translation and every pipeline made from them - and
+// built again at their next use (its draws skipped meanwhile, as for a new one). They were never freed: 1513 after
+// 30 minutes when a Mali-G720 closed at Android's memory mappings limit (BOTW #450). Checked with the pipelines,
+// every 10 s. LARECOMP_PROG_KEEP=<n> (0: never), LARECOMP_PROG_AGE=<s> (a test).
+static int prog_keep(void) {
+    static int keep = -1;
+    if (keep < 0) {
+        const char *e = getenv("LARECOMP_PROG_KEEP");
+        keep = e ? atoi(e) : pipe_keep() > 0 ? 1000 : 0;
+        if (keep > 0) LOG("[vk] programs kept: at most %d (the ones unused for minutes freed)\n", keep);
+    }
+    return keep;
+}
+
+static void prog_evict(void) {
+    static uint32_t next;
+    int keep = prog_keep(), live = atomic_load(&live_programs);
+    if (keep <= 0 || g_exec_s < next || live <= keep) return;
+    next = g_exec_s + 10;  // (every 10 s)
+    uint64_t done = vk_completed_seq();
+    int target = keep * 4 / 5, freed = 0, fpipes = 0;
+    static uint32_t ages[2];  // (s: oldest first, the unused for 10 minutes, then for 3 - LARECOMP_PROG_AGE=<s>: the
+                              // second, a test of freeing and building again)
+    if (!ages[0]) {
+        const char *e = getenv("LARECOMP_PROG_AGE");
+        ages[1] = e && atoi(e) > 0 ? (uint32_t)atoi(e) : 180;
+        ages[0] = ages[1] > 600 ? ages[1] : 600;
+        if (e) ages[0] = ages[1];
+    }
+    for (int pass = 0; pass < 2 && live > target; pass++) {
+        int want = live - target, marked = 0;
+        for (size_t i = 0; i < prog_cache.capacity; i++) {
+            Prog *p = prog_cache.entries[i].object;
+            if (!p) continue;
+            p->evict = atomic_load(&p->state) == 1 && p != last_prog && g_exec_s - p->used_s >= ages[pass] && p->used_seq <= done;
+        }
+        // (a pipeline of its still building, or still in the GPU's hands, keeps it)
+        for (size_t i = 0; i < pipe_cache.capacity; i++) {
+            Pipe *pp = pipe_cache.entries[i].object;
+            if (!pp || !pp->k.prog->evict) continue;
+            if ((atomic_load(&pp->state) == 0 && !pp->evicted) || pp->seq > done) pp->k.prog->evict = 0;
+        }
+        for (size_t i = 0; i < prog_cache.capacity; i++) {  // (no more than needed)
+            Prog *p = prog_cache.entries[i].object;
+            if (p && p->evict) { if (marked < want) marked++; else p->evict = 0; }
+        }
+        if (!marked) continue;
+        size_t np = pipe_cache.count;
+        cache_drop(&pipe_cache, pipe_gone);
+        fpipes += (int)(np - pipe_cache.count);
+        cache_drop(&prog_cache, prog_gone);
+        freed += marked, live -= marked;
+    }
+    static int nlog;
+    if (freed && nlog++ < 20) LOG("[vk] programs: %d unused ones freed with %d pipeline keys, %d kept\n", freed, fpipes, live);
 }
 
 // 8 bytes a step (PipeKey is ~700 bytes, hashed per draw); in-memory tables only - hmix values are compared with
@@ -6568,19 +6789,47 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     return true;
 }
 
-static int g_cs_n;  // (compute program table below)
+static VkObjectCache compute_cache;  // (compute programs below)
+
+static int compute_reset(void);  // (below compute_program)
 
 // In-place reboot (device.c backend_reset; GPU idle): drop what is keyed by guest addresses - programs by code
-// address (the old Prog / Pipe objects are leaked, so pipeline keys holding their pointers can't collide), compute
-// programs, shared copies - and the heap import: its pages are replaced (re-imported on first use).
+// address, their pipelines, compute programs, shared copies - and the heap import: its pages are replaced
+// (re-imported on first use). The programs and pipelines are freed (from BOTWRecomp 0780cb6): only their index was,
+// and each reboot leaked them all. Those still building stay allocated (their jobs hold them), out of the index, so
+// pipeline keys holding their pointers can't collide with new ones - no wait for the worker queues is needed.
 void vk_exec_reset(void) {
 #ifdef __ANDROID__
     vk_vamm_reset();
 #endif
-    memset(prog_tab, 0, sizeof prog_tab);
-    memset(pipe_tab, 0, sizeof pipe_tab);
-    last_pipeline = NULL;
-    g_cs_n = 0;
+    {
+        int np = 0, ng = 0, kept = 0;
+        for (size_t i = 0; i < prog_cache.capacity; i++) {
+            Prog *p = prog_cache.entries[i].object;
+            if (p) p->evict = atomic_load(&p->state) != 0;
+        }
+        for (size_t i = 0; i < pipe_cache.capacity; i++) {
+            Pipe *pp = pipe_cache.entries[i].object;
+            if (!pp) continue;
+            if (atomic_load(&pp->state) == 0 && !pp->evicted) { pp->k.prog->evict = 2; kept++; continue; }  // (building)
+            pipe_free(pp);
+            ng++;
+        }
+        for (size_t i = 0; i < prog_cache.capacity; i++) {
+            Prog *p = prog_cache.entries[i].object;
+            if (!p) continue;
+            if (p->evict == 1) { prog_free(p); np++; }
+            else kept++;
+        }
+        last_prog = NULL, last_pipeline = NULL;
+        ss_forget();  // (its cached pipeline / layout handles may name freed ones)
+        free(prog_cache.entries);
+        prog_cache = (VkObjectCache){0};
+        free(pipe_cache.entries);
+        pipe_cache = (VkObjectCache){0};
+        int nc = compute_reset();
+        LOG("[vk] reboot: %d programs, %d pipelines and %d compute programs freed (%d still building kept)\n", np, ng, nc, kept);
+    }
     gcopy_gen++;
     if (gmem_buf) {
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
@@ -6913,6 +7162,11 @@ static void build_compute(void *arg) {
     if (!spv) { atomic_store(&cp->p.state, 2); return; }
     cp->p.nbinds = vk_reflect(spv, n, cp->p.binds, MAX_BIND);
     VkShaderModule m = vk_module(spv, n);
+    if (!m) {
+        free(spv);
+        atomic_store(&cp->p.state, 2);
+        return;
+    }
     cp->p.layout = make_layout(&cp->p, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0);
     VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
     VkSpecializationInfo spec = {3, me, 12, cp->local};
@@ -6926,7 +7180,6 @@ static void build_compute(void *arg) {
     vk_fp_put(fp);
     atomic_fetch_add(&stat_compiles, 1);
     if (r == VK_SUCCESS) atomic_fetch_add(&live_cpipes, 1);
-    atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
     if (r != VK_SUCCESS || getenv("LARECOMP_LOG_CS_PIPELINES"))
         LOG("[compute] pipeline %llx: result %d, local %ux%ux%u, %zu SPIR-V words, %d bindings\n",
             (unsigned long long)cp->code_addr, r, cp->local[0], cp->local[1], cp->local[2], n, cp->p.nbinds);
@@ -6938,19 +7191,30 @@ static void build_compute(void *arg) {
     }
     vkDestroyShaderModule(g_vk.dev, m, NULL);
     free(spv);
+    atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);  // (last: from here vk_exec_reset may free it; BOTWRecomp 0780cb6)
 }
 
-static struct CsEnt { uint64_t addr; CsProg *cp; } g_cs_tab[256];  // compute programs by code address
+static void cs_free(CsProg *cp) {
+    if (cp->pipe) {
+        vkDestroyPipeline(g_vk.dev, cp->pipe, NULL);
+        if (atomic_load(&cp->p.state) == 1) atomic_fetch_sub(&live_cpipes, 1);
+    }
+    if (cp->p.layout) vkDestroyPipelineLayout(g_vk.dev, cp->p.layout, NULL);
+    if (cp->p.set_layout[0]) vkDestroyDescriptorSetLayout(g_vk.dev, cp->p.set_layout[0], NULL);
+    maxwell_free(cp->si);  // (cp->p.vi: the same)
+    free(cp);
+}
 
+// Growable by code address (BOTWRecomp 848e08c): the fixed 256 entries made every dispatch past them translate and
+// compile its program again, and leak it.
 static CsProg *compute_program(NvnProgram *np) {
     NvnShaderStage *ss = &np->stages[5];
     if (!ss->code_addr) return NULL;
-    struct CsEnt *tab = g_cs_tab;
-    int n = g_cs_n;
-    for (int i = 0; i < n; i++) if (tab[i].addr == ss->code_addr) return tab[i].cp;
+    VkObjectEntry *entry = vk_object_slot(&compute_cache, ss->code_addr);
+    if (entry->object) return entry->object;
     CsProg *cp = calloc(1, sizeof *cp);
     cp->code_addr = ss->code_addr;
-    if (n < 256) { tab[n].addr = ss->code_addr; tab[n].cp = cp; g_cs_n = n + 1; }
+    entry->object = cp;
     pthread_mutex_lock(&translate_lock);  // (the translator's globals too: the translator thread sets them for graphics)
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
@@ -6996,6 +7260,18 @@ static CsProg *compute_program(NvnProgram *np) {
     save_glsl(cp->si->msl, ss->code_addr, "cs");
     run_job(build_compute, cp);
     return cp;
+}
+
+// (vk_exec_reset) every compute program not still building freed, the index emptied
+static int compute_reset(void) {
+    int n = 0;
+    for (size_t i = 0; i < compute_cache.capacity; i++) {
+        CsProg *cp = compute_cache.entries[i].object;
+        if (cp && atomic_load(&cp->p.state) != 0) { cs_free(cp); n++; }
+    }
+    free(compute_cache.entries);
+    compute_cache = (VkObjectCache){0};
+    return n;
 }
 
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
@@ -7726,14 +8002,12 @@ static void draw_(CmdRec *r, bool indexed) {
         uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
         if (!ph) ph = 1;
 #endif
-        uint32_t pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
-        while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) pslot = (pslot + 1) & (PIPE_TAB - 1);
-        pp = pipe_tab[pslot].pipe;
+        VkObjectEntry *entry = vk_object_slot(&pipe_cache, ph);
+        pp = entry->object;
         if (!pp) {
             pp = calloc(1, sizeof *pp);
             pp->k = k;
-            pipe_tab[pslot].key = ph;
-            pipe_tab[pslot].pipe = pp;
+            entry->object = pp;
             run_job(build_pipeline, pp);
         } else if (pp->evicted) {  // (destroyed by pipe_evict: built again)
             pp->evicted = false;
@@ -7756,7 +8030,7 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     ss_enabled();
     if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; stat_pipe_binds++; rpCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
-    pp->used = SDL_GetTicksNS(), pp->seq = vk_pending_seq();  // (pipe_evict)
+    pp->used_s = g_exec_s, pp->seq = vk_pending_seq();  // (pipe_evict)
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_key += prof_td_ - prof_tk_;
 
@@ -9325,7 +9599,38 @@ static void exec_list(uint64_t handle, int depth) {
             const int32_t *rg = ct->region;
             if (rg[3] > 0 && rg[4] > 0) { st.scissor[0][0] = rg[0]; st.scissor[0][1] = rg[1]; st.scissor[0][2] = rg[3]; st.scissor[0][3] = rg[4]; }
             else { st.scissor[0][0] = st.scissor[0][1] = 0; st.scissor[0][2] = st.scissor[0][3] = 16384; }
-            clear(0, (int)r->x[6], ct->color, (uint32_t)r->x[4] ? (uint32_t)r->x[4] : 0xF, false, 0, false, 0, 0);
+            // The region's z offset and depth: layers [view's first + z, + depth) of an array texture, each its own
+            // pass with a one-layer view of it (from totk-android b028bc4: it cleared them too). Only arrays: a 3D
+            // texture's slices aren't reachable the same way through these views, so those clear the view's one
+            // layer as before. Logged once when it happens, to learn whether the game uses it.
+            const uint32_t cmask = (uint32_t)r->x[4] ? (uint32_t)r->x[4] : 0xF;
+            uint32_t nz = 1, z0 = 0, nlay = 0;
+            if (rg[2] != 0 || rg[5] > 1) {
+                TexBackend *tb = vk_tex(t, true);
+                bool arr = tb && tb->layers > 1 && tb->depth == 1;
+                static int logged;
+                if (!logged++)
+                    LOG("[vk] ClearTexture with z %d depth %d on a %s texture (%ux%ux%u layers %u)\n", rg[2], rg[5], arr ? "array" : "non-array",
+                        t->width, t->height, t->depth, tb ? tb->layers : 0);
+                if (arr) {
+                    nlay = tb->layers;
+                    nz = rg[5] > 1 ? (uint32_t)rg[5] : 1;
+                    z0 = rg[2] > 0 ? (uint32_t)rg[2] : 0;
+                    if (ct->has_view && (ct->view.setmask & 2)) z0 += ct->view.min_layer;
+                }
+            }
+            if (!nlay) clear(0, (int)r->x[6], ct->color, cmask, false, 0, false, 0, 0);
+            else
+                for (uint32_t i = 0; i < nz && z0 + i < nlay; i++) {
+                    NvnTextureView v = ct->has_view ? ct->view : (NvnTextureView){0};
+                    v.setmask |= 2;
+                    v.min_layer = (uint16_t)(z0 + i);
+                    st.rt.cview[0] = v;
+                    st.rt.has_cview[0] = 1;
+                    st.rt_dirty = true;
+                    clear(0, (int)r->x[6], ct->color, cmask, false, 0, false, 0, 0);
+                    vk_end_pass();
+                }
             vk_end_pass();
             st.rt = saved;
             memcpy(st.scissor[0], sc, sizeof sc);

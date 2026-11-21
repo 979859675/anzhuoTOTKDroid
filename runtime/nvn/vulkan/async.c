@@ -166,15 +166,26 @@ static void push_texregs(void) {
 }
 
 // Until the render thread has finished request `id` (0: nothing to wait for).
+// Both waits hand core 0 to the game's other threads while they wait (kernel_blocking_begin, as push's queue-full wait
+// does), only when there is something to wait for: a core-0 thread whose sleep ended waited behind the render thread's
+// whole backlog (from BOTWRecomp 1a6b7f5, #497: a 100 ms sleep 10 s long).
 void vk_async_wait_id(uint64_t id) {
     if (!id || !started || vk_async_is_render_thread()) return;
     pthread_mutex_lock(&q_lock);
     bool waits = q_done < id;
+    if (!waits) {
+        pthread_mutex_unlock(&q_lock);
+        return;
+    }
+    pthread_mutex_unlock(&q_lock);
     extern void vk_tl(const char *what, uint64_t a, uint64_t b);
-    if (waits) vk_tl("host: wait for request (id, guest thread)", id, kernel_current_thread() ? kernel_current_thread()->id : 0);
+    vk_tl("host: wait for request (id, guest thread)", id, kernel_current_thread() ? kernel_current_thread()->id : 0);
+    kernel_blocking_begin();
+    pthread_mutex_lock(&q_lock);
     while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
     pthread_mutex_unlock(&q_lock);
-    if (waits) vk_tl("host: wait for request end", id, 0);
+    kernel_blocking_end();
+    vk_tl("host: wait for request end", id, 0);
 }
 
 // Until every request queued so far has run (the render thread is idle after it).
@@ -186,6 +197,7 @@ void vk_async_drain(void) {
     pthread_mutex_lock(&q_lock);
     uint64_t id = q_tail;
     bool waits = q_done < id;
+    pthread_mutex_unlock(&q_lock);
     extern void vk_tl(const char *what, uint64_t a, uint64_t b);  // (LARECOMP_FRAME_TIMELINE: who waits, from where)
     if (waits) {
         Dl_info di = {0};
@@ -193,9 +205,12 @@ void vk_async_drain(void) {
         dladdr(ra, &di);  // (the caller as an offset in libmain.so, for llvm-symbolizer)
         vk_tl("host: drain wait (caller offset, guest thread)", (uint64_t)((uintptr_t)ra - (uintptr_t)di.dli_fbase),
               kernel_current_thread() ? kernel_current_thread()->id : 0);
+        kernel_blocking_begin();
     }
+    pthread_mutex_lock(&q_lock);
     while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
     pthread_mutex_unlock(&q_lock);
+    if (waits) kernel_blocking_end();
     // and the replay thread done with the draws' packets (replay.h): what runs next here may destroy what they bind
     extern void vk_rp_drain_at(void *ra);
     vk_rp_drain_at(__builtin_return_address(0));
@@ -227,7 +242,9 @@ static void mark_fences(uint64_t p, uint64_t id, int depth) {
 // submitted, so a game may record over them right after (BOTW does), while the render thread runs them later.
 // The list's fences are noted on the way (one walk instead of a second one, mark_fences, on the game's submitting
 // thread: ~0.15 ms a frame of TOTK's).
-typedef struct { uint8_t *b; size_t n, cap; uint64_t *f; size_t nf, capf; } Snap;
+// (deep: a call deeper than 8 was copied as a record, its lists' fences not noted - the copy is walked for them, as
+// mark_fences does; from BOTWRecomp b6c0499)
+typedef struct { uint8_t *b; size_t n, cap; uint64_t *f; size_t nf, capf; bool deep; } Snap;
 static void snap_add(Snap *s, uint64_t p, int depth) {
     for (int guard = 0; guard < 10000000; guard++) {
         const CmdRec *r = (const CmdRec *)(uintptr_t)p;
@@ -238,6 +255,7 @@ static void snap_add(Snap *s, uint64_t p, int depth) {
             const uint64_t *h = (const uint64_t *)r->extra;
             for (uint64_t i = 0; i < r->x[0]; i++) snap_add(s, h[i], depth + 1);
         } else {
+            if (r->op == CMD_CALL) s->deep = true;
             if (r->op == CMD_FENCE_SYNC && r->x[1]) {
                 if (s->nf == s->capf) {
                     s->capf = s->capf ? s->capf * 2 : 16;
@@ -260,7 +278,7 @@ static void snap_add(Snap *s, uint64_t p, int depth) {
 static uint8_t *snap_list(uint64_t handle, Snap *fences) {
     Snap s = {0};
     snap_add(&s, handle, 0);
-    fences->f = s.f, fences->nf = s.nf;
+    fences->f = s.f, fences->nf = s.nf, fences->deep = s.deep;
     s.b = realloc(s.b, s.n + sizeof(CmdRec));
     if (!s.b) FATAL("vk: out of memory for a command list copy\n");
     memset(s.b + s.n, 0, sizeof(CmdRec));  // CMD_END
@@ -270,14 +288,16 @@ static uint8_t *snap_list(uint64_t handle, Snap *fences) {
 
 void vk_async_execute(uint64_t handle) {
     Snap fences = {0};
-    uint8_t *copy = getenv("LARECOMP_NO_LIST_COPY") ? NULL : snap_list(handle, &fences);
+    static int no_copy = -1;  // (LARECOMP_NO_LIST_COPY, read once: this runs for every list)
+    if (no_copy < 0) no_copy = getenv("LARECOMP_NO_LIST_COPY") != NULL;
+    uint8_t *copy = no_copy ? NULL : snap_list(handle, &fences);
     if (copy) handle = (uint64_t)(uintptr_t)copy;
     pthread_mutex_lock(&p_lock);
     push_texregs();
     pthread_mutex_lock(&q_lock);
     uint64_t next = q_tail + 1;  // (the id the push gets: the list's fences carry it before the render thread sees them)
     pthread_mutex_unlock(&q_lock);
-    if (!copy) mark_fences(handle, next, 0);
+    if (!copy || fences.deep) mark_fences(handle, next, 0);  // (deep: the copy holds a call as a record, walk it)
     for (size_t i = 0; i < fences.nf; i++) {  // (as mark_fences)
         NvnSync *sy = HOST(NvnSync, fences.f[i]);
         if (!sy) { sy = calloc(1, sizeof *sy); SET_HOST(fences.f[i], sy); }

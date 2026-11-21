@@ -328,7 +328,8 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     // Only once the world has been on screen for a while (LAG_SETTLE frames, the pause menu and map counting): with the
     // lag on from the start, some ponds stayed white for the whole session, and turned on later in play they were right
     // (2026-10-28, POCO F7 Ultra; issue #43 on an Adreno 740) - the water's colour taken once, while loading, from a GPU
-    // result the lag made a frame old. So each load (the save, a fast travel) runs its first seconds without it.
+    // result the lag made a frame old. So each load (the save, a fast travel) runs its first 30 frames without it (300 until
+    // BOTWRecomp eefafaf: ~12 s at 17-20 fps after every load on a slower GPU, #465; its pond check holds with 30).
     // Away from the world for 15 s in a row before that, not at once: TOTK's menus can't be told from a load
     // (framepace_in_menu is BOTW 1.8.2's; the inventory, the map and a loading screen all leave the 3D scene undrawn),
     // so every menu counted as leaving the world and cost the next 300 frames their lag - after closing the inventory
@@ -337,7 +338,8 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     // (45 frames there: its menus are known). The first load of a session settles as before; a load shorter than that
     // keeps the lag. LARECOMP_LAG_AWAY_S=<s> (0: as before).
     if (lag > 0 && env_lag < 0) {
-        enum { LAG_SETTLE = 300 };
+        static int LAG_SETTLE = -1;  // (LARECOMP_LAG_SETTLE=<frames>; 300 until 0.3.5, from BOTWRecomp eefafaf)
+        if (LAG_SETTLE < 0) LAG_SETTLE = getenv("LARECOMP_LAG_SETTLE") ? atoi(getenv("LARECOMP_LAG_SETTLE")) : 30;
         static int away_s = -1;
         if (away_s < 0) away_s = getenv("LARECOMP_LAG_AWAY_S") ? atoi(getenv("LARECOMP_LAG_AWAY_S")) : 15;
         extern uint64_t vk_scene_frame(void), renderer_present_count(void);
@@ -355,7 +357,11 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
             away_since_ns = 0;
             if (!world_since) world_since = now;
         }
-        if (!world_since || !world || now - world_since < LAG_SETTLE) lag = 0;
+        if (!world_since || !world || now - world_since < (uint64_t)LAG_SETTLE) lag = 0;
+        static bool was_on;
+        if ((lag > 0) != was_on && (was_on = lag > 0))
+            LOG("[synclag] on at frame %llu (the world back since frame %llu)\n", (unsigned long long)now,
+                (unsigned long long)world_since);
     }
     extern int vk_ab(const char *what);
     int ab = vk_ab("synclag");
@@ -1131,7 +1137,12 @@ static void texels_region(Cpu *c, bool to_linear, bool strided) {
     uint64_t row = strided && A(4) ? A(4) : (uint64_t)wb * fi->bpb, img = strided && A(5) ? A(5) : row * hb;
     uint8_t *lin = AP(3), *base = (uint8_t *)(uintptr_t)t->addr;
     bool layers = t->layout.depth <= 1;  // (array / cube: one level slice per layer)
-    for (uint32_t k = 0; k < (layers ? d : 1); k++) {
+    // A read of a texture the GPU drew in comes from its image (vulkan/textures.c; from totk-android's read_texels, MIT): the
+    // memory holds only what the CPU wrote there. LARECOMP_READTEXELS_GPU=0: memory, as before.
+    extern bool vk_texture_read_texels(NvnTexture *t, uint32_t level, uint32_t first_layer, uint32_t nlayers, uint32_t x0,
+                                       uint32_t y0, uint32_t wb, uint32_t hb, uint8_t *dst, uint64_t row, uint64_t img);
+    bool from_gpu = to_linear && layers && vk_texture_read_texels(t, level, layer0 + (uint32_t)r[2], d, x0, y0, wb, hb, lin, row, img);
+    for (uint32_t k = 0; k < (layers ? d : 1) && !from_gpu; k++) {
         uint64_t at = layers ? (uint64_t)(layer0 + (uint32_t)r[2] + k) * tegra_layer_size(&t->layout) : 0;
         if (layers && layer0 + (uint32_t)r[2] + k >= (t->layout.layers ? t->layout.layers : 1)) break;
         tegra_copy_region(base + at + l.offset, lin + k * img, row, img, &l, fi->bpb, x0, y0, layers ? 0 : (uint32_t)r[2],
@@ -1152,7 +1163,7 @@ static void texels_region(Cpu *c, bool to_linear, bool strided) {
     if (nlog++ < 8 || (level && nlog_lv++ < 40))
         LOG("[nvn] %s %ux%u fmt %#x level %u region %d,%d,%d %dx%dx%d, first bytes %02x %02x %02x %02x%s\n",
             to_linear ? "ReadTexels" : "WriteTexels", t->width, t->height, t->format, level, r[0], r[1], r[2], r[3], r[4],
-            r[5], lin[0], lin[1], lin[2], lin[3], renderer_is_gpu_owned(t) ? " (drawn by the GPU)" : "");
+            r[5], lin[0], lin[1], lin[2], lin[3], from_gpu ? " (read back from the GPU image)" : renderer_is_gpu_owned(t) ? " (drawn by the GPU, memory read)" : "");
 }
 NVN(nvnTextureWriteTexels) { texels_region(c, false, false); }
 NVN(nvnTextureWriteTexelsStrided) { texels_region(c, false, true); }
