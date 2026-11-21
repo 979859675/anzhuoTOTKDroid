@@ -5658,9 +5658,19 @@ static VkDescriptorBufferInfo gmem_info(void) {
     }
 #endif
     if (gmem_buf) return (VkDescriptorBufferInfo){gmem_buf, 0, gmem_size};
+    // No heap on the GPU (copy mode: Mali, Xclipse): a 4 KB stand-in of zeros. Shaders index it by the guest address
+    // (gmem_.w[ga >> 2]: translate.c), out of its range for any real one - reads zero, stores dropped - so its bytes
+    // are hardly ever touched, and one copy serves the whole submission: one a descriptor write was ~38k copies, 146 MB
+    // every 2 s on the Great Sky Island in the Mali simulation, and each made the draw's descriptor set new as well
+    // (2026-11-21). LARECOMP_GMEM_ZERO_EACH=1: one per write again.
     static uint32_t zero[1024];
-    VkSpan s = vk_transient_copy(zero, sizeof zero, 256);
-    return (VkDescriptorBufferInfo){s.buf, s.off, sizeof zero};
+    static int each = -1;
+    if (each < 0) each = getenv("LARECOMP_GMEM_ZERO_EACH") && atoi(getenv("LARECOMP_GMEM_ZERO_EACH"));
+    static uint64_t zseq = ~0ull;
+    static VkSpan zs;
+    uint64_t seq = vk_pending_seq();
+    if (each || zseq != seq) { zs = vk_transient_copy(zero, sizeof zero, 256); zseq = seq; }
+    return (VkDescriptorBufferInfo){zs.buf, zs.off, sizeof zero};
 }
 
 // Compute dispatches that use global memory: the imported heap is host memory across PCIe on a discrete GPU, and a
