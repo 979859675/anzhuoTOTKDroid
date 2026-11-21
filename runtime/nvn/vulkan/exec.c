@@ -2009,12 +2009,17 @@ const char *renderer_stats(void) {
                  (unsigned long long)stat_counters_gpu, pace_slow ? "30" : "60", (unsigned long long)stat_pace_over);
         stat_counters_gpu = stat_pace_over = 0;
         {
-            extern uint64_t prof_vc_hits, prof_vc_bypass, prof_vc_copied, prof_vc_queries, prof_vc_scan_pages, prof_vc_scan_ns;
+            extern uint64_t prof_vc_hits, prof_vc_bypass, prof_vc_copied, prof_vc_queries, prof_vc_scan_pages, prof_vc_scan_ns,
+                prof_gres_vtx, prof_vc_why[7];
             n = strlen(stats_text);
-            snprintf(stats_text + n, sizeof stats_text - n,  " | vcache %llu hit %llu in place %.1f MB copied, %llu queries %.2f ms, %llu pages written",
+            snprintf(stats_text + n, sizeof stats_text - n,  " | vcache %llu hit %llu in place %.1f MB copied, %llu queries %.2f ms, %llu pages written, %.1f MB of vertices from the arena, turned away MB: big %.1f out %.1f pend %.1f slot %.1f budget %.1f alloc %.1f gpu %.1f",
                      (unsigned long long)prof_vc_hits, (unsigned long long)prof_vc_bypass, prof_vc_copied / 1048576.0,
-                     (unsigned long long)prof_vc_queries, prof_vc_scan_ns / 1e6, (unsigned long long)prof_vc_scan_pages);
+                     (unsigned long long)prof_vc_queries, prof_vc_scan_ns / 1e6, (unsigned long long)prof_vc_scan_pages,
+                     prof_gres_vtx / 1048576.0, prof_vc_why[0] / 1048576.0, prof_vc_why[1] / 1048576.0, prof_vc_why[2] / 1048576.0,
+                     prof_vc_why[3] / 1048576.0, prof_vc_why[4] / 1048576.0, prof_vc_why[5] / 1048576.0, prof_vc_why[6] / 1048576.0);
             prof_vc_hits = prof_vc_bypass = prof_vc_copied = prof_vc_queries = prof_vc_scan_pages = prof_vc_scan_ns = 0;
+            prof_gres_vtx = 0;
+            memset(prof_vc_why, 0, sizeof prof_vc_why);
             extern uint64_t prof_tex_watch_skips;
             n = strlen(stats_text);
             snprintf(stats_text + n, sizeof stats_text - n, " | tex unwritten %llu", (unsigned long long)prof_tex_watch_skips);
@@ -5946,7 +5951,8 @@ static bool gres_init(void) {
     if (g_vk.props.limits.maxStorageBufferRange < GA_SIZE) return false;
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = GA_SIZE,
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
+                                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT};  // (gres_vertex: vertices, and indices through vcache_lookup)
     // (cached: the CPU reads the GPU's stores back. Adreno's Turnip has a cached coherent type; Mali's cached one
     // isn't coherent - flushed and invalidated by hand, ga_noncoherent)
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
@@ -6134,6 +6140,45 @@ static GaRes *gres_get(uint64_t lo, uint64_t hi, bool create) {
         vk_full_barrier(cb);
     }
     return n;
+}
+
+// Vertices in a range a shader stores to (copy mode): bound in the arena's resident slot itself. The vertex cache never
+// holds pages the GPU writes (vcache_lookup: e->gpu), so those draws copied the stream from guest memory per draw - where
+// the GPU's results land only once their submission is done, so a draw after the dispatch in the same submission read
+// the frame before's. On the Great Sky Island in the Mali simulation: ~1 GB of the ~1.35 GB upload every 2 s, ~10k
+// copies of ~100 KB (2026-11-21). The slot is current in GPU order; the CPU's writes reach it at the start of the
+// submission (gres_sync, the upload command buffer: allowed inside a pass). LARECOMP_VK_NO_GRES_VTX=1: copies again.
+extern uint64_t prof_gres_vtx;  // (with the vertex cache's counters)
+static bool gres_vertex(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+    static int on = -1;
+    if (on < 0) on = !getenv("LARECOMP_VK_NO_GRES_VTX");
+    if (!on || gres_state != 1 || !size || addr < HEAP_BASE || addr - HEAP_BASE + size > HEAP_MAX) return false;
+    uint64_t lo = addr - HEAP_BASE;
+    // (the draw's reach has 256 bytes of slack past its last vertex - draw_'s "need": a stream the size of the stored
+    // buffer reached past its slot's end and was copied. The slack is read from the slot's neighbour, as from the heap)
+    GaRes *e = NULL;
+    for (int i = 0; i < ga_nres && !e; i++)
+        if (ga_res[i].live && ga_res[i].lo <= lo && lo < ga_res[i].hi && lo + size <= ga_res[i].hi + 256 &&
+            ga_res[i].off + (lo - ga_res[i].lo) + size <= GA_SIZE)
+            e = &ga_res[i];
+    if (!e) {
+        static int nlog;
+        if (nlog < 24 && size >= (16u << 10) && getenv("LARECOMP_LOG_GRES_VTX")) {  // (the large ones: the cost)
+            nlog++;
+            int near = -1;
+            for (int i = 0; i < ga_nres; i++)
+                if (ga_res[i].live && ga_res[i].lo < lo + size && lo < ga_res[i].hi) { near = i; break; }
+            LOG("[gres] vertices at heap +%llx, %llu bytes: no resident range holds them%s", (unsigned long long)lo,
+                (unsigned long long)size, near < 0 ? " (none overlaps)\n" : "");
+            if (near >= 0) LOG(" (overlaps +%llx..+%llx)\n", (unsigned long long)ga_res[near].lo, (unsigned long long)ga_res[near].hi);
+        }
+        return false;
+    }
+    gres_sync(e);
+    *buf = ga_buf;
+    *off = e->off + (lo - e->lo);
+    prof_gres_vtx += size;
+    return true;
 }
 
 // This draw's / dispatch's ranges through the arena: false - not possible here, the plain copies instead
@@ -6581,6 +6626,10 @@ static int vc_ndead;
 static int vc_on = -1;
 // (profiler: draws served / read in place, bytes refreshed, write tracking queries, written pages seen, query time)
 uint64_t prof_vc_hits, prof_vc_bypass, prof_vc_copied, prof_vc_queries, prof_vc_scan_pages, prof_vc_scan_ns;
+uint64_t prof_gres_vtx;  // (vertices bound in the arena: gres_vertex, Android's copy mode)
+// (bytes the cache turned away, by why: 0 over 64 MB, 1 outside the heap / region, 2 pending list full, 3 no table slot,
+// 4 over budget with everything drawn in the last 2 frames, 5 buffer creation, 6 pages the GPU writes)
+uint64_t prof_vc_why[7];
 
 static void vc_free_dead(bool all) {
     uint64_t done = vk_completed_seq();
@@ -6642,8 +6691,16 @@ int vk_pages_changed(uint64_t addr, uint64_t size, uint32_t since, uint32_t *now
 // Heap pages [lo, hi) (offsets) written by the GPU: never cached from now on.
 static void vc_mark_gpu(uint64_t lo, uint64_t hi) {
     if (!pt_init()) return;
+    static int logn = -1;  // (LARECOMP_LOG_VC_GPU=1: the first ranges newly taken as GPU-written, heap offsets)
+    if (logn < 0) logn = getenv("LARECOMP_LOG_VC_GPU") ? 40 : 0;
     lo += VC_HEAP_OFF, hi += VC_HEAP_OFF;  // (heap offsets -> the page tables')
-    for (uint64_t p = lo / VC_PAGE; p < (hi + VC_PAGE - 1) / VC_PAGE && p < VC_SPAN / VC_PAGE; p++) vc_page_gpu[p] = 1;
+    uint64_t fresh = 0;
+    for (uint64_t p = lo / VC_PAGE; p < (hi + VC_PAGE - 1) / VC_PAGE && p < VC_SPAN / VC_PAGE; p++) fresh += !vc_page_gpu[p], vc_page_gpu[p] = 1;
+    if (fresh && logn > 0) {
+        logn--;
+        LOG("[vcache] heap +%llx..+%llx taken as GPU-written (%llu new pages) at frame %llu\n", (unsigned long long)(lo - VC_HEAP_OFF),
+            (unsigned long long)(hi - VC_HEAP_OFF), (unsigned long long)fresh, (unsigned long long)renderer_present_count());
+    }
     vc_epoch++;
 }
 
@@ -6668,6 +6725,16 @@ static void note_gmem_store(int stage) {
 static void vc_mark_sbufs(int stage) {
     for (int i = 0; i < 16; i++) {
         uint64_t a = st.sbuf[stage][i].addr, sz = st.sbuf[stage][i].size;
+        if (a >= HEAP_BASE && sz >= (64u << 10) && a - HEAP_BASE < HEAP_MAX) {  // (LARECOMP_LOG_VC_GPU: the large ones, whose)
+            static int n = -1;
+            if (n < 0) n = getenv("LARECOMP_LOG_VC_GPU") ? 30 : 0;
+            if (n > 0 && vc_page_gpu && !vc_page_gpu[(a - VC_BASE) / VC_PAGE]) {
+                n--;
+                LOG("[vcache] stage %d storage buffer %d, heap +%llx + %llu, code %llx: taken as GPU-written\n", stage, i,
+                    (unsigned long long)(a - HEAP_BASE), (unsigned long long)sz,
+                    (unsigned long long)(st.program ? st.program->stages[stage].code_addr : 0));
+            }
+        }
         if (a >= HEAP_BASE && sz && a - HEAP_BASE < HEAP_MAX) vc_mark_gpu(a - HEAP_BASE, a - HEAP_BASE + sz);
     }
 }
@@ -6686,11 +6753,12 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
 #else
     bool cpu_fill = false;
 #endif
-    if (!vc_on || (!gmem_buf && !cpu_fill) || size > VC_MAX_RANGE) return false;
+    if (!vc_on || (!gmem_buf && !cpu_fill)) return false;
+    if (size > VC_MAX_RANGE) { prof_vc_why[0] += size; return false; }
     // (the heap; with CPU fills also the physical memory region, where TOTK keeps its vertices - VC_BASE)
     bool in_heap = addr >= HEAP_BASE && addr + size <= HEAP_BASE + (gmem_buf ? gmem_size : HEAP_MAX);
     bool in_alias = cpu_fill && vc_alias_on() && addr >= ALIAS_BASE && addr + size <= ALIAS_BASE + ALIAS_SIZE && ALIAS_BASE >= VC_BASE;
-    if (!in_heap && !in_alias) return false;
+    if (!in_heap && !in_alias) { prof_vc_why[1] += size; return false; }
     uint64_t lo = (addr - VC_BASE) & ~(VC_PAGE - 1), hi = (addr - VC_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
     uint64_t pend = vk_pending_seq(), frame = renderer_present_count();
     uint64_t h = (lo * 0x9E3779B97F4A7C15ull) ^ (hi * 0xC2B2AE3D27D4EB4Full);
@@ -6704,10 +6772,10 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
             (old_slot == ~0u || c->used_seq < vc_tab[old_slot].used_seq)) old_slot = slot;
     }
     if (!e) {  // a new range: its own device-local buffer (gen 0: copied whole at the submission)
-        if (vc_npend == VC_TAB) return false;
+        if (vc_npend == VC_TAB) { prof_vc_why[2] += size; return false; }
         if (vc_ndead) vc_free_dead(false);
         if (free_slot == ~0u) {
-            if (old_slot == ~0u || !vc_drop(&vc_tab[old_slot])) return false;
+            if (old_slot == ~0u || !vc_drop(&vc_tab[old_slot])) { prof_vc_why[3] += size; return false; }
             free_slot = old_slot;
         }
         while (vc_bytes + (hi - lo) > VC_BUDGET) {  // over budget: the least recently used entry goes
@@ -6715,13 +6783,13 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
             for (int i = 0; i < VC_TAB; i++)
                 if (vc_tab[i].buf && vc_tab[i].used_seq < pend && vc_tab[i].frame + VC_KEEP_FRAMES <= frame &&
                     (lru < 0 || vc_tab[i].used_seq < vc_tab[lru].used_seq)) lru = i;
-            if (lru < 0 || !vc_drop(&vc_tab[lru])) return false;
+            if (lru < 0 || !vc_drop(&vc_tab[lru])) { prof_vc_why[4] += size; return false; }
         }
         e = &vc_tab[free_slot];
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = hi - lo,
                                  .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-        if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &e->buf, &e->mem, NULL) != VK_SUCCESS) { memset(e, 0, sizeof *e); return false; }
+        if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &e->buf, &e->mem, NULL) != VK_SUCCESS) { memset(e, 0, sizeof *e); prof_vc_why[5] += size; return false; }
         e->lo = lo; e->hi = hi;
         vc_bytes += hi - lo;
     }
@@ -6730,7 +6798,23 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE && !e->gpu; p++) e->gpu = vc_page_gpu[p];
         e->epoch = vc_epoch;
     }
-    if (e->gpu) { prof_vc_bypass++; return false; }
+    // Pages a shader stores to: with the heap on the GPU (gmem_buf) read in place there, where the stores land. In copy
+    // mode (cpu_fill) there is no such place: the per-draw copy instead read the same guest memory this cache holds -
+    // where the stores come back once their submission is done (gc_back), seen by the write tracking - only later. So
+    // there: a range a shader stores to that the arena holds is bound in the arena's slot (current in GPU order), any
+    // other served from here. Turned away, a stream over a pool with one such page anywhere in it was copied per draw:
+    // on the Great Sky Island in the Mali simulation ~0.9-1 GB of vertices every 2 s, ~1.1 MB a draw (2026-11-21).
+    // LARECOMP_VC_GPU_COPY=1: copied per draw again.
+    if (e->gpu) {
+#ifdef __ANDROID__
+        static int keep_copy = -1;
+        if (keep_copy < 0) keep_copy = getenv("LARECOMP_VC_GPU_COPY") && atoi(getenv("LARECOMP_VC_GPU_COPY"));
+        if (cpu_fill && !keep_copy) {
+            if (gres_vertex(addr, size, buf, off)) return true;
+        } else
+#endif
+        { prof_vc_bypass++; prof_vc_why[6] += size; return false; }
+    }
     if (e->used_seq != pend) {  // first use in this submission: brought up to date by vc_flush before it runs
         e->used_seq = pend;
         vc_pend[vc_npend++] = (uint32_t)(e - vc_tab);
@@ -8401,6 +8485,8 @@ static void draw_(CmdRec *r, bool indexed) {
                 // The bound stream may cover an entire pool and cross placed
                 // chunks. The range actually reached by this draw can still fit.
                 if (vk_vamm_buffer(v.addr, need ? need : 16, &dbuf, &doff))
+                    sp = (VkSpan){dbuf, doff, NULL};
+                else if (gres_vertex(v.addr, need ? need : 16, &dbuf, &doff))  // (stored by a shader: the arena's slot)
                     sp = (VkSpan){dbuf, doff, NULL};
                 else
 #endif
