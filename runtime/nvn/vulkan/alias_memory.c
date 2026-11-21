@@ -25,6 +25,10 @@ uint64_t vk_vamm_last_read_seq(void) { return atomic_load(&last_read_seq); }
 // From 1024 MB since 2026-11-15: in a surface save and a cave save (100% file) the vertices sat at 1.28-1.79 GB, below
 // 1792, and 1.6 GB of them were copied every 2 s with the alias on (2 chunks placed). From 1024 MB on the POCO: 816 MB
 // placed, the copies 1886 -> 182 MB a 2 s window, the render thread's vertex time 225 -> 39 ms (both saves alike).
+// From 1280 MB since 2026-11-21: those two "saves" were the new game's opening cave (the seed copies were unreadable,
+// so the game started anew). On the Great Sky Island with the real save the vertices sat at 2.0-2.25 GB again, past the
+// 1024 MB alias's end at 2048: 2.6 GB copied every 2 s (upload ~2.5 GB). From 1280 the same 1 GB covers 1.28-2.30 GB,
+// both: copies 2742 -> 257 MB, the render thread's vertex time ~250 -> ~75 ms a 2 s window (POCO, Turnip).
 // LARECOMP_VK_ALIAS_START_MB=<n>: elsewhere.
 // Below ~11 GB of RAM (12 GB phones report ~11.2, 8 GB ones ~7.4): none. The placed heap already holds 2144 MB of GPU
 // memory that Android can't swap; with the game's ~1.3 GB of textures and 704 MB of this, an 8 GB Adreno 618 with the
@@ -120,7 +124,7 @@ void vk_vamm_before_map(uint64_t addr, uint64_t size) {
     unsigned first = (unsigned)((addr - ALIAS_BASE) / ALIAS_CHUNK);
     unsigned last = (unsigned)((addr - ALIAS_BASE + size - 1) / ALIAS_CHUNK);
     const char *start_env = getenv("LARECOMP_VK_ALIAS_START_MB");
-    long start_mb = start_env ? strtol(start_env, NULL, 10) : 1024;
+    long start_mb = start_env ? strtol(start_env, NULL, 10) : 1280;
     if (start_mb < 0) start_mb = 0;
     uint64_t start = (uint64_t)start_mb > (ALIAS_SIZE >> 20) ? ALIAS_SIZE : (uint64_t)start_mb << 20;
     for (unsigned i = first; i <= last && i < ALIAS_CHUNKS; i++) {

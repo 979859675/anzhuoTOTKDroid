@@ -2,6 +2,7 @@
 #include <SDL3/SDL_cpuinfo.h>
 #include "writeback_policy.h"
 #include <SDL3/SDL_timer.h>
+#include <dlfcn.h>
 #include <float.h>
 #include <math.h>
 #include <stdarg.h>
@@ -1371,7 +1372,41 @@ static int new_chunk(uint64_t size) {
 
 static void ring_retire(void) {}  // chunks are recycled lazily in vk_transient
 
+// LARECOMP_UPLOAD_STATS=1: the ring's bytes by caller (the return address; vk_transient_copy's caller for its copies),
+// the largest every 2 s as offsets in libmain.so for llvm-symbolizer - "upload" in the [vk] line is all of them
+// (textures, constants, indices, vertex copies, copy mode's pages). Diagnostics only: unlocked, approximate.
+static int up_stats = -1;
+static __thread void *up_ra;  // (vk_transient_copy: its own caller)
+enum { UP_TAB = 128 };
+static struct { void *ra; uint64_t bytes, calls; } up_tab[UP_TAB];
+static void up_note(void *ra, uint64_t size) {
+    uint32_t h = (uint32_t)(((uintptr_t)ra >> 2) * 2654435761u) & (UP_TAB - 1);
+    for (int i = 0; i < UP_TAB; i++, h = (h + 1) & (UP_TAB - 1))
+        if (up_tab[h].ra == ra || !up_tab[h].ra) { up_tab[h].ra = ra; up_tab[h].bytes += size; up_tab[h].calls++; return; }
+}
+static void up_log(void) {
+    if (up_stats <= 0) return;
+    uint64_t total = 0;
+    for (int i = 0; i < UP_TAB; i++) total += up_tab[i].bytes;
+    if (!total) return;
+    Dl_info di = {0};
+    dladdr((void *)up_log, &di);
+    LOG("[upload] %.1f MB by caller (offset in libmain.so: MB, calls):", total / 1048576.0);
+    for (int k = 0; k < 10; k++) {
+        int best = -1;
+        for (int i = 0; i < UP_TAB; i++) if (up_tab[i].bytes && (best < 0 || up_tab[i].bytes > up_tab[best].bytes)) best = i;
+        if (best < 0) break;
+        LOG(" %#llx: %.1f, %llu;", (unsigned long long)((uintptr_t)up_tab[best].ra - (uintptr_t)di.dli_fbase),
+            up_tab[best].bytes / 1048576.0, (unsigned long long)up_tab[best].calls);
+        up_tab[best].bytes = 0;
+    }
+    LOG("\n");
+    memset(up_tab, 0, sizeof up_tab);
+}
+
 VkSpan vk_transient(uint64_t size, uint64_t align) {
+    if (up_stats < 0) up_stats = getenv("LARECOMP_UPLOAD_STATS") && atoi(getenv("LARECOMP_UPLOAD_STATS"));
+    if (up_stats) { up_note(up_ra ? up_ra : __builtin_return_address(0), size); up_ra = NULL; }
     if (align < 16) align = 16;
     uint64_t pending = vk_pending_seq();
     if (active >= 0) {
@@ -1439,6 +1474,7 @@ void vk_readback_ready(uint64_t size) {
 }
 
 VkSpan vk_transient_copy(const void *data, uint64_t size, uint64_t align) {
+    if (up_stats > 0) up_ra = __builtin_return_address(0);  // (LARECOMP_UPLOAD_STATS: counted for this function's caller)
     VkSpan s = vk_transient(size ? size : 16, align);
     if (size) memcpy(s.ptr, data, size);
     return s;
@@ -1890,6 +1926,7 @@ const char *renderer_stats(void) {
              atomic_exchange(&stat_compiles, 0), (double)stat_build_wait_ns / 1e6, (unsigned long long)stat_feedback_copies, (unsigned long long)stat_feedback_reads, (unsigned long long)stat_inplace_breaks, (double)stat_upload_bytes / 1048576.0,
              (unsigned long long)stat_pipe_binds, (unsigned long long)stat_set_binds);
     stat_feedback_copies = stat_feedback_reads = stat_inplace_breaks = stat_upload_bytes = stat_build_wait_ns = stat_pipe_binds = stat_set_binds = 0;
+    up_log();
     if (getenv("LARECOMP_LOG_CBUF_BYTES")) {
         LOG("[cbuf] fixed %llu x %.1f KB, dynamic %llu x %.1f KB; copied %.1f MB; in place, patched %llu\n",
             (unsigned long long)stat_cb_n[0], stat_cb_n[0] ? stat_cb_bytes[0] / 1024.0 / stat_cb_n[0] : 0,
