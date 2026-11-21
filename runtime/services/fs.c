@@ -498,7 +498,9 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
             static const char *last;
             if (path && path != last) {
                 last = path;
-                if (getenv("LARECOMP_LOG_FILES")) LOG("[fs] read %s\n", path);
+                // (diagnosis: on by default, so a crash log names the last game files read; LARECOMP_LOG_FILES=0 turns it off)
+                const char *lf = getenv("LARECOMP_LOG_FILES");
+                if (!lf || strcmp(lf, "0")) LOG("[fs] read %s\n", path);
             }
         }
         static uint64_t reads, bytes;
