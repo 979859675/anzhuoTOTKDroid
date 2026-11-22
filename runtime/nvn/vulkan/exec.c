@@ -51,6 +51,7 @@ static int prof = -1;
 static uint64_t prof_dsw, prof_cbuf, prof_set_hits, prof_set_miss;  // (sets: driver writes, cbuf copies, set cache)
 static uint64_t prof_gcopy;  // (sets: copy mode's global memory tables - gcopy_prepare / gwin_prepare, counted in sets)
 static uint64_t stat_gc_memo_hits;  // (gcopy_prepare: tables reused from the draw before)
+static uint64_t prof_set_tex, prof_set_def, prof_set_hash;  // (sets: stage_set's texture lookups, deferred bindings, hash + cache)
 static uint64_t prof_exec, prof_draw, prof_sets, prof_vtx, prof_submit, prof_pre, prof_key, prof_dyn, prof_tex, prof_up, prof_gpu;
 static VkQueryPool prof_qp;
 static uint64_t cum_exec, cum_wait, cum_draws, cum_submits;  // (profiling) never reset: hitch log
@@ -1972,10 +1973,11 @@ const char *renderer_stats(void) {
                  prof_gpu / 1e6, prof_exec / 1e6, prof_draw / 1e6, prof_pre / 1e6, prof_key / 1e6, prof_dyn / 1e6, prof_sets / 1e6,
                  prof_tex / 1e6, prof_up / 1e6, prof_vtx / 1e6, prof_submit / 1e6);
         n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, " | sets: driver %.0f cbuf %.0f gmem tables %.0f ms (%llu reused), cache %llu hits %llu misses",
-                 prof_dsw / 1e6, prof_cbuf / 1e6, prof_gcopy / 1e6, (unsigned long long)stat_gc_memo_hits, (unsigned long long)prof_set_hits,
+        snprintf(stats_text + n, sizeof stats_text - n, " | sets: driver %.0f cbuf %.0f gmem tables %.0f vtex %.0f deferred %.0f hash %.0f ms (%llu reused), cache %llu hits %llu misses",
+                 prof_dsw / 1e6, prof_cbuf / 1e6, prof_gcopy / 1e6, prof_set_tex / 1e6, prof_set_def / 1e6, prof_set_hash / 1e6, (unsigned long long)stat_gc_memo_hits, (unsigned long long)prof_set_hits,
                  (unsigned long long)prof_set_miss);
         prof_dsw = prof_cbuf = prof_gcopy = prof_set_hits = prof_set_miss = stat_gc_memo_hits = 0;
+        prof_set_tex = prof_set_def = prof_set_hash = 0;
         extern uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn, prof_tex_same_bytes,
             prof_tex_snap_bytes, prof_tex_calm_bytes;
         n = strlen(stats_text);
@@ -7192,7 +7194,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             int ti = (int)b->binding - 32;
             float sc[2]; uint32_t wh[2];
             if (ti < si->ntex && pre_ii && ti < 64) { ii[n] = pre_ii[ti]; sc[0] = tex_sc[sg][ti][0]; sc[1] = tex_sc[sg][ti][1]; wh[0] = tex_wh[sg][ti][0]; wh[1] = tex_wh[sg][ti][1]; }
-            else if (ti < si->ntex) texture_info(stage, si, ti, &ii[n], sc, wh);
+            else if (ti < si->ntex) { uint64_t tt_ = prof > 0 ? plat_now_ns() : 0; texture_info(stage, si, ti, &ii[n], sc, wh); if (prof > 0) prof_set_tex += plat_now_ns() - tt_; }
             else { ii[n] = (VkDescriptorImageInfo){vk_default_sampler(true), vk_dummy_view(TEXTYPE_2D), VK_IMAGE_LAYOUT_GENERAL}; sc[0] = sc[1] = 1; wh[0] = wh[1] = 0; }
             if (ti < 64) {
                 tex_sc[sg][ti][0] = sc[0]; tex_sc[sg][ti][1] = sc[1];
@@ -7230,6 +7232,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         }
         n++;
     }
+    uint64_t td_ = prof > 0 ? plat_now_ns() : 0;
 #ifdef __ANDROID__
     int deferred_count = planned ? plan->ndeferred : p->nbinds;
     for (int i = 0; i < deferred_count; i++) {
@@ -7308,6 +7311,8 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     {
         static int off = -1;
         if (off < 0) off = getenv("LARECOMP_NO_SET_CACHE") != NULL;
+        uint64_t th_ = prof > 0 ? plat_now_ns() : 0;
+        if (prof > 0) prof_set_def += th_ - td_;
         uint64_t h1 = (uint64_t)(uintptr_t)layout * 0x9E3779B97F4A7C15ull, h2 = (uint64_t)(uintptr_t)layout ^ 0xC2B2AE3D27D4EB4Full;
 #define DS_MIX(v) do { uint64_t v_ = (uint64_t)(v); h1 = (h1 ^ v_) * 0x100000001B3ull; h1 ^= h1 >> 29; \
                        h2 = (h2 + v_) * 0xFF51AFD7ED558CCDull; h2 ^= h2 >> 33; } while (0)
@@ -7320,6 +7325,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         static struct { uint64_t seq, h1, h2; VkDescriptorSet ds; } cache[4096];
         uint64_t seq = vk_pending_seq();
         uint32_t slot = (uint32_t)(h1 ^ (h1 >> 32)) & 4095;
+        if (prof > 0) prof_set_hash += plat_now_ns() - th_;
         if (!off && cache[slot].seq == seq && cache[slot].h1 == h1 && cache[slot].h2 == h2) {
             prof_set_hits++;
             return cache[slot].ds;
