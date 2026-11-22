@@ -1514,7 +1514,8 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (tex_discard() && tracked && !b->dynamic && !linear && b->rs_group == RS_NONE && !b->gpu_owned && !b->scalable &&
         b->tp <= 0 && total >= (64u << 10)) {
         uint64_t lo = (t->addr + 0xFFF) & ~0xFFFull, hi = (t->addr + total) & ~0xFFFull;
-        if (hi > lo && !madvise((void *)(uintptr_t)lo, hi - lo, MADV_DONTNEED)) {
+        extern bool plat_discard_pages(uint64_t addr, uint64_t size);  // (platform/android.c: zero pages, or a hole)
+        if (hi > lo && plat_discard_pages(lo, hi - lo)) {
             if (!b->discarded) tex_discarded_bytes += hi - lo;
             b->discarded = true;
             b->disc_hash = hash_full(mem, total);

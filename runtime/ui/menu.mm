@@ -826,6 +826,18 @@ static void tab_display(void) {
                                                       "Progress since the game's last save is lost."))
             launcher_restart_app();
     }
+    {   // Memory saving (platform/android.c plat_guest_file): read as the app starts
+        extern bool plat_guest_file_active(void);
+        void launcher_restart_app(void);  // (ui/launcher.mm)
+        opt_toggle("Memory saving", &g_settings.mem_file, false,
+                   "Keeps the game's memory in a file on the phone's storage instead of in RAM, so Android can take back "
+                   "the pages it does not need without compressing them into RAM. Needs free storage for the memory the "
+                   "game uses. Applies when TOTKDroid restarts.");
+        if (g_settings.mem_file != plat_guest_file_active() &&
+            opt_button("Restart to apply memory saving", "Closes TOTKDroid and opens it again with the new setting. "
+                                                         "Progress since the game's last save is lost."))
+            launcher_restart_app();
+    }
 #endif
     opt_end();
 }

@@ -202,6 +202,12 @@ static void boot(const char *root) {
     // (the settings first: Native game code is one of them. Booting straight in - no start screen, which loads them
     // before this - chose before they were read: the setting on, the game recompiled anyway)
     { extern void settings_load(void); settings_load(); }
+#ifdef __ANDROID__
+    {   // Settings > Video > Memory saving: the guest window in a file (platform/android.c), before anything writes to it
+        extern bool plat_guest_file(bool on, uint64_t lo, uint64_t hi);
+        plat_guest_file(g_settings.mem_file, GUEST_LO, GUEST_HI);
+    }
+#endif
     native_begin_boot();  // (Native game code: the game's own code runs, no totkgame.so - runtime/native.c)
     if (!native_on() && !gamelib_load(root, why, sizeof why)) FATAL("%s\n", why);
     loader_load(exefs);

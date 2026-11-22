@@ -239,6 +239,7 @@ void settings_reset_defaults(void) {
     g_settings.shader_int32 = d->shader_int32;
     g_settings.sync_lag = d->sync_lag;
     g_settings.low_ram = d->low_ram;
+    g_settings.mem_file = d->mem_file;
     g_settings.files_in_place = d->files_in_place;
     g_settings.native_code = d->native_code;
 #endif
@@ -295,6 +296,7 @@ void settings_load(void) {
         else if (!strcmp(key, "gpu_heap")) g_settings.gpu_heap = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
         else if (!strcmp(key, "heap_file")) g_settings.heap_file = atoi(val) != 0;
         else if (!strcmp(key, "low_ram")) g_settings.low_ram = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
+        else if (!strcmp(key, "mem_file")) g_settings.mem_file = atoi(val) != 0;
         else if (!strcmp(key, "inplace_reads")) g_settings.inplace_reads = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
         else if (!strcmp(key, "turnip_lrz")) g_settings.turnip_lrz = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
         else if (!strcmp(key, "log_file")) g_settings.log_file = atoi(val) != 0;
@@ -421,6 +423,7 @@ void settings_save(void) {
             g_settings.log_file, g_settings.gpu_model);
     fprintf(f, "driver_env = %s\n", g_settings.driver_env);
     fprintf(f, "low_ram = %s\n", TRI(g_settings.low_ram));
+    fprintf(f, "mem_file = %d\n", g_settings.mem_file);
 #undef TRI
     fprintf(f, "touch_drag_camera = %d\ntouch_drag_sens = %.2f\ntouch_sticks_hidden = %d\ntouch_half_areas = %d\n",
             g_settings.touch_drag_camera, g_settings.touch_drag_sens, g_settings.touch_sticks_hidden,

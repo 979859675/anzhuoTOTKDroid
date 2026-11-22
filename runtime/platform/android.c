@@ -9,6 +9,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/falloc.h>
 #include <jni.h>
 #include <pthread.h>
 #include <sched.h>
@@ -211,6 +212,24 @@ static void wt_lock(void);
 static void wt_unlock(void);
 
 // Fresh zero pages over the whole window (the old ones are released at once).
+// ---- the guest window in a file (Settings > Video > Memory saving, plat_guest_file): the window's pages are a shared map
+// of an unlinked file on the app's internal storage instead of anonymous memory. A clean file page can go back to the
+// system at once, where an anonymous one goes to Android's compressed swap (zram), which still takes RAM. Zeroing a range
+// punches a hole in the file, so its pages read zero as the anonymous ones did. The heap (HEAP_BASE, rt.h) stays
+// anonymous: the GPU imports it at its address (vulkan/exec.c), and heap_file maps its own file there. Off: all anonymous.
+static int g_gfd = -1;
+static uint64_t g_gbase, g_gsize;  // the file's window: [g_gbase, g_gbase + g_gsize)
+static bool gfile_at(uint64_t a) {  // (is this page of the window in the file?)
+    return g_gfd >= 0 && a >= g_gbase && a < g_gbase + g_gsize && !(a >= HEAP_BASE && a < HEAP_BASE + HEAP_MAX);
+}
+static uint64_t gseg_end(uint64_t a, uint64_t hi) {  // the end of the piece from a that is all file or all anonymous
+    uint64_t e = hi;
+    const uint64_t cut[4] = {g_gbase, g_gbase + g_gsize, HEAP_BASE, HEAP_BASE + HEAP_MAX};
+    for (int i = 0; i < 4; i++)
+        if (cut[i] > a && cut[i] < e) e = cut[i];
+    return e;
+}
+
 bool plat_reset_guest(uint64_t lo, uint64_t hi) {
     if (wt_state && lo < wt_hi && hi > wt_lo) {  // (fresh pages are writable: nothing tracked there any more)
         uint64_t a = lo < wt_lo ? wt_lo : lo, e = hi > wt_hi ? wt_hi : hi;
@@ -218,9 +237,77 @@ bool plat_reset_guest(uint64_t lo, uint64_t hi) {
         memset(wt_state + ((a - wt_lo) >> 12), 0, (size_t)((e - a) >> 12));
         wt_unlock();
     }
-    return mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
-                -1, 0) == (void *)(uintptr_t)lo;
+    if (g_gfd < 0)
+        return mmap((void *)(uintptr_t)lo, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
+                    -1, 0) == (void *)(uintptr_t)lo;
+    for (uint64_t a = lo; a < hi;) {  // (piece by piece: the file's part, and the anonymous heap and the rest)
+        uint64_t e = gseg_end(a, hi);
+        if (gfile_at(a)) {
+            off_t off = (off_t)(a - g_gbase);
+            if (mmap((void *)(uintptr_t)a, e - a, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, g_gfd, off) !=
+                (void *)(uintptr_t)a)
+                return false;
+            if (fallocate(g_gfd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, off, (off_t)(e - a)) != 0)
+                memset((void *)(uintptr_t)a, 0, e - a);
+        } else if (mmap((void *)(uintptr_t)a, e - a, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) != (void *)(uintptr_t)a) {
+            return false;
+        }
+        a = e;
+    }
+    return true;
 }
+
+// Drops the pages of [lo, hi): zero pages for the anonymous parts, a hole in the file for the file's. False where a piece
+// could not be dropped (the caller then clears the range by hand).
+static bool gdrop(uint64_t lo, uint64_t hi) {
+    if (g_gfd < 0) return madvise((void *)(uintptr_t)lo, hi - lo, MADV_DONTNEED) == 0;
+    bool ok = true;
+    for (uint64_t a = lo; a < hi;) {
+        uint64_t e = gseg_end(a, hi);
+        if (gfile_at(a))
+            ok = (fallocate(g_gfd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)(a - g_gbase), (off_t)(e - a)) == 0) && ok;
+        else
+            ok = (madvise((void *)(uintptr_t)a, e - a, MADV_DONTNEED) == 0) && ok;
+        a = e;
+    }
+    return ok;
+}
+// (textures.c, after an upload: the guest copy of a texture is dropped, as plat_discard's pages - but nothing else)
+bool plat_discard_pages(uint64_t addr, uint64_t size) { return gdrop(addr, addr + size); }
+
+// Settings > Video > Memory saving, read as the app starts (main.c boot, before the game writes to the window): the window
+// becomes a shared map of a file in the app's internal storage (unlinked at once, so it goes with the process). The file
+// is sparse: only the pages the game touches take storage. Needs a file system that can punch holes (ext4 and f2fs can).
+// Anything else: the window stays anonymous, and the log says why.
+bool plat_guest_file(bool on, uint64_t lo, uint64_t hi) {
+    if (g_gfd >= 0) return true;
+    if (!on) return false;
+    const char *dir = SDL_GetAndroidInternalStoragePath();
+    if (!dir || !*dir) {
+        fprintf(stderr, "[android] memory saving: no app storage: the guest memory stays in RAM\n");
+        return false;
+    }
+    char path[1024];
+    snprintf(path, sizeof path, "%s/guest-memory.bin", dir);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "[android] memory saving: cannot create %s (errno %d): the guest memory stays in RAM\n", path, errno);
+        return false;
+    }
+    unlink(path);
+    if (ftruncate(fd, (off_t)(hi - lo)) != 0 || fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 4096) != 0) {
+        fprintf(stderr, "[android] memory saving: the storage can't size or punch holes in a file (errno %d): the guest memory stays in RAM\n", errno);
+        close(fd);
+        return false;
+    }
+    g_gfd = fd, g_gbase = lo, g_gsize = hi - lo;
+    fprintf(stderr, "[android] memory saving: the guest memory (%llu MB, heap in RAM) is a file on the app's storage\n",
+            (unsigned long long)((hi - lo) >> 20));
+    if (!plat_reset_guest(lo, hi)) FATAL("cannot map the guest memory's file\n");
+    return true;
+}
+bool plat_guest_file_active(void) { return g_gfd >= 0; }
 
 void plat_commit(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 
@@ -246,7 +333,7 @@ void plat_discard(uint64_t addr, uint64_t size) {
     }
     memset((void *)(uintptr_t)addr, 0, lo - addr);
     memset((void *)(uintptr_t)hi, 0, addr + size - hi);
-    if (madvise((void *)(uintptr_t)lo, hi - lo, MADV_DONTNEED) != 0) memset((void *)(uintptr_t)lo, 0, hi - lo);
+    if (!gdrop(lo, hi)) memset((void *)(uintptr_t)lo, 0, hi - lo);  // (a file map: a hole in the file, see above)
 }
 
 // ---- page write tracking (plat_written_pages), for the copy mode of Qualcomm's driver: there the heap isn't GPU
