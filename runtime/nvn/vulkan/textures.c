@@ -229,7 +229,71 @@ static VkFormat bc_target(VkFormat bc, uint32_t *bpp) {
 static bool is_bc(VkFormat f) { return f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK; }
 
 // wb x hb blocks (bsize bytes each, rows of blocks) -> texels, rows of wb * 4 texels of bpp bytes
-static void bc_decode(VkFormat bc, const uint8_t *blocks, uint32_t wb, uint32_t hb, uint32_t bsize, uint8_t *out, uint32_t bpp) {
+static void bc_decode_rows(VkFormat bc, const uint8_t *blocks, uint32_t wb, uint32_t hb, uint32_t bsize, uint8_t *out, uint32_t bpp);
+// ---- BC decode in four parts at once (GPUs without BC: Mali, and the tests' LARECOMP_NO_BC): rows of blocks split
+// between three helper threads and the caller (the render thread), each writing its own rows of the output. The decode
+// ran on the render thread alone - on the Great Sky Island in the Mali simulation ~490 ms of its every 2 s went to the
+// texture uploads, most of it this (2026-11-21). Under BC_PAR_MIN blocks: in one piece. LARECOMP_BC_THREADS=0: one
+// piece always.
+#include <semaphore.h>
+enum { BC_PARTS = 4, BC_PAR_MIN = 1024 };
+static struct {
+    pthread_t th;
+    sem_t go;
+    VkFormat bc;
+    const uint8_t *blocks;
+    uint32_t wb, hb, bsize, bpp;
+    uint8_t *out;
+} bc_job[BC_PARTS - 1];
+static sem_t bc_done;
+static int bc_par = -1;
+static void *bc_worker(void *arg) {
+    int i = (int)(intptr_t)arg;
+    vk_fp_thread("vk-bcdec");
+    for (;;) {
+        sem_wait(&bc_job[i].go);
+        if (bc_job[i].bpp) bc_decode_rows(bc_job[i].bc, bc_job[i].blocks, bc_job[i].wb, bc_job[i].hb, bc_job[i].bsize, bc_job[i].out, bc_job[i].bpp);
+        else bc1_to_astc(bc_job[i].blocks, bc_job[i].out, (uint64_t)bc_job[i].wb * bc_job[i].hb);
+        sem_post(&bc_done);
+    }
+    return NULL;
+}
+// wb x hb blocks -> the decoded output (bpp bytes a texel; 0: BC1 -> ASTC 4x4 blocks, 16 bytes each), split by rows
+static void bc_decode_par(VkFormat bc, const uint8_t *blocks, uint32_t wb, uint32_t hb, uint32_t bsize, uint8_t *out, uint32_t bpp) {
+    if (bc_par < 0) {
+        const char *e = getenv("LARECOMP_BC_THREADS");
+        bc_par = !e || atoi(e) != 0;
+        if (bc_par) {
+            sem_init(&bc_done, 0, 0);
+            for (int i = 0; i < BC_PARTS - 1 && bc_par; i++) {
+                sem_init(&bc_job[i].go, 0, 0);
+                if (pthread_create(&bc_job[i].th, NULL, bc_worker, (void *)(intptr_t)i)) bc_par = 0;
+                else pthread_setname_np(bc_job[i].th, "bc decode");
+            }
+        }
+    }
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;  // (the helpers serve one caller at a time; another: alone)
+    uint64_t row_out = bpp ? (uint64_t)wb * 4 * bpp * 4 : (uint64_t)wb * 16;  // (one row of blocks, decoded)
+    if (!bc_par || (uint64_t)wb * hb < BC_PAR_MIN || hb < BC_PARTS || pthread_mutex_trylock(&mu)) {
+        if (bpp) bc_decode_rows(bc, blocks, wb, hb, bsize, out, bpp);
+        else bc1_to_astc(blocks, out, (uint64_t)wb * hb);
+        return;
+    }
+    uint32_t part = hb / BC_PARTS;
+    for (int i = 0; i < BC_PARTS - 1; i++) {
+        uint32_t y0 = part * (uint32_t)(i + 1), n = i == BC_PARTS - 2 ? hb - y0 : part;
+        bc_job[i].bc = bc, bc_job[i].wb = wb, bc_job[i].hb = n, bc_job[i].bsize = bsize, bc_job[i].bpp = bpp;
+        bc_job[i].blocks = blocks + (uint64_t)y0 * wb * bsize;
+        bc_job[i].out = out + (uint64_t)y0 * row_out;
+        sem_post(&bc_job[i].go);
+    }
+    if (bpp) bc_decode_rows(bc, blocks, wb, part, bsize, out, bpp);
+    else bc1_to_astc(blocks, out, (uint64_t)wb * part);
+    for (int i = 0; i < BC_PARTS - 1; i++) sem_wait(&bc_done);
+    pthread_mutex_unlock(&mu);
+}
+
+static void bc_decode_rows(VkFormat bc, const uint8_t *blocks, uint32_t wb, uint32_t hb, uint32_t bsize, uint8_t *out, uint32_t bpp) {
     int pitch = (int)(wb * 4 * bpp);
     for (uint32_t y = 0; y < hb; y++)
         for (uint32_t x = 0; x < wb; x++) {
@@ -671,8 +735,7 @@ static uint64_t bc_upload_blocks(VkCommandBuffer cb, TexBackend *b, const uint8_
     uint64_t out_size = bpp ? (uint64_t)wb * 4 * hb * 4 * bpp : (uint64_t)wb * hb * 16;
     VkSpan s = vk_transient(out_size, 16);
     uint64_t decode_start = decode_ns ? SDL_GetTicksNS() : 0;
-    if (bpp) bc_decode(b->bc_vf, blocks, wb, hb, bsize, s.ptr, bpp);
-    else bc1_to_astc(blocks, s.ptr, (uint64_t)wb * hb);
+    bc_decode_par(b->bc_vf, blocks, wb, hb, bsize, s.ptr, bpp);  // (bpp 0: BC1 -> ASTC 4x4)
     if (decode_ns) *decode_ns = SDL_GetTicksNS() - decode_start;
     uint32_t iw = level_w(b, lv), ih = level_h(b, lv);
     VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = wb * 4, .bufferImageHeight = hb * 4,
