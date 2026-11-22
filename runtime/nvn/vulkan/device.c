@@ -1173,11 +1173,12 @@ static void android_create_surface(struct ANativeWindow *aw) {
 #include <android/native_window.h>
 #include <dlfcn.h>
 int vk_between_fps(void);
+int vk_between_target(void);
 static void android_frame_rate(struct ANativeWindow *aw) {
     static struct ANativeWindow *asked_aw;
     static float asked = -1;
     int mode = g_settings.fps_mode;
-    float want = mode == 4 && vk_between_fps() != 30 ? (float)vk_between_fps() : 0.0f;
+    float want = mode == 4 && vk_between_target() != 30 ? (float)vk_between_target() : 0.0f;
     bool fg = false;
     extern int vk_fg_state(void);
     if (vk_fg_state() > 0) {  // (1 generating, 2 waiting, 3 no refresh left)
@@ -1994,6 +1995,8 @@ bool vk_adreno_7xx_8xx(const char *name) {
 // copies went from 13,000 to 57 every 2 s (p90) and the slowest windows from 3 to 10.6 fps, with nothing reported wrong
 // (#65 #73 #27). In place is a feedback loop Vulkan leaves undefined: checked on Turnip frame by frame, on Mali by players.
 bool vk_inplace_auto(void) { return vk_adreno_7xx_8xx(g_vk.props.deviceName) || g_vk.props.vendorID == 0x13B5; }
+static int between_for(float hz) { return hz > 110 ? 40 : hz > 80 ? 45 : hz > 50 ? 30 : 45; }
+
 int vk_between_fps(void) {
     static int fps = 45;
     static uint64_t next;
@@ -2002,11 +2005,26 @@ int vk_between_fps(void) {
         next = now + 1000000000ull;
         const SDL_DisplayMode *m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window));
         float hz = m ? m->refresh_rate : 0;
-        int f = hz > 110 ? 40 : hz > 80 ? 45 : hz > 50 ? 30 : 45;
+        int f = between_for(hz);
         if (f != fps) LOG("[vk] Frame rate 40 / 45: %d fps on a %.0f Hz screen\n", f, hz);
         fps = f;
     }
     return fps;
+}
+
+// ... and the one the window asks for (android_frame_rate): from the fastest rate the screen offers, not the current
+// one - HyperOS keeps a game at 60 Hz on a 120 Hz screen until it asks for more, so from the current rate 40 / 45 fell
+// to 30 and never asked. The frame rate itself still follows the screen's rate (vk_between_fps): 30 until the system
+// switches, and on a system that won't. (from BOTWRecomp 8964997)
+int vk_between_target(void) {
+    static int fps;
+    if (!fps) {
+        extern float plat_max_refresh_hz(void);
+        float hz = plat_max_refresh_hz();
+        fps = hz > 0 ? between_for(hz) : -1;
+        LOG("[vk] Frame rate 40 / 45: the screen offers up to %.0f Hz\n", hz);
+    }
+    return fps > 0 ? fps : vk_between_fps();
 }
 
 static bool g_lrz_at_start = true;
