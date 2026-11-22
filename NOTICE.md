@@ -30,6 +30,10 @@
   `runtime/services/restbl.h`, with its host test `tests/restbl/`, are ported from
   [valentderah/totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp) (`runtime/restbl.c` and `runtime/restbl.h`
   there, MIT). Same MIT License notice as above. The table's merge into `runtime/services/fs.c` is TOTKDroid's own.
+- **Ported from PC TotK Recomp (MIT):** the ExeFS patch formats (IPS, IPS32 and .pchtxt of the mods' exefs folders, and
+  the build id rule), `runtime/exefs_patch.c` and `runtime/exefs_patch.h`, with its host test `tests/exefs/`, are ported
+  from [valentderah/totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp) (`tools/exefs_patches.py` there, MIT).
+  Same MIT License notice as above. Their use in `runtime/cheats.c` (the writes into the game's code at boot) is TOTKDroid's own.
 - **Third-party code** keeps its own license, listed in [README.md](README.md#credits).
 - **Ideas and layouts from [totk-android](https://github.com/AurelioB/totk-android)** (AurelioB, MIT): the HD rumble
   mixing in `runtime/hle/input.c` (two bands to one strength, the silence threshold, the 250 ms stale value) follows its

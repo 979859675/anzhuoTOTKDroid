@@ -32,6 +32,9 @@ bool mods_file(int i, const char **path, const char **host);
 void mods_select_dlc(bool dlc);
 // The cheats folder of the mod (cheats.c: its <build id>.txt): out, false when it has none
 bool mods_cheats_dir(const char *name, char *out, size_t cap);
+// The ExeFS folders of the mod (exefs/, and each folder of atmosphere/exefs_patches/): their patch files are main's
+// (cheats.c). Up to max paths of 1200 bytes into out; their number.
+int mods_exefs_dirs(const char *name, char (*out)[1200], int max);
 // The mod's own note - a .txt in its folder (Sobre.txt, README.txt...) - its first `cap` bytes, in the menu font's
 // characters (ASCII and accented Latin letters; symbols and emoji left out). "" if it has none.
 const char *mods_note(const char *name, char *buf, size_t cap);

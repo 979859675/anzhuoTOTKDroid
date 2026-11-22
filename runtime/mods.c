@@ -98,6 +98,29 @@ bool mods_cheats_dir(const char *name, char *out, size_t cap) {
     return mod_base(name, base, sizeof base) && cheats_dir_in(base, out, cap);
 }
 
+// The ExeFS folders of a mod (cheats.c reads their patch files): exefs/ in the mod, then each folder of
+// atmosphere/exefs_patches/ (the Atmosphere place of a download). Up to max paths into out; their number.
+int mods_exefs_dirs(const char *name, char (*out)[1200], int max) {
+    char base[1024];
+    if (!mod_base(name, base, sizeof base)) return 0;
+    int k = 0;
+    char dir[1200];
+    if (k < max && sub_dir(base, "exefs", dir, sizeof dir)) snprintf(out[k++], 1200, "%s", dir);
+    char atm[1200], patches[1200];
+    if (k < max && sub_dir(base, "atmosphere", atm, sizeof atm) && sub_dir(atm, "exefs_patches", patches, sizeof patches)) {
+        DIR *d = opendir(patches);
+        for (struct dirent *e; d && k < max && (e = readdir(d));) {
+            if (e->d_name[0] == '.') continue;
+            char p[1200];
+            struct stat sb;
+            snprintf(p, sizeof p, "%s/%s", patches, e->d_name);
+            if (!stat(p, &sb) && S_ISDIR(sb.st_mode)) snprintf(out[k++], 1200, "%s", p);
+        }
+        if (d) closedir(d);
+    }
+    return k;
+}
+
 int mods_list(ModInfo *out, int max) {
     DIR *d = opendir("mods");
     if (!d) return 0;
@@ -267,6 +290,7 @@ const char *mods_note(const char *name, char *buf, size_t cap) {
 }
 #else
 bool mods_cheats_dir(const char *name, char *out, size_t cap) { (void)name, (void)out, (void)cap; return false; }
+int mods_exefs_dirs(const char *name, char (*out)[1200], int max) { (void)name, (void)out, (void)max; return 0; }
 int mods_list(ModInfo *out, int max) { (void)out, (void)max; return 0; }
 void mods_set(const char *name, bool on) { (void)name, (void)on; }
 void mods_scan(void) {}

@@ -15,6 +15,9 @@
 // are on). The instruction cache is flushed after each write. A cheat that writes an instruction the port changes
 // itself (native_site_reserved), or one that only puts the code back, is not run.
 //
+// The mods' ExeFS patch files (IPS, .pchtxt) for this build are main's code writes too: read at boot, checked, and written
+// into the game's code before the cheats (the section below the cheats' code writes; exefs_patch.h).
+//
 // The VM runs in the present path (nvn/objects.c nvnQueuePresentTexture -> cheats_frame), every presented frame while
 // the cheat is on, after the game's first 60 frames (as the PC port). The list is read at boot and, while the game is
 // not running, again for the Mods page; while it runs, a cheat's switch changes at once but the mods do not (they apply
@@ -33,6 +36,7 @@
 
 #include "hle.h"
 #include "kernel.h"
+#include "exefs_patch.h"
 #include "mods.h"
 #include "platform.h"
 #include "rt.h"
@@ -110,15 +114,15 @@ static void list_set(char *list, size_t cap, const char *key, int on) {
 
 static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 
-// main's NSO header: the build id (bytes 0x40-0x47) and the text segment's end (its memory offset and size)
-static int read_main_header(const char *exefs, uint8_t head[0x48]) {
+// main's NSO header: the build id (bytes 0x40-0x5F) and the text segment's end (its memory offset and size)
+static int read_main_header(const char *exefs, uint8_t head[0x60]) {
     char path[1200];
     snprintf(path, sizeof path, "%s/main", exefs);
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
-    size_t n = fread(head, 1, 0x48, f);
+    size_t n = fread(head, 1, 0x60, f);
     fclose(f);
-    return n == 0x48 && !memcmp(head, "NSO0", 4);
+    return n == 0x60 && !memcmp(head, "NSO0", 4);
 }
 
 // the file named want in dir, its name in any case, into out; 0 when there is none
@@ -169,7 +173,7 @@ static int vm_wanted(void) {   // g_lock held
 
 // Reads the enabled mods' cheats for this build into a new list, then replaces the running one.
 static void scan(const char *exefs) {
-    uint8_t head[0x48];
+    uint8_t head[0x60];
     Cheat *list = NULL;
     int n = 0, cap = 0;
     uint64_t code_limit = 0;
@@ -448,6 +452,177 @@ static void check_code_sites(void) {
     }
 }
 
+// ---- the mods' ExeFS patches (exefs_patch.h): the IPS and .pchtxt files of main's build, in the mods' exefs folders.
+// Read at boot (collect_patches), checked against main (check_patches, before native_prepare rewrites the code), and
+// written into main's code by cheats_native_ready, before the code cheats. A file applies whole or not at all: its
+// writes are whole instructions into main's code, none of them one the port changes itself, and no branch of them goes
+// to a zero word of the game's code that the file does not write (a code cave of the file is written by it). Like the
+// emulators, the writes are the game's own, for as long as the mod is on (they are not put back as a cheat's are).
+
+typedef struct {
+    char mod[96];       // the mod's folder
+    char file[200];     // the patch file's name
+    ExefsWrites w;      // its writes into main's image
+    int ok;             // applies (check_patches; cheats_native_ready writes it)
+    char note[200];     // why it does not, when not ok
+} Patch;
+
+static Patch *g_patch;
+static int g_npatch;
+enum { PATCH_MAX = 64, PATCH_FILE_MAX = 64 << 20 };
+
+static void patches_free(void) {
+    for (int i = 0; i < g_npatch; i++) exefs_writes_free(&g_patch[i].w);
+    free(g_patch);
+    g_patch = NULL;
+    g_npatch = 0;
+}
+
+// a file's bytes (malloc'd; NULL when it can't be read or is too big)
+static uint8_t *read_bytes(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    uint8_t *b = NULL;
+    long sz = fseek(f, 0, SEEK_END) == 0 ? ftell(f) : -1;
+    if (sz >= 0 && sz <= PATCH_FILE_MAX && fseek(f, 0, SEEK_SET) == 0) {
+        b = (uint8_t *)malloc(sz ? (size_t)sz : 1);
+        if (b && fread(b, 1, (size_t)sz, f) != (size_t)sz) {
+            free(b);
+            b = NULL;
+        }
+        if (b) *n = (size_t)sz;
+    }
+    fclose(f);
+    return b;
+}
+
+// Adds a file's writes (w, moved in) to the list; false when the list is full
+static int add_patch(const char *mod, const char *file, ExefsWrites *w, int ok, const char *note) {
+    if (g_npatch == PATCH_MAX) return 0;
+    Patch *grown = (Patch *)realloc(g_patch, sizeof *g_patch * (size_t)(g_npatch + 1));
+    if (!grown) return 0;
+    g_patch = grown;
+    Patch *p = &g_patch[g_npatch++];
+    memset(p, 0, sizeof *p);
+    snprintf(p->mod, sizeof p->mod, "%s", mod);
+    snprintf(p->file, sizeof p->file, "%s", file);
+    p->w = *w;
+    p->ok = ok;
+    snprintf(p->note, sizeof p->note, "%s", note ? note : "");
+    return 1;
+}
+
+// The patch files of the mods that are on, for main's build (head: main's NSO header). They go to g_patch.
+static void collect_patches(const uint8_t head[0x60]) {
+    char bid[65];
+    for (int i = 0; i < 32; i++) snprintf(bid + 2 * i, 3, "%02X", head[0x40 + i]);
+    ModInfo mods[MODS_MAX];
+    int nm = mods_list(mods, MODS_MAX);
+    for (int k = 0; k < nm; k++) {
+        if (!mods[k].on) continue;
+        char dirs[8][1200];
+        int nd = mods_exefs_dirs(mods[k].name, dirs, 8);
+        for (int d = 0; d < nd; d++) {
+            DIR *dir = opendir(dirs[d]);
+            if (!dir) continue;
+            for (struct dirent *e; (e = readdir(dir));) {
+                if (e->d_name[0] == '.') continue;
+                const char *dot = strrchr(e->d_name, '.');
+                if (!dot) continue;
+                int ips = !strcasecmp(dot, ".ips"), pch = !strcasecmp(dot, ".pchtxt");
+                if (!ips && !pch) continue;
+                char path[1600];
+                snprintf(path, sizeof path, "%s/%s", dirs[d], e->d_name);
+                ExefsWrites w = {0};
+                char err[200] = "";
+                int r = -1;
+                if (ips) {
+                    size_t stem = (size_t)(dot - e->d_name);
+                    char name[96];
+                    if (stem >= sizeof name) continue;
+                    memcpy(name, e->d_name, stem);
+                    name[stem] = 0;
+                    if (!exefs_bid_match(name, bid)) continue;   // another build's file
+                    size_t n = 0;
+                    uint8_t *raw = read_bytes(path, &n);
+                    if (!raw) {
+                        snprintf(err, sizeof err, "%s", "cannot read the file");
+                    } else {
+                        r = exefs_parse_ips(raw, n, &w, err, sizeof err);
+                        free(raw);
+                    }
+                } else {
+                    char *text = read_text(path);
+                    if (!text) continue;
+                    char pbid[80] = "";
+                    r = exefs_parse_pchtxt(text, pbid, sizeof pbid, &w, err, sizeof err);
+                    free(text);
+                    if (!exefs_bid_match(pbid, bid)) {   // another build's file (or none)
+                        exefs_writes_free(&w);
+                        continue;
+                    }
+                }
+                if (!add_patch(mods[k].name, e->d_name, &w, r == 0, r == 0 ? "" : err)) exefs_writes_free(&w);
+            }
+            closedir(dir);
+        }
+    }
+    LOG("[exefs] %d patch files of the mods for this build\n", g_npatch);
+}
+
+// Each patch file checked against main (g_lock held; main is loaded, the code not rewritten yet).
+static void check_patches(void) {
+    uint64_t b = main_base(), size = main_size();
+    for (int i = 0; i < g_npatch; i++) {
+        Patch *p = &g_patch[i];
+        if (!p->ok) {
+            LOG("[exefs] %s/%s is not applied: %s\n", p->mod, p->file, p->note);
+            continue;
+        }
+        char note[200] = "";
+        const char *why = NULL;
+        if (!native_wanted()) {
+            why = "the game's code runs recompiled here (LARECOMP_NATIVE=0): patches need the native code";
+        } else if (!b || !g_code_limit) {
+            why = "main is not loaded";
+        } else {
+            CheatStore *st = (CheatStore *)calloc((size_t)p->w.n + 1, sizeof *st);   // (the file's runs, for branch_into_cave)
+            if (!st) why = "out of memory";
+            for (int r = 0; r < p->w.n && !why; r++) {
+                ExefsRun *run = &p->w.runs[r];
+                st[r].off = run->off;
+                st[r].width = (int)run->len;
+                if (run->len == 0) continue;
+                if (run->off + run->len > size) {
+                    why = "a write outside main's image";
+                } else if (run->off + run->len > g_code_limit) {
+                    snprintf(note, sizeof note, "a write into main's data at main+%llx (only code patches run here)",
+                             (unsigned long long)run->off);
+                    why = note;
+                } else if (run->off % 4 || run->len % 4) {
+                    why = "a write that is not whole instructions";
+                } else {
+                    for (uint32_t q = 0; q < run->len && !why; q += 4) {
+                        uint64_t a = b + run->off + q;
+                        uint32_t cur = *(const uint32_t *)(uintptr_t)a, want;
+                        memcpy(&want, run->bytes + q, 4);
+                        if (native_site_reserved(a, cur) || native_site_reserved(a, want)) why = "the port changes this instruction itself";
+                        else if (branch_into_cave(b, run->off + q, want, st, p->w.n, note, sizeof note)) why = note;
+                    }
+                }
+            }
+            free(st);
+        }
+        if (why) {
+            p->ok = 0;
+            snprintf(p->note, sizeof p->note, "%s", why);
+            LOG("[exefs] %s/%s is not applied: %s\n", p->mod, p->file, why);
+        } else {
+            LOG("[exefs] %s/%s checked: applies at the native start\n", p->mod, p->file);
+        }
+    }
+}
+
 // ---- the interface
 
 // the Mods page's list (the game not running) reads the default folder: the data root's, where the game is set up
@@ -458,10 +633,14 @@ void cheats_boot(const char *exefs) {
     memset(g_statics, 0, sizeof g_statics);
     g_frames = 0;
     scan(g_exefs);
+    patches_free();
+    uint8_t head[0x60];
+    if (read_main_header(g_exefs, head)) collect_patches(head);
     pthread_mutex_lock(&g_lock);
     g_code_ok = 0;
     g_undo_n = 0;
     check_code_sites();
+    check_patches();
     g_vm = vm_wanted();
     pthread_mutex_unlock(&g_lock);
     g_running = 1;
@@ -500,6 +679,51 @@ void cheats_native_ready(void) {
                 pages++;
             }
         }
+    }
+    // the ExeFS patches that apply: their pages made writable, their bytes written (never put back), then the cheats
+    for (int i = 0; i < g_npatch && b; i++) {
+        Patch *p = &g_patch[i];
+        if (!p->ok) continue;
+        int bad = 0;
+        for (int r = 0; r < p->w.n && !bad; r++) {
+            ExefsRun *run = &p->w.runs[r];
+            if (!run->len) continue;
+            uint64_t first = run->off >> 12, last = (run->off + run->len - 1) >> 12;
+            for (uint64_t pg = first; pg <= last && !bad; pg++) {
+                if (pg >= (uint64_t)CODE_PAGES) {
+                    bad = 1;
+                    break;
+                }
+                if (g_code_pages[pg >> 3] & (1u << (pg & 7))) continue;
+                if (mprotect((void *)(uintptr_t)(b + (pg << 12)), 4096, PROT_READ | PROT_WRITE | PROT_EXEC)) {
+                    LOG("[exefs] the game's code page %llx can't be made writable (errno %d)\n",
+                        (unsigned long long)(b + (pg << 12)), errno);
+                    bad = 1;
+                    break;
+                }
+                g_code_pages[pg >> 3] |= (uint8_t)(1u << (pg & 7));
+                pages++;
+            }
+        }
+        if (bad) {
+            p->ok = 0;
+            snprintf(p->note, sizeof p->note, "%s", "the game's code can't be written here");
+            LOG("[exefs] %s/%s is not applied: %s\n", p->mod, p->file, p->note);
+            continue;
+        }
+        int writes = 0;
+        uint64_t total = 0;
+        for (int r = 0; r < p->w.n; r++) {
+            ExefsRun *run = &p->w.runs[r];
+            if (!run->len) continue;
+            uint8_t *dst = (uint8_t *)(uintptr_t)(b + run->off);
+            memcpy(dst, run->bytes, run->len);
+            __builtin___clear_cache((char *)dst, (char *)dst + run->len);
+            writes++;
+            total += run->len;
+        }
+        LOG("[exefs] %s/%s applied: %d writes, %llu bytes of main's code\n", p->mod, p->file, writes,
+            (unsigned long long)total);
     }
     if (failed) {
         for (int i = 0; i < g_count; i++) {
