@@ -21,7 +21,16 @@
 #include "../../hle.h"
 #include "../../kernel.h"
 #include "shaders.h"
+#include "shader_meta_cache.h"
 #include "vk.h"
+#if defined(__has_include)
+#if __has_include("mw_translator_id.h")
+#include "mw_translator_id.h"  // (MW_TRANSLATOR_ID: the build's translator sources, android/.../cpp/mw_translator_id.cmake)
+#endif
+#endif
+#ifndef MW_TRANSLATOR_ID
+#define MW_TRANSLATOR_ID __DATE__ " " __TIME__  // (no cmake id: this file's build)
+#endif
 #include "vk_fpenv.h"
 #include "buffer_copy.h"
 #include "job_queue.h"
@@ -68,6 +77,8 @@ uint64_t prof_up_cum;  // (the same, never reset)
 #define PROF_T0() uint64_t prof_t0_ = prof ? SDL_GetTicksNS() : 0
 #define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
 static _Atomic int stat_compiles;
+static _Atomic uint64_t stat_meta_hits, stat_meta_misses;  // (.smeta: programs taken from it / translated with it on; renderer_stats; BOTWRecomp b4e80e7)
+static _Atomic uint64_t stat_meta_hits_all, stat_meta_misses_all;
 static _Atomic int live_programs, live_gpipes, live_cpipes;  // (made so far: the memory mappings log, vk_live_counts)
 static void pipe_evict(void);  // (graphics pipelines: below)
 static void prog_evict(void);  // (their programs: below)
@@ -2095,6 +2106,17 @@ const char *renderer_stats(void) {
              (unsigned long long)stat_pipe_binds, (unsigned long long)stat_set_binds);
     stat_feedback_copies = stat_feedback_reads = stat_inplace_breaks = stat_upload_bytes = stat_build_wait_ns = stat_pipe_binds = stat_set_binds = 0;
     up_log();
+    {   // (BOTWRecomp b4e80e7) programs built from the .smeta cache (no translation, no shaderc) and those translated, this interval / since the start
+        uint64_t mh = atomic_exchange_explicit(&stat_meta_hits, 0, memory_order_relaxed);
+        uint64_t mm = atomic_exchange_explicit(&stat_meta_misses, 0, memory_order_relaxed);
+        if (mh || mm) {
+            atomic_fetch_add_explicit(&stat_meta_hits_all, mh, memory_order_relaxed);
+            atomic_fetch_add_explicit(&stat_meta_misses_all, mm, memory_order_relaxed);
+            LOG("[vk] shader-meta: %llu from .smeta / %llu translated (total %llu / %llu)\n", (unsigned long long)mh, (unsigned long long)mm,
+                (unsigned long long)atomic_load_explicit(&stat_meta_hits_all, memory_order_relaxed),
+                (unsigned long long)atomic_load_explicit(&stat_meta_misses_all, memory_order_relaxed));
+        }
+    }
     if (getenv("LARECOMP_LOG_CBUF_BYTES")) {
         LOG("[cbuf] fixed %llu x %.1f KB, dynamic %llu x %.1f KB; copied %.1f MB; in place, patched %llu\n",
             (unsigned long long)stat_cb_n[0], stat_cb_n[0] ? stat_cb_bytes[0] / 1024.0 / stat_cb_n[0] : 0,
@@ -3366,8 +3388,11 @@ typedef struct {
                            // ShaderInfo it sits 1.4 KB in, past the 64 textures - a cache miss each draw, ~7% of the
                            // render thread on the POCO F7 Ultra: draw_writes)
     uint8_t fs_gather;  // (up_fix) the fragment stage's first gathered texture: 0 not looked yet, 1 none, 2 + its slot
+                        // (set when the program is made: from the GLSL, or from its .smeta file - which has no GLSL)
     _Atomic int state;  // 0 building, 1 ready, 2 failed
     _Atomic int urgent; // 1: a draw waits on this program (its jobs go to the head of the queues; BOTWRecomp e8fac0f)
+    uint64_t meta_h1[2], meta_h2[2];  // (.smeta keys of its stages: vertex, fragment; BOTWRecomp b4e80e7)
+    bool meta_key_ok[2];
     uint8_t evict;      // (prog_evict, vk_exec_reset) 1: to be freed, 2: kept - a pipeline of its still building
     uint32_t used_s;    // when a draw last used it (g_exec_s), and that submission (prog_evict)
     uint64_t used_seq;
@@ -3434,13 +3459,12 @@ static void subst_glsl(ShaderInfo *si, uint64_t addr, const char *suffix) {
 }
 #endif
 
-static void compile_program(void *arg) {
-    Prog *p = arg;
-    if (atomic_load_explicit(&jobs_abort, memory_order_acquire)) { signal_build_done(&p->state, 2); return; }  // (jobs_drain)
-    size_t nv = 0, nf = 0;
-    uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
-    uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
-    if (!sv || !sf) { free(sv); free(sf); signal_build_done(&p->state, 2); return; }
+static bool meta_cache_on(void);  // (.smeta: below)
+
+// The program from its two SPIR-V modules (taken over): reflection, shader modules, layout. From compile_program (shaderc /
+// the .spv cache after a translation) or from prog_fast_or_translate (from_meta: no translation at all; BOTWRecomp b4e80e7)
+static void compile_program_from_spirv(Prog *p, uint32_t *sv, size_t nv, uint32_t *sf, size_t nf, bool from_meta) {
+    if (!sv || !sf || atomic_load_explicit(&jobs_abort, memory_order_acquire)) { free(sv); free(sf); signal_build_done(&p->state, 2); return; }
     p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
     p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
     p->vs = vk_module(sv, nv);
@@ -3477,7 +3501,24 @@ static void compile_program(void *arg) {
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
     atomic_fetch_add(&stat_compiles, 1);
     atomic_fetch_add(&live_programs, 1);
+    if (from_meta) atomic_fetch_add_explicit(&stat_meta_hits, 1, memory_order_relaxed);
     signal_build_done(&p->state, p->vs && p->fs ? 1 : 2);
+}
+
+static void compile_program(void *arg) {
+    Prog *p = arg;
+    if (atomic_load_explicit(&jobs_abort, memory_order_acquire)) { signal_build_done(&p->state, 2); return; }  // (jobs_drain)
+    size_t nv = 0, nf = 0;
+    uint64_t vs_h = 0, fs_h = 0;
+    uint32_t *sv = vk_glsl_to_spirv_ex(p->vi->msl, STAGE_VERTEX, "vs", &nv, &vs_h);
+    uint32_t *sf = sv ? vk_glsl_to_spirv_ex(p->fi->msl, STAGE_FRAGMENT, "fs", &nf, &fs_h) : NULL;
+    if (sv && sf && vs_h && fs_h && !atomic_load_explicit(&jobs_abort, memory_order_acquire) && meta_cache_on()) {
+        // (BOTWRecomp b4e80e7) the stages' metadata beside their SPIR-V: the next run skips the translation (keys: translate_program)
+        vk_shader_cache_ensure_dirs();
+        if (p->meta_key_ok[0]) mw_meta_store("cache/spirv", p->meta_h1[0], p->meta_h2[0], STAGE_VERTEX, p->vi, vs_h, nv, p->vs_uses_vid, 1);
+        if (p->meta_key_ok[1]) mw_meta_store("cache/spirv", p->meta_h1[1], p->meta_h2[1], STAGE_FRAGMENT, p->fi, fs_h, nf, false, p->fs_gather);
+    }
+    compile_program_from_spirv(p, sv, nv, sf, nf, false);
 }
 
 #ifdef __ANDROID__
@@ -3514,6 +3555,88 @@ static bool qcom_no_switch(void) {
 static bool cbwin_wanted(void);  // (below gmem_placed)
 #endif
 
+#ifdef __ANDROID__
+// (BOTWRecomp b4e80e7) The translator's switches for one translation, gathered in one place: translate_program applies
+// them to the maxwell_* globals and the .smeta keys hash them, so what a key covers is what the translation used.
+static void trans_cfg_get(MwTransCfg *c) {
+    memset(c, 0, sizeof *c);
+    uint32_t f = 0, e = 0;
+    if (!g_vk.shader_int64 || g_settings.shader_int32 || getenv("LARECOMP_VK_INT32") != NULL) f |= MW_TF_NO_INT64;
+    if (gcopy_mode || gwin_mode) f |= MW_TF_GMEM_MAP_ALL;
+    if (gmem_bda != 0) f |= MW_TF_GMEM_BDA;
+    if (gcopy_mode && !getenv("LARECOMP_NO_GMISS")) f |= MW_TF_GMEM_MISS_LOG;
+    if (!getenv("LARECOMP_BRX_ALL_LABELS")) f |= MW_TF_BRX_WINDOW;
+    if (!getenv("LARECOMP_DYN_STACKS")) f |= MW_TF_STATIC_STACKS;
+    if (structure_on()) f |= MW_TF_STRUCTURED;
+    if (!getenv("LARECOMP_NO_STRUCT_SKIPS")) f |= MW_TF_STRUCT_SKIPS;
+    if (!getenv("LARECOMP_NO_GFIND_CACHE")) f |= MW_TF_GFIND_CACHE;
+    if (qcom_no_switch()) {
+        f |= MW_TF_NO_SWITCH;
+        if (!getenv("LARECOMP_QCOM_LOCAL")) f |= MW_TF_NO_LOCAL_STRUCT;
+    }
+    if (!getenv("LARECOMP_BITWISE_HALF")) f |= MW_TF_NATIVE_HALF;
+    if (!getenv("LARECOMP_SAFE_MATH")) f |= MW_TF_FAST_MINMAX;
+    if (cbwin_wanted()) f |= MW_TF_CB_WINDOW;
+    if (getenv("LARECOMP_VK_OPT") != NULL) f |= MW_TF_VK_OPT;
+    // (translate.c's own getenv switches)
+    if (getenv("LARECOMP_NO_VS_SNAP")) e |= MW_TE_NO_VS_SNAP;
+    if (getenv("LARECOMP_FS_SNAP")) e |= MW_TE_FS_SNAP;
+    if (getenv("LARECOMP_NO_GATHER_SNAP")) e |= MW_TE_NO_GATHER_SNAP;
+    if (getenv("LARECOMP_NO_GATHER_DREF_ROUND")) e |= MW_TE_NO_GATHER_DREF;
+    if (getenv("LARECOMP_NO_TXD")) e |= MW_TE_NO_TXD;
+    if (getenv("LARECOMP_NO_BANK2")) e |= MW_TE_NO_BANK2;
+    if (getenv("LARECOMP_NO_DISCARD")) e |= MW_TE_NO_DISCARD;
+    c->flags = f;
+    c->env_flags = e;
+    c->subgroup_stages = g_vk.subgroup_stages;
+    c->miss_stages = getenv("LARECOMP_GMISS_STAGES") ? (uint32_t)strtoul(getenv("LARECOMP_GMISS_STAGES"), NULL, 0) : ~0u;  // (a test: which stages log misses - 1 vertex, 2 fragment, 32 compute)
+    c->txd_order = getenv("LARECOMP_TXD_ORDER") ? (uint32_t)atoi(getenv("LARECOMP_TXD_ORDER")) : 0;
+    c->vk_api = g_vk.api ? g_vk.api : VK_API_VERSION_1_3;
+    c->gmem_base = HEAP_BASE;
+    c->gmem_size = HEAP_MAX;
+}
+
+static void trans_cfg_apply(const MwTransCfg *c) {
+    maxwell_gmem_base = c->gmem_base;
+    maxwell_gmem_size = c->gmem_size;
+    maxwell_no_int64 = (c->flags & MW_TF_NO_INT64) != 0;
+    maxwell_subgroup_stages = c->subgroup_stages;
+    maxwell_gmem_map_all = (c->flags & MW_TF_GMEM_MAP_ALL) != 0;
+    maxwell_gmem_bda = (c->flags & MW_TF_GMEM_BDA) != 0;
+    maxwell_gmem_miss_log = (c->flags & MW_TF_GMEM_MISS_LOG) != 0;
+    maxwell_gmem_miss_stages = c->miss_stages;
+    maxwell_brx_window = (c->flags & MW_TF_BRX_WINDOW) != 0;
+    maxwell_static_stacks = (c->flags & MW_TF_STATIC_STACKS) != 0;
+    maxwell_structured = (c->flags & MW_TF_STRUCTURED) != 0;
+    maxwell_struct_skips = (c->flags & MW_TF_STRUCT_SKIPS) != 0;
+    maxwell_gfind_cache = (c->flags & MW_TF_GFIND_CACHE) != 0;
+    maxwell_no_switch = (c->flags & MW_TF_NO_SWITCH) != 0;
+    maxwell_no_local_struct = (c->flags & MW_TF_NO_LOCAL_STRUCT) != 0;
+    maxwell_native_half = (c->flags & MW_TF_NATIVE_HALF) != 0;
+    maxwell_fast_minmax = (c->flags & MW_TF_FAST_MINMAX) != 0;
+    maxwell_cb_window = (c->flags & MW_TF_CB_WINDOW) != 0;
+}
+#endif
+
+// Persist the translation's metadata (.smeta, shader_meta_cache.h) beside the SPIR-V: a warm run skips maxwell_translate
+// and shaderc. LARECOMP_NO_SMETA=1: off. Off too where the GLSL text is itself wanted or edited (LARECOMP_SAVE_MSL,
+// LARECOMP_DUMP_FS, LARECOMP_SHADER_SUBST), without the SPIR-V cache and with the translator's debug captures.
+static bool meta_cache_on(void) {
+#ifdef __ANDROID__
+    static _Atomic int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) {
+        const char *off = getenv("LARECOMP_NO_SMETA");
+        v = !(off && atoi(off) != 0) && !getenv("LARECOMP_VK_NO_SPIRV_CACHE") && !getenv("LARECOMP_SAVE_MSL") &&
+            !getenv("LARECOMP_DUMP_FS") && !getenv("LARECOMP_SHADER_SUBST");
+        atomic_store_explicit(&on, v, memory_order_relaxed);
+    }
+    return v && !maxwell_dbg_code && !maxwell_dbg_vs;
+#else
+    return false;
+#endif
+}
+
 static void translate_program(void *arg) {
     Prog *p = arg;
     if (atomic_load_explicit(&jobs_abort, memory_order_acquire)) { signal_build_done(&p->state, 2); return; }  // (jobs_drain)
@@ -3521,23 +3644,9 @@ static void translate_program(void *arg) {
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
 #ifdef __ANDROID__
-    maxwell_no_int64 = !g_vk.shader_int64 || g_settings.shader_int32 || getenv("LARECOMP_VK_INT32") != NULL;
-    maxwell_subgroup_stages = g_vk.subgroup_stages;
-    maxwell_gmem_map_all = gcopy_mode || gwin_mode;
-    maxwell_gmem_bda = gmem_bda != 0;
-    maxwell_gmem_miss_log = gcopy_mode && !getenv("LARECOMP_NO_GMISS");
-    if (getenv("LARECOMP_GMISS_STAGES"))  // (a test: which stages log misses - 1 vertex, 2 fragment, 32 compute)
-        maxwell_gmem_miss_stages = (unsigned)strtoul(getenv("LARECOMP_GMISS_STAGES"), NULL, 0);
-    maxwell_brx_window = !getenv("LARECOMP_BRX_ALL_LABELS");
-    maxwell_static_stacks = !getenv("LARECOMP_DYN_STACKS");
-    maxwell_structured = structure_on();
-    maxwell_struct_skips = !getenv("LARECOMP_NO_STRUCT_SKIPS");
-    maxwell_gfind_cache = !getenv("LARECOMP_NO_GFIND_CACHE");
-    maxwell_no_switch = qcom_no_switch();
-    maxwell_no_local_struct = qcom_no_switch() && !getenv("LARECOMP_QCOM_LOCAL");
-    maxwell_native_half = !getenv("LARECOMP_BITWISE_HALF");
-    maxwell_fast_minmax = !getenv("LARECOMP_SAFE_MATH");
-    maxwell_cb_window = cbwin_wanted();
+    MwTransCfg cfg;
+    trans_cfg_get(&cfg);
+    trans_cfg_apply(&cfg);
 #endif
     p->vi = maxwell_translate_bounded((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], p->const_bytes[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
@@ -3593,8 +3702,81 @@ static void translate_program(void *arg) {
     }
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
+    {   // the fragment stage's first gathered texture now (up_fix; was looked up at the first scaled draw): the .smeta file keeps it, the GLSL isn't there then
+        const char *g = strstr(p->fi->msl, "textureGather(t");
+        int slot = g ? atoi(g + 15) : -1;
+        p->fs_gather = slot >= 0 && slot < p->fi->ntex && slot < 64 ? (uint8_t)(2 + slot) : 1;
+    }
+#ifdef __ANDROID__
+    if (meta_cache_on()) {  // (the keys of what was just translated, by the same switches - cfg - and the shader bytes now)
+        p->meta_key_ok[0] = mw_stage_key((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], p->const_bytes[0], STAGE_VERTEX, &p->vkey,
+                                         &cfg, MW_TRANSLATOR_ID, &p->meta_h1[0], &p->meta_h2[0]);
+        p->meta_key_ok[1] = mw_stage_key((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], p->const_bytes[1], STAGE_FRAGMENT, &p->fkey,
+                                         &cfg, MW_TRANSLATOR_ID, &p->meta_h1[1], &p->meta_h2[1]);
+        atomic_fetch_add_explicit(&stat_meta_misses, 1, memory_order_relaxed);
+    }
+#endif
     run_job_ex(compile_program, p, atomic_load_explicit(&p->urgent, memory_order_relaxed) != 0);
 }
+
+#ifdef __ANDROID__
+// (BOTWRecomp b4e80e7) A warm program: both stages' metadata from their .smeta files and their SPIR-V from the cache, no
+// translation, no shaderc; anything missing, short, corrupt or from another key - translate_program as before. The vertex
+// stage's key is in p->meta_*[0] (get_program); the fragment stage's depends on the varyings the vertex stage writes.
+static void prog_fast_or_translate(void *arg) {
+    Prog *p = arg;
+    if (atomic_load_explicit(&jobs_abort, memory_order_acquire)) { signal_build_done(&p->state, 2); return; }  // (jobs_drain)
+    ShaderInfo *vi = NULL, *fi = NULL;
+    uint32_t *sv = NULL, *sf = NULL;
+    size_t nv = 0, nf = 0, vn = 0, fn = 0;
+    uint64_t vs_h = 0, fs_h = 0;
+    bool vid = false;
+    uint8_t gather = 1;
+    MwTransCfg cfg;
+    trans_cfg_get(&cfg);
+    if (!p->meta_key_ok[0])
+        p->meta_key_ok[0] = mw_stage_key((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], p->const_bytes[0], STAGE_VERTEX, &p->vkey,
+                                         &cfg, MW_TRANSLATOR_ID, &p->meta_h1[0], &p->meta_h2[0]);
+    if (p->meta_key_ok[0]) vi = mw_meta_load("cache/spirv", p->meta_h1[0], p->meta_h2[0], STAGE_VERTEX, &vs_h, &vn, &vid, NULL);
+    if (vi) {
+        ShaderKey fkey = p->fkey;
+        fkey.vs_out_mask = vi->out_mask;
+        if (mw_stage_key((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], p->const_bytes[1], STAGE_FRAGMENT, &fkey, &cfg,
+                         MW_TRANSLATOR_ID, &p->meta_h1[1], &p->meta_h2[1])) {
+            p->meta_key_ok[1] = true;
+            fi = mw_meta_load("cache/spirv", p->meta_h1[1], p->meta_h2[1], STAGE_FRAGMENT, &fs_h, &fn, NULL, &gather);
+        }
+    }
+    if (vi && fi) {
+        sv = vk_spirv_load_cached(vs_h, &nv);
+        sf = sv ? vk_spirv_load_cached(fs_h, &nf) : NULL;
+        if (sv && sf && nv == vn && nf == fn) {
+            if (atomic_load_explicit(&jobs_abort, memory_order_acquire)) {
+                free(sv); free(sf); maxwell_free(vi); maxwell_free(fi);
+                signal_build_done(&p->state, 2);
+                return;
+            }
+            p->vi = vi;
+            p->fi = fi;
+            p->fkey.vs_out_mask = vi->out_mask;
+            p->fs_out_mask = fi->out_mask;
+            p->vs_uses_vid = vid;
+            p->fs_gather = gather;
+            if (vi->writes_layer) {  // (as translate_program)
+                static int n;
+                if (n++ < 20) LOG("[shader] vertex shader %llx writes the layer / viewport index: dropped\n", (unsigned long long)p->code[0]);
+            }
+            compile_program_from_spirv(p, sv, nv, sf, nf, true);
+            return;
+        }
+    }
+    free(sv);
+    free(sf);
+    maxwell_free(vi);
+    maxwell_free(fi);
+    run_translate_ex(translate_program, p, atomic_load_explicit(&p->urgent, memory_order_relaxed) != 0);
+}
+#endif
 
 // Growable (object_cache.h, from BOTWRecomp 848e08c): the fixed 4096-entry table's probe never ended once full.
 static VkObjectCache prog_cache;
@@ -3646,6 +3828,18 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey, bool 
     }
     p->vkey = *vkey;
     p->fkey = *fkey;
+#ifdef __ANDROID__
+    if (meta_cache_on()) {  // (a .smeta file for its vertex stage: a build job, not the translator's queue - the fast path, or the translation after it)
+        MwTransCfg cfg;
+        trans_cfg_get(&cfg);
+        p->meta_key_ok[0] = mw_stage_key((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], p->const_bytes[0], STAGE_VERTEX, &p->vkey,
+                                         &cfg, MW_TRANSLATOR_ID, &p->meta_h1[0], &p->meta_h2[0]);
+        if (p->meta_key_ok[0] && mw_meta_exists("cache/spirv", p->meta_h1[0])) {
+            run_job_ex(prog_fast_or_translate, p, urgent);
+            return p;
+        }
+    }
+#endif
     run_translate_ex(translate_program, p, urgent);
     return p;
 }
