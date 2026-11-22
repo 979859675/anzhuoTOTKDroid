@@ -586,12 +586,15 @@ static void check_patches(void) {
         } else if (!b || !g_code_limit) {
             why = "main is not loaded";
         } else {
-            CheatStore *st = (CheatStore *)calloc((size_t)p->w.n + 1, sizeof *st);   // (the file's runs, for branch_into_cave)
+            // the file's runs, all of them first: a branch may go to a cave the file writes later in its order
+            CheatStore *st = (CheatStore *)calloc((size_t)p->w.n + 1, sizeof *st);
             if (!st) why = "out of memory";
+            for (int r = 0; !why && r < p->w.n; r++) {
+                st[r].off = p->w.runs[r].off;
+                st[r].width = (int)p->w.runs[r].len;
+            }
             for (int r = 0; r < p->w.n && !why; r++) {
                 ExefsRun *run = &p->w.runs[r];
-                st[r].off = run->off;
-                st[r].width = (int)run->len;
                 if (run->len == 0) continue;
                 if (run->off + run->len > size) {
                     why = "a write outside main's image";
