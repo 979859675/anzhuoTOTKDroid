@@ -9,6 +9,7 @@
 #include "../framepace.h"
 #include "../platform.h"
 #include "nvn.h"
+#include "vulkan/watchdog.h"
 #include "vulkan/writeback_policy.h"
 
 void renderer_sync(void);
@@ -294,6 +295,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
         KThread *kt = kernel_current_thread();
         if (kt) g_sync_tid = kt->id;
     }
+    WdMark wd_mark = vk_wd_enter(WD_G_SYNCWAIT, sync_of(A(0))->lseq);  // (freeze watchdog: the waits inside show on top of it; from BOTWRecomp 3f9d546)
     kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
     if (vk_async_on()) {  // the render thread's translation of the fence first (vulkan/async.c)
         if (flush || whole) vk_async_drain();
@@ -442,6 +444,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     else renderer_wait_seq(sync_of(A(0))->seq);  // only the submission that holds this fence
 #ifdef __ANDROID__
     kernel_blocking_end();
+    vk_wd_leave(wd_mark);
     vk_tl("game: SyncWait end", sync_of(A(0))->lseq, sync_of(A(0))->seq);
     // LARECOMP_LOG_SYNC: waits over a millisecond in the world (frame 1500 on, 40 of them) - how old the fence was,
     // the waits for its translation and its GPU work
@@ -2058,6 +2061,8 @@ bool fs_save_pending(void);
 static pthread_mutex_t bg_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t bg_cv = PTHREAD_COND_INITIALIZER;
 static bool bg_paused;  // (bg_m)
+// (vulkan/watchdog.c: a game stopped in the background is not a freeze; no lock, the waiting thread holds bg_m)
+bool nvn_background_paused(void) { return __atomic_load_n(&bg_paused, __ATOMIC_RELAXED); }
 void nvn_background(bool on) {
     static int enabled = -1;
     if (enabled < 0) enabled = !getenv("LARECOMP_BG_PAUSE") || atoi(getenv("LARECOMP_BG_PAUSE"));

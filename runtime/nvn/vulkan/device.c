@@ -450,13 +450,12 @@ static void pick_device(void) {
 
 static bool g_fault_ext;
 // After VK_ERROR_DEVICE_LOST: what the driver says faulted (VK_EXT_device_fault), into the log.
-void vk_device_fault_report(void) {
-    static int once;
-    if (once++ || !g_fault_ext) return;
+static void fault_dump(void) {
     PFN_vkGetDeviceFaultInfoEXT get = (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(g_vk.dev, "vkGetDeviceFaultInfoEXT");
     if (!get) return;
     VkDeviceFaultCountsEXT c = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
-    if (get(g_vk.dev, &c, NULL) != VK_SUCCESS) { LOG("[vk] device fault: no info\n"); return; }
+    VkResult fr = get(g_vk.dev, &c, NULL);
+    if (fr != VK_SUCCESS) { LOG("[vk] device fault: no info (%d)\n", fr); return; }
     VkDeviceFaultAddressInfoEXT addr[16];
     VkDeviceFaultVendorInfoEXT vend[16];
     if (c.addressInfoCount > 16) c.addressInfoCount = 16;
@@ -473,6 +472,20 @@ void vk_device_fault_report(void) {
         LOG("[vk]   vendor: %s (code %#llx data %#llx)\n", vend[i].description, (unsigned long long)vend[i].vendorFaultCode,
             (unsigned long long)vend[i].vendorFaultData);
 }
+void vk_device_fault_report(void) {
+    static int once;
+    if (once++ || !g_fault_ext) return;
+    fault_dump();
+}
+#ifdef __ANDROID__
+// The same on demand, for the freeze watchdog (watchdog.c) after a long stall: a driver that has lost the device without
+// telling the caller (no VK_ERROR_DEVICE_LOST yet) may still have a fault to report. Its helper thread calls this
+// (from BOTWRecomp 3f9d546).
+void vk_device_fault_probe(void) {
+    if (!g_fault_ext) { LOG("[watchdog] VK_EXT_device_fault is not enabled\n"); return; }
+    fault_dump();
+}
+#endif
 
 static void create_device(void) {
     uint32_t ne = 0;
@@ -1123,8 +1136,14 @@ static void create_swapchain(void) {
 }
 
 static void recreate_swapchain(void) {
+#ifdef __ANDROID__
+    WdMark wd_mark = vk_wd_enter(WD_R_SWAPCHAIN, 0);  // (freeze watchdog: vkDeviceWaitIdle waits for all the GPU's work)
+#endif
     vkDeviceWaitIdle(g_vk.dev);
     create_swapchain();
+#ifdef __ANDROID__
+    vk_wd_leave(wd_mark);
+#endif
 }
 
 #ifdef __ANDROID__
@@ -1189,6 +1208,7 @@ static bool android_surface_ready(void) {  // false: no window to draw into now
     if (!aw) { surface_lost = true; return false; }
     android_frame_rate(aw);
     if (aw == surface_aw && !surface_lost) return true;
+    WdMark wd_mark = vk_wd_enter(WD_R_SWAPCHAIN, 1);  // (freeze watchdog)
     vkDeviceWaitIdle(g_vk.dev);
     for (uint32_t i = 0; i < g_vk.sc_count; i++) vk_rp_forget_view(g_vk.sc_views[i]), vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
     g_vk.sc_count = 0;
@@ -1199,6 +1219,7 @@ static bool android_surface_ready(void) {  // false: no window to draw into now
     surface_lost = false;
     LOG("[vk] window surface made again (the app came back from the background)\n");
     create_swapchain();
+    vk_wd_leave(wd_mark);
     return g_vk.swapchain != VK_NULL_HANDLE;
 }
 #endif
@@ -1262,7 +1283,13 @@ bool vk_frame_begin(const float clear[4]) {
     // until the app went to the background (the surface's loss ends the wait) - TOTK froze until another window came
     // in front and back (2026-10-25). Then the swapchain is made again, as that trip does; still none: no frame now.
     const uint64_t acquire_ns = 1000000000ull;
+#ifdef __ANDROID__
+    WdMark wd_mark = vk_wd_enter(WD_R_ACQUIRE, 0);  // (freeze watchdog)
+#endif
     VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, acquire_ns, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+#ifdef __ANDROID__
+    vk_wd_leave(wd_mark);
+#endif
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {
         static int nstuck;
         if (nstuck++ < 20) LOG("[vk] no window image within 1 s (%d): the swapchain made again\n", r);
@@ -1271,7 +1298,13 @@ bool vk_frame_begin(const float clear[4]) {
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
         if (!g_vk.swapchain) return false;
+#ifdef __ANDROID__
+        wd_mark = vk_wd_enter(WD_R_ACQUIRE, 1);
+#endif
         r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, acquire_ns, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+#ifdef __ANDROID__
+        vk_wd_leave(wd_mark);
+#endif
         if (r == VK_TIMEOUT || r == VK_NOT_READY) { LOG("[vk] still no window image: frame skipped\n"); return false; }
     }
 #ifdef __ANDROID__
@@ -1356,7 +1389,13 @@ void vk_frame_end(const char *shot_path) {
 #ifdef __ANDROID__
     uint64_t trace_start = vk_timing_trace_on() ? SDL_GetTicksNS() : 0;
 #endif
+#ifdef __ANDROID__
+    WdMark wd_mark = vk_wd_enter(WD_R_QUEUE_PRESENT, seq);  // (freeze watchdog)
+#endif
     VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
+#ifdef __ANDROID__
+    vk_wd_leave(wd_mark);
+#endif
     if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) g_presented_images++;
 #ifdef __ANDROID__
     if (trace_start) vk_timing_trace_wait(VK_TIMING_PRESENT, SDL_GetTicksNS() - trace_start);
@@ -1409,6 +1448,12 @@ void vk_async_drain(void);
 uint64_t renderer_present_count(void) { return vk_async_on() && !vk_async_is_render_thread() ? g_game_frames : total_frames; }
 #else
 uint64_t renderer_present_count(void) { return total_frames; }
+#endif
+#ifdef __ANDROID__
+// For the freeze watchdog (watchdog.c): the render thread's and the game's counts of presents, plain reads
+// (from BOTWRecomp 3f9d546)
+uint64_t vk_wd_frames_done(void) { return __atomic_load_n(&total_frames, __ATOMIC_RELAXED); }
+uint64_t vk_wd_frames_asked(void) { return __atomic_load_n(&g_game_frames, __ATOMIC_RELAXED); }
 #endif
 uint64_t vk_frame_counter(void) { return g_frame_counter; }
 static float g_shot_crop[4] = {0, 0, 1, 1};
@@ -2118,6 +2163,9 @@ void ui_window_init(void) {
     create_swapchain();
     vk_exec_init();
     vk_shaders_init();
+#ifdef __ANDROID__
+    vk_watchdog_start();  // (watchdog.c: says where the game stops, if it does - from BOTWRecomp 3f9d546)
+#endif
 }
 
 SDL_Window *ui_window(void) { return window; }

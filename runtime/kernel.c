@@ -508,6 +508,73 @@ void kernel_blocking_end(void) {
     if (blocking_t0) g_blocked_ns += plat_now_ns() - blocking_t0;
     blocking_t0 = 0;
 }
+
+// ---- for the freeze watchdog (vulkan/watchdog.c): who has core 0, and where it is (from BOTWRecomp 1a6b7f5).
+// A thread holding core 0 in no SVC and no marked host wait may spin in the game's code or sit in an unmarked host call,
+// so the watchdog asks: SIGUSR2 to the holder, whose handler keeps where it was (pc, lr, frame-pointer chain), read
+// back by the watchdog. Async-signal-safe: plain stores into a static record. No lock on the watchdog's side (racy
+// reads: a stale value is only a worse diagnostic).
+#include <signal.h>
+#include <ucontext.h>
+#define C0_FRAMES 16
+static struct { volatile uint64_t seq; uint64_t pc, lr, sp, fp, frames[C0_FRAMES]; int nframes; } c0_where;
+static void c0_where_handler(int sig, siginfo_t *si, void *ctx) {
+    (void)sig, (void)si;
+    ucontext_t *uc = ctx;
+    uint64_t sp = uc->uc_mcontext.sp, fp = uc->uc_mcontext.regs[29];
+    c0_where.pc = uc->uc_mcontext.pc, c0_where.lr = uc->uc_mcontext.regs[30], c0_where.sp = sp, c0_where.fp = fp;
+    int n = 0;
+    // (the frame-pointer chain: [fp] = caller's fp, [fp+8] = return address; only inside this stack, upwards)
+    for (uint64_t f = fp; n < C0_FRAMES && f >= sp && f < sp + (8u << 20) && !(f & 7); n++) {
+        uint64_t next = ((const uint64_t *)(uintptr_t)f)[0], ret = ((const uint64_t *)(uintptr_t)f)[1];
+        c0_where.frames[n] = ret;
+        if (next <= f) { n++; break; }
+        f = next;
+    }
+    c0_where.nframes = n;
+    __atomic_add_fetch(&c0_where.seq, 1, __ATOMIC_RELEASE);
+}
+
+// Core 0's holder (id, for how long) and the threads queued for it; false when nobody holds it.
+bool kernel_core0_info(uint64_t *id, uint64_t *held_ns, uint64_t *waiters, int max, int *nwaiters) {
+    KThread *h = c0_holder;
+    *nwaiters = 0;
+    for (KThread *w = c0_head; w && *nwaiters < max; w = w->core0_next) waiters[(*nwaiters)++] = w->id;
+    if (!h) return false;
+    *id = h->id;
+    uint64_t since = c0_since, now = plat_now_ns();
+    *held_ns = now > since ? now - since : 0;
+    return true;
+}
+
+// Where core 0's holder is right now (its host registers and frames); false if there is none or it didn't answer
+// within ~200 ms (a thread stuck in the kernel with signals blocked).
+bool kernel_core0_where(uint64_t *pc, uint64_t *lr, uint64_t *frames, int max, int *nframes) {
+    static bool installed;
+    if (!installed) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = c0_where_handler;
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(SIGUSR2, &sa, NULL)) return false;
+        installed = true;
+    }
+    KThread *h = c0_holder;
+    if (!h) return false;
+    uint64_t before = __atomic_load_n(&c0_where.seq, __ATOMIC_ACQUIRE);
+    if (pthread_kill(h->host, SIGUSR2)) return false;
+    for (int i = 0; i < 40 && __atomic_load_n(&c0_where.seq, __ATOMIC_ACQUIRE) == before; i++) {
+        struct timespec ts = {0, 5000000};
+        nanosleep(&ts, NULL);
+    }
+    if (__atomic_load_n(&c0_where.seq, __ATOMIC_ACQUIRE) == before) return false;
+    *pc = c0_where.pc, *lr = c0_where.lr;
+    int n = c0_where.nframes < max ? c0_where.nframes : max;
+    for (int i = 0; i < n; i++) frames[i] = c0_where.frames[i];
+    *nframes = n;
+    return true;
+}
 #endif
 
 #ifdef __ANDROID__
@@ -975,27 +1042,40 @@ static int prof_svc = -1;
 
 static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc);
 
-// LARECOMP_WATCHDOG=<seconds>: every that many seconds, the game's threads stuck in one svc for longer, with its
-// arguments and caller, and where each of the others is (its guest lr) - for hangs.
+// The game's threads: those in one svc for longer than svc_ns, with its arguments, caller and what they wait on, and
+// where each of the others is (its guest lr; core 0's holder on Android). No lock (a stuck thread may hold g_klock):
+// the list only grows during a boot. Also from the freeze watchdog (vulkan/watchdog.c), once no frame finishes
+// (from BOTWRecomp f5d7acf).
+void kernel_log_threads(uint64_t svc_ns) {
+    uint64_t now = plat_now_ns();
+    LOG("[watchdog] threads:\n");
+    for (KThread *t = g_threads; t; t = t->anext) {
+        if (t->finished) continue;
+        uint32_t n = t->svc_now;
+#ifdef __ANDROID__
+        const char *c0 = t->core0_held ? ", holds core 0" : "";
+#else
+        const char *c0 = "";
+#endif
+        if (n && now - t->svc_since > svc_ns)
+            LOG("[watchdog]  t%llu prio %d core %d: svc %02x for %.1f s (%llx, %llx, %llx, %llx) from %llx; wait kind %d addr %llx%s\n",
+                (unsigned long long)t->id, t->prio, __atomic_load_n(&t->core, __ATOMIC_RELAXED), n - 1,
+                (now - t->svc_since) / 1e9, (unsigned long long)t->svc_args[0], (unsigned long long)t->svc_args[1],
+                (unsigned long long)t->svc_args[2], (unsigned long long)t->svc_args[3],
+                (unsigned long long)t->svc_lr, (int)t->wait_kind, (unsigned long long)t->wait_addr, c0);
+        else
+            LOG("[watchdog]  t%llu prio %d core %d: running%s, pc %llx lr %llx%s\n", (unsigned long long)t->id, t->prio,
+                __atomic_load_n(&t->core, __ATOMIC_RELAXED), n ? " (short svc)" : "", (unsigned long long)t->cpu.pc,
+                (unsigned long long)t->cpu.x[30], c0);
+    }
+}
+
+// LARECOMP_WATCHDOG=<seconds>: every that many seconds, kernel_log_threads - for hangs.
 static void *watchdog_main(void *arg) {
     uint64_t every = (uint64_t)(uintptr_t)arg;
     for (;;) {
         sleep((unsigned)every);
-        uint64_t now = plat_now_ns();
-        LOG("[watchdog] threads:\n");
-        for (KThread *t = g_threads; t; t = t->anext) {
-            if (t->finished) continue;
-            uint32_t n = t->svc_now;
-            if (n && now - t->svc_since > every * 1000000000ull)
-                LOG("[watchdog]  t%llu prio %d: svc %02x for %llus (%llx, %llx, %llx, %llx) from %llx; wait kind %d addr %llx\n",
-                    (unsigned long long)t->id, t->prio, n - 1, (unsigned long long)((now - t->svc_since) / 1000000000ull),
-                    (unsigned long long)t->svc_args[0], (unsigned long long)t->svc_args[1],
-                    (unsigned long long)t->svc_args[2], (unsigned long long)t->svc_args[3],
-                    (unsigned long long)t->svc_lr, (int)t->wait_kind, (unsigned long long)t->wait_addr);
-            else
-                LOG("[watchdog]  t%llu prio %d: running%s, pc %llx lr %llx\n", (unsigned long long)t->id, t->prio,
-                    n ? " (short svc)" : "", (unsigned long long)t->cpu.pc, (unsigned long long)t->cpu.x[30]);
-        }
+        kernel_log_threads(every * 1000000000ull);
     }
     return NULL;
 }

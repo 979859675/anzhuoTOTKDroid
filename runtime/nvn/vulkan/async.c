@@ -26,6 +26,7 @@
 #include "../../rt.h"
 #include "../../kernel.h"
 #include "vk_fpenv.h"
+#include "watchdog.h"
 
 enum { REQ_EXEC, REQ_PRESENT, REQ_FENCE, REQ_TEXREG };
 typedef struct { int type; uint64_t a; void *p; uint64_t id; } Req;
@@ -93,9 +94,12 @@ static void *render_main(void *arg) {
     bool cpu_timing = timing && atoi(timing) != 0;
     pthread_mutex_lock(&q_lock);
     for (;;) {
+        if (q_head == q_tail) vk_wd_set(WD_R_WAIT_GAME, 0);  // (freeze watchdog: where this thread is; from BOTWRecomp 3f9d546)
         while (q_head == q_tail) pthread_cond_wait(&q_more, &q_lock);
         Req r = q[q_head % QN];
         pthread_mutex_unlock(&q_lock);
+        vk_wd_set(r.type == REQ_EXEC ? WD_R_TRANSLATE : r.type == REQ_PRESENT ? WD_R_PRESENT_REQ : r.type == REQ_FENCE ? WD_R_FENCE_REQ
+                  : WD_R_CALL_REQ, r.id);  // (REQ_TEXREG: the texture batch, shown as a call)
         uint64_t t0 = plat_now_ns(), cpu0 = cpu_timing ? render_cpu_ns() : 0;
         extern void vk_tl(const char *what, uint64_t a, uint64_t b);  // (exec.c: LARECOMP_FRAME_TIMELINE)
         extern void nvn_texreg_apply(void *batch);  // (objects.c)
@@ -136,11 +140,13 @@ static uint64_t push(int type, uint64_t a, void *p) {
     }
     if (q_tail - q_head >= QN || (type == REQ_PRESENT && q_presents >= ahead)) {
         pthread_mutex_unlock(&q_lock);
+        WdMark wm = vk_wd_enter(WD_G_QUEUE_FULL, q_tail - q_head);  // (freeze watchdog)
         kernel_blocking_begin();
         pthread_mutex_lock(&q_lock);
         while (q_tail - q_head >= QN || (type == REQ_PRESENT && q_presents >= ahead)) pthread_cond_wait(&q_less, &q_lock);
         pthread_mutex_unlock(&q_lock);
         kernel_blocking_end();
+        vk_wd_leave(wm);
         pthread_mutex_lock(&q_lock);
     }
     uint64_t id = ++q_tail;  // (ids 1, 2, ...: the request at index id - 1)
@@ -180,12 +186,22 @@ void vk_async_wait_id(uint64_t id) {
     pthread_mutex_unlock(&q_lock);
     extern void vk_tl(const char *what, uint64_t a, uint64_t b);
     vk_tl("host: wait for request (id, guest thread)", id, kernel_current_thread() ? kernel_current_thread()->id : 0);
+    WdMark wm = vk_wd_enter(WD_G_WAIT_ID, id);  // (freeze watchdog)
     kernel_blocking_begin();
     pthread_mutex_lock(&q_lock);
     while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
     pthread_mutex_unlock(&q_lock);
     kernel_blocking_end();
+    vk_wd_leave(wm);
     vk_tl("host: wait for request end", id, 0);
+}
+
+// The freeze watchdog's look at the queue: no lock (the render thread may be stuck holding it), plain reads - a stale
+// number is fine there. queued: requests ever queued, done: the last the render thread finished (from BOTWRecomp 3f9d546).
+void vk_async_wd_info(uint64_t *queued, uint64_t *done, int *presents) {
+    *queued = __atomic_load_n(&q_tail, __ATOMIC_RELAXED);
+    *done = __atomic_load_n(&q_done, __ATOMIC_RELAXED);
+    *presents = __atomic_load_n(&q_presents, __ATOMIC_RELAXED);
 }
 
 // Until every request queued so far has run (the render thread is idle after it).
@@ -207,9 +223,11 @@ void vk_async_drain(void) {
               kernel_current_thread() ? kernel_current_thread()->id : 0);
         kernel_blocking_begin();
     }
+    WdMark wm = vk_wd_enter(WD_G_DRAIN, id);  // (freeze watchdog)
     pthread_mutex_lock(&q_lock);
     while (q_done < id) pthread_cond_wait(&q_less, &q_lock);
     pthread_mutex_unlock(&q_lock);
+    vk_wd_leave(wm);
     if (waits) kernel_blocking_end();
     // and the replay thread done with the draws' packets (replay.h): what runs next here may destroy what they bind
     extern void vk_rp_drain_at(void *ra);
