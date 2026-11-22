@@ -765,6 +765,15 @@ static void tab_display(void) {
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. FXAA: a single, cheaper pass that also softens the image "
                "a little. Most useful at a lower internal resolution.");
+    {   // The sun's shadow maps made larger (vulkan/textures.c shadow_scale): 960 px at 1x, 3840 at 4x. Applies at the next start.
+        static const char *sizes[] = {"1x (960)", "2x (1920)", "3x (2880)", "4x (3840)"};
+        int ss = g_settings.shadow_scale < 1 ? 0 : g_settings.shadow_scale > 4 ? 3 : g_settings.shadow_scale - 1;
+        if (opt_choice("Shadow map size", &ss, sizes, 4, 0,
+                       "The sun's shadow maps drawn larger, for sharper shadows. Each step adds GPU memory: 4x takes a few "
+                       "hundred MB more. Experimental: at 2x and up the shadow edges may show extra copies, which "
+                       "are not fixed yet. Applies the next time the game starts.", false))
+            g_settings.shadow_scale = ss + 1;
+    }
     {   // The game's own rendering costs (runtime/native.c: shadow map size, its FXAA, the far plane). They apply at once.
         static const char *shadows[] = {"Game", "Lower", "Lowest"};
         static const int shadow_px[] = {0, 288, 256};

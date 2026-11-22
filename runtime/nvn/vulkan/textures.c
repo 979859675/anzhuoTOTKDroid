@@ -263,11 +263,26 @@ static void bc_decode(VkFormat bc, const uint8_t *blocks, uint32_t wb, uint32_t 
 //             HUD and menus are drawn sharp
 //   RS_SCENE  the 3D scene's targets (1600x900 docked, the game's dynamic sizes down to 1280x720, their fractions):
 //             the internal resolution (Video > Internal resolution)
-static float g_rs[3][2] = {{1, 1}, {1, 1}, {1, 1}};
+static float g_rs[4][2] = {{1, 1}, {1, 1}, {1, 1}, {1, 1}};
 void renderer_get_scale(float *sx, float *sy) { *sx = g_rs[RS_OUT][0]; *sy = g_rs[RS_OUT][1]; }
 void renderer_set_scale(float sx, float sy) { g_rs[RS_OUT][0] = sx; g_rs[RS_OUT][1] = sy; }
 void renderer_get_scene_scale(float *sx, float *sy) { *sx = g_rs[RS_SCENE][0]; *sy = g_rs[RS_SCENE][1]; }
 void renderer_set_scene_scale(float sx, float sy) { g_rs[RS_SCENE][0] = sx; g_rs[RS_SCENE][1] = sy; }
+
+// The sun's shadow maps (Video > Shadow map size, settings.c shadow_scale): 1 to 4 times the game's size on each side.
+// Set once, when the device is picked (device.c), from the setting at start: a map made at one size is not reallocated
+// when the setting changes, so the change takes effect at the next start. The game still sees its own size: its viewports and scissors are scaled into the larger maps, as the scene's are
+// (exec.c pass_sx), and the copies scale their regions (sub_resolve). Shaders sample the maps by normalised
+// coordinates, so they see nothing of it. What is not done yet: the game's filter spacing (a fixed offset in the
+// shadow map's UV, meant for its own texels) is not divided by the scale, so at 2x and more the sun's shadow edges
+// may show extra copies. The compare samplers filter linearly at more than 1x (2x2 PCF per tap, since each tap
+// covers a fraction of the old area).
+static int g_shadow_scale = 1;
+void renderer_set_shadow_scale(int s) {
+    s = s < 1 ? 1 : s > 4 ? 4 : s;
+    g_shadow_scale = s;
+    g_rs[RS_SHADOW][0] = g_rs[RS_SHADOW][1] = (float)s;
+}
 uint64_t renderer_present_count(void);
 static bool rs_stale(const TexBackend *b) {
     return b->rs_group && (b->sx != g_rs[b->rs_group][0] || b->sy != g_rs[b->rs_group][1]);
@@ -287,6 +302,10 @@ static uint8_t tex_scale_group(const NvnTexture *t) {
     bool totk_out = g_game_version == 143 && t->target == 1 && t->samples <= 1 && !(t->flags & 9) && t->width == 1920 &&
                     t->height == 1080 && (t->format == 0x3f || t->format == 0x25);
     if (totk_out) return RS_OUT;
+    if (g_shadow_scale > 1 && t->target == 4 && t->format == 0x32 && t->samples <= 1 && t->width == t->height &&
+        t->width >= 256 && t->depth >= 2 && t->depth <= 4 &&
+        (uint32_t)(t->width * g_shadow_scale) <= (uint32_t)g_vk.props.limits.maxImageDimension2D)
+        return RS_SHADOW;  // (the sun's cascade maps and the static shadow maps: 2D arrays of D16, square)
     if ((t->target != 1 && t->target != 4) || t->samples > 1 || !(t->flags & 9) || t->width < 32 || t->height < 16) return RS_NONE;
     float a = (float)t->width / (float)t->height;
     if (a < 1.74f || a > 1.81f) return RS_NONE;
@@ -486,7 +505,9 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         static int f32 = -1;
         if (f32 < 0) f32 = !getenv("LARECOMP_VK_D16_AS_D32") ? 1 : atoi(getenv("LARECOMP_VK_D16_AS_D32"));
         float a = (float)t->width / (float)(t->height ? t->height : 1);  // (its 1600x896 / 800x448; the maps: 400x400, 424x424)
-        if (f32 > 1 || (f32 && (b->rs_group != RS_NONE || (a > 1.74f && a < 1.81f)))) vf = VK_FORMAT_D32_SFLOAT;
+        // (the scaled shadow maps (RS_SHADOW) stay D16: at 4x a D32 would double their memory)
+        if (f32 > 1 || (f32 && ((b->rs_group != RS_NONE && b->rs_group != RS_SHADOW) || (a > 1.74f && a < 1.81f))))
+            vf = VK_FORMAT_D32_SFLOAT;
     }
     VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
     b->astc_bw = b->astc_bh = 0;
@@ -2245,6 +2266,7 @@ static VkSampler make_sampler(const NvnSamplerDesc *d, bool compare) {
     if (d->compare_mode && compare) {
         si.compareEnable = VK_TRUE;
         si.compareOp = getenv("LARECOMP_NO_SHADOW") ? VK_COMPARE_OP_ALWAYS : compare_op(d->compare_func);
+        if (g_shadow_scale > 1) si.magFilter = si.minFilter = VK_FILTER_LINEAR;  // (the taps cover a fraction of the old area)
     }
     VkSamplerCustomBorderColorCreateInfoEXT cb = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
     if (border) {

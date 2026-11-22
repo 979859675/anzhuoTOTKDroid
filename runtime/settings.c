@@ -224,6 +224,7 @@ void settings_reset_defaults(void) {
     g_settings.motion = d->motion;
     g_settings.rumble = d->rumble;
     g_settings.shadow_res = d->shadow_res;
+    g_settings.shadow_scale = d->shadow_scale;
     g_settings.game_fxaa = d->game_fxaa;
     g_settings.far_clip = d->far_clip;
     g_settings.motion_source = d->motion_source;
@@ -272,6 +273,7 @@ void settings_load(void) {
         else if (!strcmp(key, "motion")) g_settings.motion = atoi(val) != 0;
         else if (!strcmp(key, "rumble")) g_settings.rumble = atoi(val) >= 0 && atoi(val) <= 300 ? atoi(val) : 100;
         else if (!strcmp(key, "shadow_res")) g_settings.shadow_res = atoi(val) == 288 || atoi(val) == 256 ? atoi(val) : 0;
+        else if (!strcmp(key, "shadow_scale")) g_settings.shadow_scale = atoi(val) >= 1 && atoi(val) <= 4 ? atoi(val) : 1;
         else if (!strcmp(key, "game_fxaa")) g_settings.game_fxaa = atoi(val) != 0;
         else if (!strcmp(key, "far_clip")) g_settings.far_clip = atoi(val) >= 1000 && atoi(val) <= 100000 ? atoi(val) : 0;
         else if (!strcmp(key, "motion_source")) g_settings.motion_source = atoi(val) >= 0 && atoi(val) <= 2 ? atoi(val) : 0;
@@ -396,6 +398,7 @@ void settings_save(void) {
             g_settings.fg_perf, g_settings.lsfg_flow);
     fprintf(f, "rumble = %d\n", g_settings.rumble);
     fprintf(f, "shadow_res = %d\n", g_settings.shadow_res);
+    fprintf(f, "shadow_scale = %d\n", g_settings.shadow_scale < 1 ? 1 : g_settings.shadow_scale);
     fprintf(f, "game_fxaa = %d\n", g_settings.game_fxaa);
     fprintf(f, "far_clip = %d\n", g_settings.far_clip);
     fprintf(f, "motion = %d\nmotion_source = %d\nmotion_flat = %d\n", g_settings.motion, g_settings.motion_source,
