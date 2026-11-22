@@ -60,6 +60,8 @@ typedef struct {
                                   // 2's) baked into pipelines (exec.c PipeKey.fx)
     bool eds2;                    // extended dynamic state 2 in use; without it, depth bias and primitive restart are
                                   // pipeline state (exec.c PipeKey.prim_restart)
+    bool dyn_vi;                  // VK_EXT_vertex_input_dynamic_state in use: vertex attributes / bindings set per draw, not in
+                                  // the pipeline (dyn_vi.h; from BOTWRecomp 8146cfa)
 #ifdef __ANDROID__
     bool mem_dmabuf;              // external memory may be exported as DMA-BUF instead of OPAQUE_FD
     bool mem_ahb;                 // Android hardware buffers may be imported (the heap from gralloc: exec.c heap_ahb_place)

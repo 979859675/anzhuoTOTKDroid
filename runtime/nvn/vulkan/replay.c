@@ -196,6 +196,14 @@ static inline void run(uint64_t *p, uint64_t h) {
         rp_real.vkCmdCopyImageToBuffer(cb, (VkImage)(uintptr_t)p[2], (VkImageLayout)v, (VkBuffer)(uintptr_t)p[3], 1, &c);
         break;
     }
+    case RP_VI: {  // (read in place: the producer's copy stays in the ring until this packet is done)
+        uint32_t nb = aux & 0xFF, na = aux >> 8;
+        const VkVertexInputBindingDescription2EXT *vb = (const VkVertexInputBindingDescription2EXT *)&p[2];
+        const VkVertexInputAttributeDescription2EXT *va =
+            (const VkVertexInputAttributeDescription2EXT *)&p[2 + nb * RP_VI_W(VkVertexInputBindingDescription2EXT)];
+        rp_real.vkCmdSetVertexInputEXT(cb, nb, nb ? vb : NULL, na, na ? va : NULL);
+        break;
+    }
     case RP_MEM_BARRIER: {
         VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = p[2], .srcAccessMask = p[3],
                                .dstStageMask = p[4], .dstAccessMask = p[5]};
@@ -317,10 +325,10 @@ void vk_rp_frame(void) {
         {   // the replay thread's time by packet type
             static const char *nm[] = {"wrap", "u32", "face", "stencil op", "depth bias", "blend", "viewport", "scissor", "pipe",
                                        "sets", "ib", "vb", "draw", "draw idx", "push", "begin", "end", "barrier",
-                                       "dispatch", "copy i2b", "mem barrier"};
+                                       "dispatch", "copy i2b", "mem barrier", "vi"};
             char b[1024];
             int n = 0;
-            for (int k = 1; k < 21 && n < 900; k++)
+            for (int k = 1; k < 22 && n < 900; k++)
                 if (st_op_n[k]) n += snprintf(b + n, sizeof b - n, " %s %.0f/%.3fms/max%.0fus", nm[k], (double)st_op_n[k] / frames,
                                               st_op_ns[k] / 1e6 / frames, st_op_max[k] / 1e3);
             LOG("[replay]   per frame:%s\n", b);
@@ -381,6 +389,8 @@ SHIM(vkCmdSetStencilOp, (VkCommandBuffer cb, VkStencilFaceFlags a, VkStencilOp b
      (cb, a, b, c, d, e))
 SHIM(vkCmdSetPrimitiveRestartEnable, (VkCommandBuffer cb, VkBool32 a), (cb, a))
 SHIM(vkCmdSetDepthBiasEnable, (VkCommandBuffer cb, VkBool32 a), (cb, a))
+SHIM(vkCmdSetVertexInputEXT, (VkCommandBuffer cb, uint32_t a, const VkVertexInputBindingDescription2EXT *b, uint32_t c,
+                              const VkVertexInputAttributeDescription2EXT *d), (cb, a, b, c, d))
 SHIM(vkCmdClearAttachments, (VkCommandBuffer cb, uint32_t a, const VkClearAttachment *b, uint32_t c, const VkClearRect *d),
      (cb, a, b, c, d))
 SHIM(vkCmdBeginRendering, (VkCommandBuffer cb, const VkRenderingInfo *a), (cb, a))

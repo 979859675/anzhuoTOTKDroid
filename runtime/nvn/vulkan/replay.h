@@ -25,7 +25,7 @@
     X(vkCmdSetScissor) X(vkCmdSetDepthBias) X(vkCmdSetBlendConstants) X(vkCmdSetStencilCompareMask) \
     X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdSetCullMode) X(vkCmdSetFrontFace) \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) \
-    X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetDepthBiasEnable) \
+    X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetDepthBiasEnable) X(vkCmdSetVertexInputEXT) \
     X(vkCmdClearAttachments) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) \
     X(vkCmdNextSubpass) X(vkCmdExecuteCommands) X(vkCmdPipelineBarrier) X(vkCmdPipelineBarrier2) X(vkCmdWriteTimestamp) \
     X(vkCmdWriteTimestamp2) X(vkCmdResetQueryPool) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdCopyQueryPoolResults) \
@@ -53,7 +53,7 @@ int vk_rp_tid(void);              // (the replay thread, for the ADPF session; 0
 // command buffer
 #define RP_WORDS (1u << 17)  // (1 MB: ~25,000 packets, several frames' worth of draws)
 enum { RP_WRAP, RP_U32, RP_FACE_U32, RP_STENCIL_OP, RP_DEPTH_BIAS, RP_BLEND, RP_VIEWPORT, RP_SCISSOR, RP_PIPE, RP_SETS,
-       RP_IB, RP_VB, RP_DRAW, RP_DRAW_IDX, RP_PUSH, RP_BEGIN_RENDERING, RP_END_RENDERING, RP_FULL_BARRIER, RP_DISPATCH, RP_COPY_I2B, RP_MEM_BARRIER };
+       RP_IB, RP_VB, RP_DRAW, RP_DRAW_IDX, RP_PUSH, RP_BEGIN_RENDERING, RP_END_RENDERING, RP_FULL_BARRIER, RP_DISPATCH, RP_COPY_I2B, RP_MEM_BARRIER, RP_VI };
 extern uint64_t rp_ring[RP_WORDS];
 extern uint64_t rp_w;  // the producer's position (published: rp_wpub, by rp_commit)
 extern uint64_t rp_free_end;  // (the producer's: where the ring was known free up to, the last time it looked)
@@ -194,6 +194,23 @@ static inline void rpCmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoi
         p[3 + nsets + (ndyn - 1) / 2] = 0;  // (an odd count's last word)
         __builtin_memcpy(&p[3 + nsets], dyn, ndyn * 4);
     }
+    rp_publish(n);
+}
+// (vkCmdSetVertexInputEXT, from BOTWRecomp 8146cfa; header aux: bindings | attributes << 8. The descriptions are copied as
+// they are, 4 words each with a NULL pNext: at most 17 + 32 of them, 198 words)
+#define RP_VI_W(t) ((uint32_t)((sizeof(t) + 7) / 8))
+static inline void rpCmdSetVertexInput(VkCommandBuffer cb, uint32_t nb, const VkVertexInputBindingDescription2EXT *vb, uint32_t na,
+                                       const VkVertexInputAttributeDescription2EXT *va) {
+    if (!rp_on || nb > 17 || na > 32) {
+        if (rp_on) vk_rp_drain();
+        vkCmdSetVertexInputEXT(cb, nb, vb, na, va);
+        return;
+    }
+    uint32_t n = 2 + nb * RP_VI_W(VkVertexInputBindingDescription2EXT) + na * RP_VI_W(VkVertexInputAttributeDescription2EXT);
+    uint64_t *p = rp_reserve(n, cb);
+    p[0] = RP_HDR(RP_VI, n, nb | na << 8, 0);
+    if (nb) __builtin_memcpy(&p[2], vb, nb * sizeof *vb);
+    if (na) __builtin_memcpy(&p[2 + nb * RP_VI_W(VkVertexInputBindingDescription2EXT)], va, na * sizeof *va);
     rp_publish(n);
 }
 static inline void rpCmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, VkIndexType t) {
@@ -345,6 +362,7 @@ static inline int vk_rp_tid(void) { return 0; }
 #define rpCmdSetStencilTestEnable vkCmdSetStencilTestEnable
 #define rpCmdSetPrimitiveRestartEnable vkCmdSetPrimitiveRestartEnable
 #define rpCmdSetDepthBiasEnable vkCmdSetDepthBiasEnable
+#define rpCmdSetVertexInput vkCmdSetVertexInputEXT
 #define rpCmdSetStencilCompareMask vkCmdSetStencilCompareMask
 #define rpCmdSetStencilWriteMask vkCmdSetStencilWriteMask
 #define rpCmdSetStencilReference vkCmdSetStencilReference
