@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "imgui.h"
+#include "i18n.h"  // (the overlay's text in Chinese: tr_zh)
 
 extern "C" {
 #include "platform.h"
@@ -230,8 +231,8 @@ void perf_overlay_draw(ImVec2 display, float scale) {
             turnip = sep && strstr(sep, "Turnip");
             char low[96];
             for (int i = 0; i < (int)sizeof low; i++) low[i] = (char)tolower((unsigned char)gpu[i]);
-            brand = strstr(low, "adreno") ? "QUALCOMM" : strstr(low, "mali") || strstr(low, "immortalis") ? "ARM"
-                    : strstr(low, "nvidia") ? "NVIDIA" : strstr(low, "xclipse") ? "SAMSUNG" : "GPU";
+            brand = strstr(low, "adreno") ? "高通" : strstr(low, "mali") || strstr(low, "immortalis") ? "ARM"
+                    : strstr(low, "nvidia") ? "英伟达" : strstr(low, "xclipse") ? "三星" : "GPU";
         }
     }
 
@@ -250,8 +251,8 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     if (rss < 0) strcpy(ram, "--");
     else snprintf(ram, sizeof ram, "%ld MB", rss);
     if (rss < 0) strcpy(mem, "--");
-    else if (total <= 0) snprintf(mem, sizeof mem, "RAM %ld MB, free %ld MB", rss, avail);
-    else snprintf(mem, sizeof mem, "RAM %ld / %ld MB, free %ld MB", rss, total, avail);
+    else if (total <= 0) snprintf(mem, sizeof mem, tr_zh("App uses %ld MB, %ld MB free"), rss, avail);
+    else snprintf(mem, sizeof mem, tr_zh("App uses %ld of %ld MB, %ld MB free"), rss, total, avail);
 
     font = g_overlay_font ? g_overlay_font : ImGui::GetFont();
     // compact: Swap2's items, each as wide as its widest reading (so the panel keeps its size) and a gap apart
@@ -259,13 +260,13 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     char cs[5][48];
     float cw[5], csz[5] = {15, 13, 13, 13, 13};
     static const uint32_t ccol[5] = {0xFF6DE6EF, 0xFFFFFFFF, 0xFFE3EAF5, 0xFFFFD477, 0xFFFFD477};
-    const char *widest[5] = {gen ? "88.8 > 88.8 FPS" : "88.8 FPS", "888.8 ms", "RAM 8888 / 16384 MB, free 8888 MB",
-                             "SoC 88.8\xc2\xb0", "BAT 88.8\xc2\xb0"};
+    const char *widest[5] = {gen ? "88.8 > 88.8 FPS" : "88.8 FPS", "888.8 ms", "应用占用 8888 / 总 16384 MB · 剩余 8888 MB",
+                             "芯片 88.8\xc2\xb0", "电池 88.8\xc2\xb0"};
     snprintf(cs[0], sizeof cs[0], "%s", f);
     snprintf(cs[1], sizeof cs[1], "%s ms", number(a, ms));
     snprintf(cs[2], sizeof cs[2], "%s", mem);
-    snprintf(cs[3], sizeof cs[3], "SoC %s\xc2\xb0", number(a, soc));
-    snprintf(cs[4], sizeof cs[4], "BAT %s\xc2\xb0", number(a, bat));
+    snprintf(cs[3], sizeof cs[3], tr_zh("SoC %s\xc2\xb0"), number(a, soc));
+    snprintf(cs[4], sizeof cs[4], tr_zh("BAT %s\xc2\xb0"), number(a, bat));
     float cx = 12;
     for (int i = 0; i < 5; i++) {
         cw[i] = fmaxf(text_w(cs[i], csz[i]), text_w(widest[i], csz[i]));
@@ -301,7 +302,7 @@ void perf_overlay_draw(ImVec2 display, float scale) {
             rect(178, 9, 260, 29, 5, 0xFF203A50);
             text(brand, 184, 23, 10, 0xFF6DE6EF);
         }
-        text("TOTK / MONITOR", 12, 23, 10, 0xFF92A5BC);
+        text(tr_zh("TOTK / MONITOR"), 12, 23, 10, 0xFF92A5BC);
         char title[96];
         snprintf(title, sizeof title, "%s", gpu[0] ? gpu : "GPU");
         for (int n = (int)strlen(title); n > 1 && text_w(title, 12) > 245;) title[--n] = 0;
@@ -309,26 +310,26 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         text(f, 12, 72, 19, 0xFF6DE6EF);
         snprintf(s, sizeof s, "%s ms", number(a, ms));
         text(s, 175, 72, 15, 0xFFFFFFFF);
-        chart(0, 82, 0xFF50DBEB, "FPS");
-        chart(1, 123, 0xFFFFCE78, "ms");
-        chart(2, 164, 0xFFA699FF, "RAM MB");
-        snprintf(s, sizeof s, "GPU %s ms  |  App RAM %s", number(a, gms), ram);
+        chart(0, 82, 0xFF50DBEB, tr_zh("FPS"));
+        chart(1, 123, 0xFFFFCE78, tr_zh("ms"));
+        chart(2, 164, 0xFFA699FF, tr_zh("RAM MB"));
+        snprintf(s, sizeof s, tr_zh("GPU %s ms  |  App RAM %s"), number(a, gms), ram);
         text(s, 12, 212, 11, 0xFFE3EAF5);
-        snprintf(s, sizeof s, "CPU cap %s%s", cpu, turnip ? "  |  Turnip (Mesa)" : "");
+        snprintf(s, sizeof s, tr_zh("CPU cap %s%s"), cpu, turnip ? "  |  Turnip (Mesa)" : "");
         text(s, 12, 229, 10, turnip ? 0xFFFF9F43 : 0xFFE3EAF5);
         char lv[8];
         if (level < 0) strcpy(lv, "--");
         else snprintf(lv, sizeof lv, "%d%%", level);
-        snprintf(s, sizeof s, "SoC %s\xc2\xb0  BAT %s\xc2\xb0  %s", number(a, soc), number(b, bat), lv);
+        snprintf(s, sizeof s, tr_zh("SoC %s\xc2\xb0  BAT %s\xc2\xb0  %s"), number(a, soc), number(b, bat), lv);
         text(s, 12, 246, 11, 0xFFFFD477);
-        char fr[64], th[8];
-        if (total <= 0) strcpy(fr, "--");
-        else snprintf(fr, sizeof fr, "%.1f GB total, %.1f GB free", total / 1024.0f, avail / 1024.0f);
-        if (thermal < 0) strcpy(th, "--");
-        else snprintf(th, sizeof th, "%d", thermal);
-        snprintf(s, sizeof s, "Phone RAM %s  T:%s", fr, th);
+        char fr[64], th[24];  // the phone's total and what is free (MemAvailable), then the thermal state
+        if (total <= 0) snprintf(fr, sizeof fr, tr_zh("Phone total -- \xc2\xb7 free %.1f GB"), avail / 1024.0f);
+        else snprintf(fr, sizeof fr, tr_zh("Phone total %.1f GB \xc2\xb7 free %.1f GB"), total / 1024.0f, avail / 1024.0f);
+        if (thermal < 0) snprintf(th, sizeof th, "%s", tr_zh("Heat --"));
+        else snprintf(th, sizeof th, tr_zh("Heat %d"), thermal);
+        snprintf(s, sizeof s, "%s  %s", fr, th);
         text(s, 12, 263, 10, 0xFFE3EAF5);
-        text("500 ms samples \xc2\xb7 48 s history", 12, 279, 9, 0xFF92A5BC);
+        text(tr_zh("500 ms samples \xc2\xb7 48 s history"), 12, 279, 9, 0xFF92A5BC);
     }
     ImGui::Dummy(ImVec2(W * u, H * u));
     ImGui::End();

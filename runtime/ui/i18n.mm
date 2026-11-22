@@ -114,22 +114,20 @@ std::string ui_upper(const char *s) {
     return t;
 }
 
-void i18n_merge_fonts(ImFontAtlas *atlas, float size_px) {
 #ifdef __ANDROID__
+static void merge_fonts_for(const Table *t, ImVector<ImWchar> &ranges, bool all_hanzi, ImFontAtlas *atlas,
+                           float size_px) {
     // The shipped Baloo 2 has Latin only: Russian, Japanese, Korean and Chinese come from the phone's own fonts, merged
     // into the font just added, with the glyphs the menu language's table uses (a few hundred, not whole scripts: the
     // atlas stays small)
-    const Table *t = menu_table();
-    if (!t) return;
     const char *code = t->code;
     bool cjk = !strcmp(code, "ja") || !strcmp(code, "ko") || !strncmp(code, "zh", 2);
     if (!cjk && strcmp(code, "ru")) return;
-    static ImVector<ImWchar> ranges;
     if (ranges.empty()) {
         ImFontGlyphRangesBuilder b;
         for (size_t i = 0; i < t->n; i++) b.AddText(t->rows[i][1]);
         b.AddText("0123456789 %.,:;!?()[]/-+x");
-        if (!strncmp(code, "zh", 2)) b.AddRanges(gb2312_hanzi_ranges);   // (the cheats' names: any Chinese text, as the file has it)
+        if (all_hanzi && !strncmp(code, "zh", 2)) b.AddRanges(gb2312_hanzi_ranges);   // (the cheats' names: any Chinese text, as the file has it)
         b.BuildRanges(&ranges);
     }
     // Candidates, the language's own first: Xiaomi's MiSans (HyperOS), then Google's NotoSansCJK collection (Japanese,
@@ -186,7 +184,41 @@ void i18n_merge_fonts(ImFontAtlas *atlas, float size_px) {
         return;
     }
     fprintf(stderr, "[ui] menus in %s: no system font with its letters\n", code);
+}
+#endif
+
+void i18n_merge_fonts(ImFontAtlas *atlas, float size_px) {
+#ifdef __ANDROID__
+    static ImVector<ImWchar> ranges;  // (the menu language's table: the atlas's ranges, built once)
+    if (const Table *t = menu_table()) merge_fonts_for(t, ranges, true, atlas, size_px);
 #else
     (void)atlas, (void)size_px;
+#endif
+}
+
+void i18n_merge_overlay_font(ImFontAtlas *atlas, float size_px) {
+#ifdef __ANDROID__
+    // the overlay's Chinese whatever the menus' language: its own table, not the whole Han set (the atlas stays small)
+    static ImVector<ImWchar> ranges;
+    static const Table zh = TABLE("zh-Hans", kZhHans);
+    merge_fonts_for(&zh, ranges, false, atlas, size_px);
+#else
+    (void)atlas, (void)size_px;
+#endif
+}
+
+// The overlay's text: Simplified Chinese whatever the menus' language (anything not in the table shown as written)
+const char *tr_zh(const char *en) {
+#ifdef __ANDROID__
+    if (!en || !*en) return en;
+    static const auto *map = [] {
+        auto *m = new std::unordered_map<std::string, const char *>();
+        for (const auto &r : kZhHans) m->emplace(r[0], r[1]);
+        return m;
+    }();
+    auto it = map->find(en);
+    return it == map->end() ? en : it->second;
+#else
+    return en;
 #endif
 }
