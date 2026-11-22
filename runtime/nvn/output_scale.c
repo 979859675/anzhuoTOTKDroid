@@ -6,7 +6,7 @@
 // "Internal resolution" (g_settings.res_mode) sets the scene's, "Output resolution" (g_settings.out_lines) caps the
 // final image's (else the window's):
 //   Match display  the scene at the size it takes in the final image
-//   1x .. 4x       N times the Switch's docked scene: 900 lines x N; capped to the GPU's 16384-pixel texture limit
+//   1x .. 8x       N times the Switch's docked scene: 900 lines x N; capped to the GPU's 16384-pixel texture limit
 //   .75x / .50x / .25x  of Match display
 //   Dynamic        Match display, lowered in steps while the GPU can't hold the frame rate and raised again when it
 //                  can (each change reallocates the render targets: a short hitch, so it changes rarely, with hysteresis)

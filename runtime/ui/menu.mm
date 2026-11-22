@@ -679,9 +679,9 @@ static void tab_display(void) {
     // display order -> RES_* (the ini / enum order predates the menu order)
     // (up to 4x: 7680 x 4320, 8K - more only ran out of GPU memory, and sat next to 75% in the list)
     // (Match display in the middle: left from it 75% / 50% / 25%, right Dynamic then 1x-4x; user 2026-10-11)
-#ifdef __ANDROID__  // (3x / 4x: 4K / 8K, beyond a phone)
-    static const char *res[] = {"25%", "50%", "75%", "Match display", "Dynamic", "1x", "2x"};
-    static const int res_mode[] = {RES_Q25, RES_Q50, RES_Q75, RES_MATCH, RES_DYNAMIC, 1, 2};
+#ifdef __ANDROID__  // (up to 8x: 5x-8x need a lot of GPU memory, most phones will run out)
+    static const char *res[] = {"25%", "50%", "75%", "Match display", "Dynamic", "1x", "2x", "3x", "4x", "5x", "6x", "7x", "8x"};
+    static const int res_mode[] = {RES_Q25, RES_Q50, RES_Q75, RES_MATCH, RES_DYNAMIC, 1, 2, 3, 4, 5, 6, 7, 8};
 #else
     static const char *res[] = {"25%", "50%", "75%", "Match display", "Dynamic", "1x", "2x", "3x", "4x"};
     static const int res_mode[] = {RES_Q25, RES_Q50, RES_Q75, RES_MATCH, RES_DYNAMIC, 1, 2, 3, 4};
@@ -693,11 +693,11 @@ static void tab_display(void) {
         for (int i = 0; i < NRES; i++) if (res_mode[i] == g_settings.res_mode) ri = i;
         float sx, sy;
         renderer_get_scene_scale(&sx, &sy);
-        char d[640];
+        char d[768];
         int n = snprintf(d, sizeof d, tr("How sharp the 3D image is (the HUD is drawn at the Output resolution). Match "
                                          "display: the final image's resolution (your screen's, unless Output resolution is "
                                          "lower). Dynamic: as sharp as your GPU keeps at "
-                                         "full speed. 1x-2x: the Switch's 900p times that. 75%% / 50%% / 25%%: a share of the "
+                                         "full speed. 1x-8x: the Switch's 900p times that (the higher ones need a lot of GPU memory). 75%% / 50%% / 25%%: a share of the "
                                          "display, for slower devices.\n\nRendering the 3D image at %.0f x %.0f."),
                          1600.0 * sx, 900.0 * sy);
         if (g_settings.res_mode == RES_DYNAMIC && n > 0 && n < (int)sizeof d)

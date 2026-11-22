@@ -340,7 +340,7 @@ void settings_load(void) {
             int n = atoi(val);
             g_settings.res_mode = !strcmp(val, "dynamic") ? RES_DYNAMIC : (!strcmp(val, "75%") || !strcmp(val, "67%")) ? RES_Q75 :
                                   !strcmp(val, "50%") ? RES_Q50 : !strcmp(val, "25%") ? RES_Q25 :
-                                  (n >= 1 && n <= 4) ? n : n > 4 ? 4 : RES_MATCH;  // (5x-8x were removed)
+                                  (n >= 1 && n <= 8) ? n : n > 8 ? 8 : RES_MATCH;  // (1x-8x; 5x-8x are the GPU-memory heavy ones)
         }
         else if (!strcmp(key, "upscaler"))  // (metalfx / fsr1: this OS's sharp one)
             g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR
