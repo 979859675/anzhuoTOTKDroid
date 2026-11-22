@@ -24,6 +24,7 @@
 #include "vk.h"
 #include "vk_fpenv.h"
 #include "buffer_copy.h"
+#include "job_queue.h"
 #include "timing_trace.h"
 #include "object_cache.h"
 #include "replay.h"
@@ -1654,10 +1655,45 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size, int kind) {
 // ================================================================== worker threads (shader / pipeline builds)
 // First-use compiles run off the render thread; draws needing them are skipped until ready (as on Metal).
 // LARECOMP_SYNC_SHADERS=1 builds on first use, blocking (deterministic tests).
-typedef struct Job { void (*fn)(void *); void *arg; struct Job *next; } Job;
+typedef MwJob Job;
 static Job *jobs_head, *jobs_tail;
 static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
+
+// Waited-on builds go first (from BOTWRecomp e8fac0f): a draw that waits (wait_built_job) marks its program, the job
+// is queued at the head of its queue, and the waiting thread takes the job still queued for its object and runs it
+// itself (g_inline_steal: what it starts runs inline too) - it no longer waits behind the FIFO, nor for a free worker
+// or a gate slot. A running job is waited for on build_done_cond (every state change signals it) instead of a poll.
+// LARECOMP_URGENT_BUILDS=0: the FIFO as before. Lock order when nesting: build_done_lock -> jobs_lock -> tjobs_lock
+// (workers never signal with a queue lock held).
+static pthread_mutex_t build_done_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t build_done_cond = PTHREAD_COND_INITIALIZER;
+static _Atomic bool jobs_abort;     // (jobs_drain: queued jobs end at once with state 2, nothing new starts work)
+static __thread bool g_inline_steal;  // (this thread is running a stolen job: its follow-up jobs run inline)
+static _Atomic uint64_t stat_stolen_jobs;
+
+static bool urgent_builds_on(void) {
+    static _Atomic int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) {
+        const char *e = getenv("LARECOMP_URGENT_BUILDS");
+        v = e ? atoi(e) != 0 : 1;
+        atomic_store_explicit(&on, v, memory_order_relaxed);
+    }
+    return v != 0;
+}
+
+static void build_done_wake(void) {
+    pthread_mutex_lock(&build_done_lock);
+    pthread_cond_broadcast(&build_done_cond);
+    pthread_mutex_unlock(&build_done_lock);
+}
+
+// (a build's last act: the state store, then the wake - the waiters re-check the state under build_done_lock)
+static void signal_build_done(_Atomic int *state, int val) {
+    atomic_store_explicit(state, val, memory_order_release);
+    build_done_wake();
+}
 
 // Admission gate: how many compiles run at once (from Swap2-Native's vka_psogate.h / vka_pso.c gate_slots). A compile
 // takes the driver hundreds of MB and, on Turnip, thousands of memory mappings (Swap2: three long ones took 58,619 of
@@ -1749,7 +1785,8 @@ static void *worker(void *a) {
             gate_refresh();  // (rate-limited; the /proc reads outside the lock)
             pthread_mutex_lock(&jobs_lock);
             if (!jobs_head) { pthread_mutex_unlock(&jobs_lock); continue; }  // (another worker took it)
-            if (!atomic_load(&g_urgent) && g_gate_active >= atomic_load(&g_gate_slots)) {
+            if (!atomic_load(&g_urgent) && !atomic_load_explicit(&jobs_abort, memory_order_acquire) &&
+                g_gate_active >= atomic_load(&g_gate_slots)) {  // (a drain lets the queue run out: its jobs end at once)
                 // (timed: memory freed elsewhere raises the slots without a job finishing)
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
@@ -1771,6 +1808,7 @@ static void *worker(void *a) {
         g_gate_active--;
         if (!g_gate_off) pthread_cond_broadcast(&jobs_cond);  // (gated workers: a slot is free)
         pthread_mutex_unlock(&jobs_lock);
+        build_done_wake();  // (jobs_drain waits for the queues to run dry)
     }
     return NULL;
 }
@@ -1787,6 +1825,7 @@ static pthread_mutex_t translate_lock = PTHREAD_MUTEX_INITIALIZER;  // graphics 
 static Job *tjobs_head, *tjobs_tail;
 static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
+static int tjobs_active;  // (translating now; tjobs_lock)
 static void *translator(void *a) {
     (void)a;
     vk_fp_thread("vk-translate");
@@ -1796,73 +1835,156 @@ static void *translator(void *a) {
         Job *j = tjobs_head;
         tjobs_head = j->next;
         if (!tjobs_head) tjobs_tail = NULL;
+        tjobs_active++;
         pthread_mutex_unlock(&tjobs_lock);
         j->fn(j->arg);
         free(j);
+        pthread_mutex_lock(&tjobs_lock);
+        tjobs_active--;
+        pthread_mutex_unlock(&tjobs_lock);
+        build_done_wake();
     }
     return NULL;
 }
-static bool sync_shaders(void);
-static void run_translate(void (*fn)(void *), void *arg) {
-    if (sync_shaders()) { fn(arg); return; }
-    static bool started;
-    if (!started) { started = true; pthread_t t; pthread_create(&t, NULL, translator, NULL); }
-    Job *j = malloc(sizeof *j);
-    j->fn = fn; j->arg = arg; j->next = NULL;
+
+// Both queues empty and nothing running (one snapshot: the locks nest in the documented order).
+static bool jobs_all_idle(void) {
+    pthread_mutex_lock(&jobs_lock);
     pthread_mutex_lock(&tjobs_lock);
-    if (tjobs_tail) tjobs_tail->next = j; else tjobs_head = j;
-    tjobs_tail = j;
-    pthread_cond_signal(&tjobs_cond);
+    bool idle = !jobs_head && g_gate_active == 0 && !tjobs_head && tjobs_active == 0;
     pthread_mutex_unlock(&tjobs_lock);
+    pthread_mutex_unlock(&jobs_lock);
+    return idle;
 }
 
-static void run_job(void (*fn)(void *), void *arg) {
-    if (sync_shaders()) { fn(arg); return; }
-    static bool started;
-    if (!started) {
-        started = true;
-        // first entry into an area builds dozens of pipelines at once: use most of the CPU (draws wait for them)
-        int cores = SDL_GetNumLogicalCPUCores();
-        int n = cores - 4;
+// vk_exec_reset's: every queued job ends with state 2 at once (jobs_abort), the running ones finish; returns when no
+// job is queued or running, so nothing reads the guest heap or touches a program / pipeline afterwards. Jobs only
+// start more jobs from inside a job (translate -> compile), which keeps the count above 0 until the last is queued
+// and has seen the flag. Not for a job's own thread (a worker would wait for itself).
+static void jobs_drain(void) {
 #ifdef __ANDROID__
-        n = cores / 2;
-        if (n > 4) n = 4;  // leave CPU capacity for the game and Vulkan translation
+    WdMark wm = vk_wd_enter(WD_R_BUILD_WAIT, 0);  // (freeze watchdog)
 #endif
-        const char *workers = getenv("LARECOMP_SHADER_WORKERS");
-        if (workers) n = atoi(workers);
-        if (n < 1) n = 1;
-        if (n > 16) n = 16;
-        g_gate_workers = n;
-#ifdef __ANDROID__
-        const char *gate = getenv("LARECOMP_COMPILE_GATE");  // (=0: off; an explicit worker count wins too)
-        g_gate_off = n < 2 || workers || (gate && atoi(gate) == 0);
-#endif
-        for (int i = 0; i < n; i++) { pthread_t t; pthread_create(&t, NULL, worker, NULL); }
-    }
-    Job *j = malloc(sizeof *j);
-    j->fn = fn; j->arg = arg; j->next = NULL;
+    atomic_store_explicit(&jobs_abort, true, memory_order_release);
     pthread_mutex_lock(&jobs_lock);
-    if (jobs_tail) jobs_tail->next = j; else jobs_head = j;
-    jobs_tail = j;
-    pthread_cond_signal(&jobs_cond);
+    pthread_cond_broadcast(&jobs_cond);  // (gated workers)
     pthread_mutex_unlock(&jobs_lock);
+    pthread_mutex_lock(&build_done_lock);
+    while (!jobs_all_idle()) {
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += 5000000;
+        if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&build_done_cond, &build_done_lock, &until);
+    }
+    pthread_mutex_unlock(&build_done_lock);
+    atomic_store_explicit(&jobs_abort, false, memory_order_release);
+#ifdef __ANDROID__
+    vk_wd_leave(wm);
+#endif
 }
+
+static bool sync_shaders(void);
+static pthread_once_t translator_once = PTHREAD_ONCE_INIT;
+static bool translator_started;
+static void start_translator(void) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, translator, NULL) == 0) {
+        pthread_detach(t);
+        translator_started = true;
+    }
+}
+static void run_translate_ex(void (*fn)(void *), void *arg, bool urgent) {
+    if (sync_shaders() || g_inline_steal) { fn(arg); return; }
+    pthread_once(&translator_once, start_translator);
+    if (!translator_started || !mw_job_push(&tjobs_lock, &tjobs_cond, &tjobs_head, &tjobs_tail, fn, arg, urgent)) {
+        fn(arg);
+        return;
+    }
+    if (urgent) build_done_wake();  // (a waiting draw takes it from the head)
+}
+
+static pthread_once_t workers_once = PTHREAD_ONCE_INIT;
+static void start_workers(void) {
+    // first entry into an area builds dozens of pipelines at once: use most of the CPU (draws wait for them)
+    int cores = SDL_GetNumLogicalCPUCores();
+    int n = cores - 4;
+#ifdef __ANDROID__
+    n = cores / 2;
+    if (n > 4) n = 4;  // leave CPU capacity for the game and Vulkan translation
+#endif
+    const char *workers = getenv("LARECOMP_SHADER_WORKERS");
+    if (workers) n = atoi(workers);
+    if (n < 1) n = 1;
+    if (n > 16) n = 16;
+    g_gate_workers = n;
+#ifdef __ANDROID__
+    const char *gate = getenv("LARECOMP_COMPILE_GATE");  // (=0: off; an explicit worker count wins too)
+    g_gate_off = n < 2 || workers || (gate && atoi(gate) == 0);
+#endif
+    for (int i = 0; i < n; i++) { pthread_t t; if (pthread_create(&t, NULL, worker, NULL) == 0) pthread_detach(t); }
+}
+
+static void run_job_ex(void (*fn)(void *), void *arg, bool urgent) {
+    if (sync_shaders() || g_inline_steal) { fn(arg); return; }
+    pthread_once(&workers_once, start_workers);
+    if (!mw_job_push(&jobs_lock, &jobs_cond, &jobs_head, &jobs_tail, fn, arg, urgent)) { fn(arg); return; }
+    if (urgent) build_done_wake();
+}
+static void run_job(void (*fn)(void *), void *arg) { run_job_ex(fn, arg, false); }
 
 // A skipped draw is lost for good when its target is built once and kept: BOTW's terrain height array (1024x1024x8,
 // each layer drawn once from the one before - the first draw of that shader skipped left layer 3 and all after it
 // empty: no ground on the plateau). Draws into arrays, cubemaps, 3D textures and mipmapped targets wait for their
 // shader and pipeline instead (LARECOMP_WAIT_PERSISTENT=0: skip them like the rest).
 static uint64_t stat_build_wait_ns;
-static void wait_built(_Atomic int *state) {
-    if (atomic_load(state)) return;
+// Waits for state != 0. urgent_flag (a program's): marks it for the jobs it starts next (translate -> compile go to the
+// head); steal_arg: the object whose still queued job this thread runs itself - the compile queue first, then (a
+// program) the translate queue. A stolen job runs with the host FPCR like the workers' (vk_fpenv.h) and nothing of
+// this thread's is held meanwhile. The gate is bypassed twice over: g_urgent for the workers, no slot taken here.
+static void wait_built_job(_Atomic int *state, _Atomic int *urgent_flag, void *steal_arg, uint64_t wd_arg) {
+    if (atomic_load_explicit(state, memory_order_acquire)) return;
+#ifdef __ANDROID__
+    WdMark wm = vk_wd_enter(WD_R_BUILD_WAIT, wd_arg);  // (freeze watchdog; covers the stolen builds too)
+#else
+    (void)wd_arg;
+#endif
     uint64_t t0 = plat_now_ns();
+    bool urg = urgent_builds_on();
+    if (urg && urgent_flag) atomic_store_explicit(urgent_flag, 1, memory_order_relaxed);
     atomic_fetch_add(&g_urgent, 1);  // (the compile gate lets every build start meanwhile)
     pthread_mutex_lock(&jobs_lock);
     pthread_cond_broadcast(&jobs_cond);
     pthread_mutex_unlock(&jobs_lock);
-    while (!atomic_load(state)) usleep(200);
+    while (!atomic_load_explicit(state, memory_order_acquire)) {
+        if (urg && steal_arg) {
+            Job *j = mw_job_steal(&jobs_lock, &jobs_head, &jobs_tail, steal_arg);
+            if (!j && urgent_flag) j = mw_job_steal(&tjobs_lock, &tjobs_head, &tjobs_tail, steal_arg);
+            if (j) {
+                atomic_fetch_add_explicit(&stat_stolen_jobs, 1, memory_order_relaxed);
+                bool prev = g_inline_steal;
+                g_inline_steal = true;
+                uint64_t fp = vk_fp_host("a stolen build");  // (FPCR 0 around it: vk_fpenv.h)
+                j->fn(j->arg);
+                vk_fp_put(fp);
+                g_inline_steal = prev;
+                free(j);
+                continue;
+            }
+        }
+        struct timespec until;  // (timed: a job another thread starts for it can be queued without a wake)
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += 1000000;
+        if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+        pthread_mutex_lock(&build_done_lock);
+        if (!atomic_load_explicit(state, memory_order_acquire)) pthread_cond_timedwait(&build_done_cond, &build_done_lock, &until);
+        pthread_mutex_unlock(&build_done_lock);
+    }
     atomic_fetch_sub(&g_urgent, 1);
     stat_build_wait_ns += plat_now_ns() - t0;
+#ifdef __ANDROID__
+    vk_wd_leave(wm);
+#endif
 }
 static bool rt_is_persistent(NvnTexture *t) {
     static int on = -1;
@@ -3240,6 +3362,7 @@ typedef struct {
                            // render thread on the POCO F7 Ultra: draw_writes)
     uint8_t fs_gather;  // (up_fix) the fragment stage's first gathered texture: 0 not looked yet, 1 none, 2 + its slot
     _Atomic int state;  // 0 building, 1 ready, 2 failed
+    _Atomic int urgent; // 1: a draw waits on this program (its jobs go to the head of the queues; BOTWRecomp e8fac0f)
     uint8_t evict;      // (prog_evict, vk_exec_reset) 1: to be freed, 2: kept - a pipeline of its still building
     uint32_t used_s;    // when a draw last used it (g_exec_s), and that submission (prog_evict)
     uint64_t used_seq;
@@ -3308,10 +3431,11 @@ static void subst_glsl(ShaderInfo *si, uint64_t addr, const char *suffix) {
 
 static void compile_program(void *arg) {
     Prog *p = arg;
+    if (atomic_load_explicit(&jobs_abort, memory_order_acquire)) { signal_build_done(&p->state, 2); return; }  // (jobs_drain)
     size_t nv = 0, nf = 0;
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
     uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
-    if (!sv || !sf) { free(sv); free(sf); atomic_store(&p->state, 2); return; }
+    if (!sv || !sf) { free(sv); free(sf); signal_build_done(&p->state, 2); return; }
     p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
     p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
     p->vs = vk_module(sv, nv);
@@ -3322,7 +3446,7 @@ static void compile_program(void *arg) {
         if (p->vs) vkDestroyShaderModule(g_vk.dev, p->vs, NULL);
         if (p->fs) vkDestroyShaderModule(g_vk.dev, p->fs, NULL);
         p->vs = p->fs = VK_NULL_HANDLE;
-        atomic_store(&p->state, 2);
+        signal_build_done(&p->state, 2);
         return;
     }
 #ifdef __ANDROID__
@@ -3348,7 +3472,7 @@ static void compile_program(void *arg) {
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
     atomic_fetch_add(&stat_compiles, 1);
     atomic_fetch_add(&live_programs, 1);
-    atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
+    signal_build_done(&p->state, p->vs && p->fs ? 1 : 2);
 }
 
 #ifdef __ANDROID__
@@ -3387,6 +3511,7 @@ static bool cbwin_wanted(void);  // (below gmem_placed)
 
 static void translate_program(void *arg) {
     Prog *p = arg;
+    if (atomic_load_explicit(&jobs_abort, memory_order_acquire)) { signal_build_done(&p->state, 2); return; }  // (jobs_drain)
     pthread_mutex_lock(&translate_lock);
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
@@ -3418,12 +3543,12 @@ static void translate_program(void *arg) {
     pthread_mutex_unlock(&translate_lock);
     if (!p->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi->error, (unsigned long long)p->code[0]);
-        atomic_store(&p->state, 2);
+        signal_build_done(&p->state, 2);
         return;
     }
     if (!p->fi->msl) {
         LOG("[shader] FS translate failed: %s\n", p->fi->error);
-        atomic_store(&p->state, 2);
+        signal_build_done(&p->state, 2);
         return;
     }
 #ifdef __ANDROID__
@@ -3463,7 +3588,7 @@ static void translate_program(void *arg) {
     }
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
-    run_job(compile_program, p);
+    run_job_ex(compile_program, p, atomic_load_explicit(&p->urgent, memory_order_relaxed) != 0);
 }
 
 // Growable (object_cache.h, from BOTWRecomp 848e08c): the fixed 4096-entry table's probe never ended once full.
@@ -3475,7 +3600,7 @@ static Prog *prog_used(Prog *p) {
     return p;
 }
 
-static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
+static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey, bool urgent) {
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
     // (the previous draw's program and keys again - most draws: no hashing; the code addresses are part of it, as
     // the program object can be reused for other code)
@@ -3483,8 +3608,11 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     static uint64_t last_code[2];
     static ShaderKey last_vkey, last_fkey;
     if (last_prog && np == last_np && last_code[0] == np->stages[0].code_addr && last_code[1] == np->stages[1].code_addr &&
-        !memcmp(vkey, &last_vkey, sizeof *vkey) && !memcmp(fkey, &last_fkey, sizeof *fkey))
+        !memcmp(vkey, &last_vkey, sizeof *vkey) && !memcmp(fkey, &last_fkey, sizeof *fkey)) {
+        if (urgent && !atomic_load_explicit(&last_prog->state, memory_order_acquire))
+            atomic_store_explicit(&last_prog->urgent, 1, memory_order_relaxed);
         return prog_used(last_prog);
+    }
     last_np = np, last_code[0] = np->stages[0].code_addr, last_code[1] = np->stages[1].code_addr;
     last_vkey = *vkey, last_fkey = *fkey;
     uint64_t h = 0xcbf29ce484222325ull;
@@ -3496,8 +3624,14 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
 #endif
     if (!h) h = 1;
     VkObjectEntry *entry = vk_object_slot(&prog_cache, h);
-    if (entry->object) return prog_used(last_prog = entry->object);
+    if (entry->object) {
+        Prog *hit_p = entry->object;
+        if (urgent && !atomic_load_explicit(&hit_p->state, memory_order_acquire))
+            atomic_store_explicit(&hit_p->urgent, 1, memory_order_relaxed);
+        return prog_used(last_prog = hit_p);
+    }
     Prog *p = calloc(1, sizeof *p);
+    if (urgent) atomic_store_explicit(&p->urgent, 1, memory_order_relaxed);
     last_prog = prog_used(p);
     entry->object = p;
     for (int i = 0; i < 2; i++) {
@@ -3507,7 +3641,7 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     }
     p->vkey = *vkey;
     p->fkey = *fkey;
-    run_translate(translate_program, p);
+    run_translate_ex(translate_program, p, urgent);
     return p;
 }
 
@@ -3931,6 +4065,7 @@ static VkPrimitiveTopology topo_class_base(uint8_t c) {
 
 static void build_pipeline(void *arg) {
     Pipe *pp = arg;
+    if (atomic_load_explicit(&jobs_abort, memory_order_acquire)) { signal_build_done(&pp->state, 2); return; }  // (jobs_drain)
     PipeKey *k = &pp->k;
     VkPipelineShaderStageCreateInfo stages[2] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = k->prog->vs, .pName = "main"},
@@ -4054,7 +4189,24 @@ static void build_pipeline(void *arg) {
         if (n++ < 20) LOG("[vk] graphics pipeline failed (%d): vs %llx fs %llx\n", (int)r,
                           (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
     }
-    atomic_store(&pp->state, r == VK_SUCCESS ? 1 : 2);
+    signal_build_done(&pp->state, r == VK_SUCCESS ? 1 : 2);
+}
+
+// A pipeline a draw is about to wait for (keep): built right here, no queue, no gate (from BOTWRecomp e8fac0f).
+static void schedule_pipeline_build(Pipe *pp, bool keep) {
+    if (keep && !sync_shaders() && urgent_builds_on()) {
+#ifdef __ANDROID__
+        WdMark wm = vk_wd_enter(WD_R_BUILD_WAIT, pp->k.prog ? pp->k.prog->code[1] : 0);
+#endif
+        uint64_t t0 = plat_now_ns();
+        build_pipeline(pp);
+        stat_build_wait_ns += plat_now_ns() - t0;
+#ifdef __ANDROID__
+        vk_wd_leave(wm);
+#endif
+        return;
+    }
+    run_job(build_pipeline, pp);
 }
 
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
@@ -7039,9 +7191,12 @@ static int compute_reset(void);  // (below compute_program)
 // In-place reboot (device.c backend_reset; GPU idle): drop what is keyed by guest addresses - programs by code
 // address, their pipelines, compute programs, shared copies - and the heap import: its pages are replaced
 // (re-imported on first use). The programs and pipelines are freed (from BOTWRecomp 0780cb6): only their index was,
-// and each reboot leaked them all. Those still building stay allocated (their jobs hold them), out of the index, so
-// pipeline keys holding their pointers can't collide with new ones - no wait for the worker queues is needed.
+// and each reboot leaked them all. The build queues are drained first (jobs_drain; from BOTWRecomp e8fac0f): queued jobs
+// end with state 2, running ones finish, so no worker reads the guest heap or touches an object afterwards. What is
+// still state 0 after that (nothing, short of a bug) stays allocated out of the index, as before: the rule below is
+// the safety net, not the mechanism.
 void vk_exec_reset(void) {
+    jobs_drain();
 #ifdef __ANDROID__
     vk_vamm_reset();
 #endif
@@ -7071,7 +7226,8 @@ void vk_exec_reset(void) {
         free(pipe_cache.entries);
         pipe_cache = (VkObjectCache){0};
         int nc = compute_reset();
-        LOG("[vk] reboot: %d programs, %d pipelines and %d compute programs freed (%d still building kept)\n", np, ng, nc, kept);
+        LOG("[vk] reboot: %d programs, %d pipelines and %d compute programs freed (%d still building kept, %llu builds stolen so far)\n", np, ng, nc, kept,
+            (unsigned long long)atomic_load(&stat_stolen_jobs));
     }
     gcopy_gen++;
     dchain = dchain_after = false;  // (from BOTWRecomp 7845d58)
@@ -7408,14 +7564,15 @@ typedef struct { Prog p; ShaderInfo *si; VkPipeline pipe; uint32_t local[3]; uin
 
 static void build_compute(void *arg) {
     CsProg *cp = arg;
+    if (atomic_load_explicit(&jobs_abort, memory_order_acquire)) { signal_build_done(&cp->p.state, 2); return; }  // (jobs_drain)
     size_t n = 0;
     uint32_t *spv = vk_glsl_to_spirv(cp->si->msl, STAGE_COMPUTE, "cs", &n);
-    if (!spv) { atomic_store(&cp->p.state, 2); return; }
+    if (!spv) { signal_build_done(&cp->p.state, 2); return; }
     cp->p.nbinds = vk_reflect(spv, n, cp->p.binds, MAX_BIND);
     VkShaderModule m = vk_module(spv, n);
     if (!m) {
         free(spv);
-        atomic_store(&cp->p.state, 2);
+        signal_build_done(&cp->p.state, 2);
         return;
     }
     cp->p.layout = make_layout(&cp->p, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0);
@@ -7442,7 +7599,7 @@ static void build_compute(void *arg) {
     }
     vkDestroyShaderModule(g_vk.dev, m, NULL);
     free(spv);
-    atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);  // (last: from here vk_exec_reset may free it; BOTWRecomp 0780cb6)
+    signal_build_done(&cp->p.state, r == VK_SUCCESS ? 1 : 2);  // (last: from here vk_exec_reset may free it; BOTWRecomp 0780cb6)
 }
 
 static void cs_free(CsProg *cp) {
@@ -7836,7 +7993,6 @@ static void draw_(CmdRec *r, bool indexed) {
             fkey.early_z = !(size >= 0x7cc && size < 0x880) && (ctl[0x718] & 1);
         }
     }
-    Prog *pr = get_program(st.program, &vkey, &fkey);
     bool keep = false;  // (a target built once and kept: wait for the shader and pipeline - wait_built)
     {   // (the same targets as the previous draw, same frame: their answer again - reading 6 texture objects a draw
         // showed up)
@@ -7858,7 +8014,8 @@ static void draw_(CmdRec *r, bool indexed) {
         }
         keep = kkeep;
     }
-    if (pr && keep) wait_built(&pr->state);
+    Prog *pr = get_program(st.program, &vkey, &fkey, keep && urgent_builds_on());  // (after keep: a waited-on program's jobs go first)
+    if (pr && keep) wait_built_job(&pr->state, &pr->urgent, pr, pr->code[1]);
     if (!pr || atomic_load(&pr->state) != 1) { stat_skipped++; skip_note("shader"); return; }
     {   // fragment-shader hash: interior backdrop detection (widescreen), skip lists, item twinkle (renderer.m)
         static uint64_t last_fs, last_hash;
@@ -8275,10 +8432,10 @@ static void draw_(CmdRec *r, bool indexed) {
             pp = calloc(1, sizeof *pp);
             pp->k = k;
             entry->object = pp;
-            run_job(build_pipeline, pp);
+            schedule_pipeline_build(pp, keep);
         } else if (pp->evicted) {  // (destroyed by pipe_evict: built again)
             pp->evicted = false;
-            run_job(build_pipeline, pp);
+            schedule_pipeline_build(pp, keep);
         }
         // Verification rebuilds the original key to detect missing invalidations during later device tests.
         if (hit && memcmp(&k, &last_pipeline->k, sizeof k)) {
@@ -8288,7 +8445,7 @@ static void draw_(CmdRec *r, bool indexed) {
         last_pipeline = pp;
         pipeline_dirty = false;
     }
-    if (keep) wait_built(&pp->state);
+    if (keep) wait_built_job(&pp->state, NULL, pp, pp->k.prog ? pp->k.prog->code[1] : 0);
     if (atomic_load(&pp->state) != 1) {
         if (g_debug_frame) LOG("[draw]   skipped: pipeline %s\n", atomic_load(&pp->state) ? "failed" : "still building");
         stat_skipped++;
