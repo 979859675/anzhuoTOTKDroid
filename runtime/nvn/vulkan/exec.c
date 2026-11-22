@@ -49,6 +49,8 @@ static uint64_t stat_pipe_binds, stat_set_binds;  // (graphics draws: pipelines 
 // sets = descriptor sets incl. cbuf copies, vtx = index scan + vertex copies, submit = vkQueueSubmit2)
 static int prof = -1;
 static uint64_t prof_dsw, prof_cbuf, prof_set_hits, prof_set_miss;  // (sets: driver writes, cbuf copies, set cache)
+static uint64_t prof_gcopy;  // (sets: copy mode's global memory tables - gcopy_prepare / gwin_prepare, counted in sets)
+static uint64_t stat_gc_memo_hits;  // (gcopy_prepare: tables reused from the draw before)
 static uint64_t prof_exec, prof_draw, prof_sets, prof_vtx, prof_submit, prof_pre, prof_key, prof_dyn, prof_tex, prof_up, prof_gpu;
 static VkQueryPool prof_qp;
 static uint64_t cum_exec, cum_wait, cum_draws, cum_submits;  // (profiling) never reset: hitch log
@@ -1970,9 +1972,10 @@ const char *renderer_stats(void) {
                  prof_gpu / 1e6, prof_exec / 1e6, prof_draw / 1e6, prof_pre / 1e6, prof_key / 1e6, prof_dyn / 1e6, prof_sets / 1e6,
                  prof_tex / 1e6, prof_up / 1e6, prof_vtx / 1e6, prof_submit / 1e6);
         n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, " | sets: driver %.0f cbuf %.0f ms, cache %llu hits %llu misses",
-                 prof_dsw / 1e6, prof_cbuf / 1e6, (unsigned long long)prof_set_hits, (unsigned long long)prof_set_miss);
-        prof_dsw = prof_cbuf = prof_set_hits = prof_set_miss = 0;
+        snprintf(stats_text + n, sizeof stats_text - n, " | sets: driver %.0f cbuf %.0f gmem tables %.0f ms (%llu reused), cache %llu hits %llu misses",
+                 prof_dsw / 1e6, prof_cbuf / 1e6, prof_gcopy / 1e6, (unsigned long long)stat_gc_memo_hits, (unsigned long long)prof_set_hits,
+                 (unsigned long long)prof_set_miss);
+        prof_dsw = prof_cbuf = prof_gcopy = prof_set_hits = prof_set_miss = stat_gc_memo_hits = 0;
         extern uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn, prof_tex_same_bytes,
             prof_tex_snap_bytes, prof_tex_calm_bytes;
         n = strlen(stats_text);
@@ -5916,6 +5919,7 @@ static VmaAllocation ga_mem;
 static uint8_t *ga_ptr;
 static uint64_t ga_res_top, ga_head = GA_RES, ga_seg_seq[GA_SIZE / GA_SEG];
 static int gres_state = -1;
+static uint64_t gres_gen;  // (bumped when resident slots are made, merged, let go or reset: gcopy_prepare's memo)
 static uint64_t stat_gres_res, stat_gres_sync;  // (resident ranges used, CPU-changed bytes uploaded)
 
 // The arena's memory not coherent (Mali: its cached type 0xb; no type is both cached and coherent): what the CPU
@@ -6053,6 +6057,7 @@ static bool ga_backs_into(uint64_t off, uint64_t len) {  // (a write-back still 
     return any;
 }
 static void gres_reclaim(void) {
+    gres_gen++;
     uint64_t done = vk_completed_seq();
     for (int i = 0; i < ga_nres; i++) {
         GaRes *e = &ga_res[i];
@@ -6128,6 +6133,7 @@ static GaRes *gres_get(uint64_t lo, uint64_t hi, bool create) {
         return NULL;
     }
     GaRes *n = &ga_res[slot];
+    gres_gen++;
     uint8_t *shadow = malloc(len);
     uint64_t *bseq = calloc((len + 255) / 256, sizeof *bseq);
     if (!shadow || !bseq) { free(shadow); free(bseq); if (slot == ga_nres - 1) ga_nres--; return NULL; }
@@ -6405,6 +6411,7 @@ static VkDescriptorBufferInfo gmiss_info(void) {
 }
 
 static void gres_reset(void) {
+    gres_gen++;
     pthread_mutex_lock(&gc_lock);
     gc_nback = 0;  // (their shadow / bseq pointers and guest addresses belong to the boot being torn down)
     pthread_mutex_unlock(&gc_lock);
@@ -6524,7 +6531,56 @@ static int gcopy_ranges(unsigned stage_mask, bool store, GcRange *r) {
     return m;
 }
 
+// The last loading draw's table, and what it was made from: a draw that binds the same storage buffers in the same
+// submission and frame, with the arena and the learned ranges as they were, reuses it - its loads were copied into
+// the ring for this submission already. A lit pass draws many objects in a row over the same light list: gcopy_prepare
+// ran whole for each, ~240 ms of the render thread every 2 s on the Great Sky Island in the Mali simulation
+// (2026-11-21). Not for a storing draw (its write-backs are queued per draw). LARECOMP_GCOPY_MEMO=0: always made.
+static struct {
+    bool ok;
+    unsigned mask;
+    int gl_n;
+    uint64_t seq, frame, gen, size;
+    uint64_t sb[6][16][2];
+    uint32_t tab[(GMAP_MAX + 1) * 4];
+    VkSpan span;
+} gc_memo;
+static bool gc_memo_key(unsigned stage_mask, bool fill) {  // (fill: store this draw's key; else: does it match?)
+    uint64_t seq = vk_pending_seq(), frame = renderer_present_count();
+    if (!fill && (!gc_memo.ok || gc_memo.mask != stage_mask || gc_memo.seq != seq || gc_memo.frame != frame ||
+                  gc_memo.gen != gres_gen || gc_memo.gl_n != gl_n)) return false;
+    for (int st_ = 0; st_ < 6; st_++) {
+        if (!(stage_mask & (1u << st_))) continue;
+        for (int i = 0; i < 16; i++) {
+            uint64_t ad = st.sbuf[st_][i].addr, sz = st.sbuf[st_][i].size;
+            if (fill) gc_memo.sb[st_][i][0] = ad, gc_memo.sb[st_][i][1] = sz;
+            else if (gc_memo.sb[st_][i][0] != ad || gc_memo.sb[st_][i][1] != sz) return false;
+        }
+    }
+    if (fill) gc_memo.mask = stage_mask, gc_memo.seq = seq, gc_memo.frame = frame, gc_memo.gen = gres_gen, gc_memo.gl_n = gl_n;
+    return true;
+}
+static void gcopy_prepare_(unsigned stage_mask, bool store);
 static void gcopy_prepare(unsigned stage_mask, bool store) {
+    static int on = -1;
+    if (on < 0) on = !getenv("LARECOMP_GCOPY_MEMO") || atoi(getenv("LARECOMP_GCOPY_MEMO")) != 0;
+    if (on && !store && gc_memo_key(stage_mask, false)) {
+        memcpy(gmap_tab, gc_memo.tab, sizeof gmap_tab);
+        gc_span = gc_memo.span, gc_size = gc_memo.size, gfast_n = 0;
+        stat_gc_memo_hits++;
+        return;
+    }
+    gcopy_prepare_(stage_mask, store);
+    gc_memo.ok = false;
+    if (on && !store) {  // (made after it: the arena's generation as it stands now)
+        gc_memo_key(stage_mask, true);
+        memcpy(gc_memo.tab, gmap_tab, sizeof gmap_tab);
+        gc_memo.span = gc_span, gc_memo.size = gc_size;
+        gc_memo.ok = true;
+    }
+}
+
+static void gcopy_prepare_(unsigned stage_mask, bool store) {
     memset(gmap_tab, 0, sizeof gmap_tab);
     gfast_n = 0;
     gc_size = 0;
@@ -8234,11 +8290,13 @@ static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_dyn += SDL_GetTicksNS() - prof_td_;
     PROF_T0();
 #ifdef __ANDROID__
+    uint64_t prof_tg_ = prof ? SDL_GetTicksNS() : 0;
     if (gcopy_mode && (pr->vi->uses_gmem_map || pr->fi->uses_gmem_map))  // (the table both stages' sets use)
         gcopy_prepare((pr->vi->uses_gmem_map ? 1u : 0u) | (pr->fi->uses_gmem_map ? 2u : 0u),
                       pr->vi->uses_gmem_store || pr->fi->uses_gmem_store);
     else if (gwin_mode && (pr->vi->uses_gmem_map || pr->fi->uses_gmem_map))
         gwin_prepare((pr->vi->uses_gmem_map ? 1u : 0u) | (pr->fi->uses_gmem_map ? 2u : 0u));
+    if (prof) prof_gcopy += SDL_GetTicksNS() - prof_tg_;
 #endif
     uint32_t dyn[64], ndv = 0, ndf = 0;  // (the sets' dynamic uniform buffer offsets: vertex, then fragment)
     memset(cbw_patch, 0, sizeof cbw_patch);  // (cbwin_bind fills them while the sets are written)
