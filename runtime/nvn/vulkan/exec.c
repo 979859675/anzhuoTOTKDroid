@@ -1121,6 +1121,11 @@ void vk_gpuprof_report(void) {
     gp_n = 0;
 }
 
+// Dispatch chaining's state (dispatch_compute, below; the submission flushes what is owed)
+static bool dchain;              // the last GPU work recorded was a dispatch; since then only binds and state
+static VkCommandBuffer dchain_cb;
+static bool dchain_after;        // that dispatch's barrier after it is still owed
+
 // Submit the pending work (if any). wait/signal: binary semaphores for presentation (may be null).
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra) {
     (void)extra;
@@ -1139,6 +1144,8 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
         cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->upload};
     }
     vk_cmd();  // (an empty main buffer still carries the semaphores)
+    if (dchain_after) vk_full_barrier(s->main);  // (the barrier a chained storing dispatch still owes, from BOTWRecomp 7845d58)
+    dchain = dchain_after = false;
 #ifdef __ANDROID__
     if (vk_counter_mode() == 2 && cq[cur_sub].pool) {  // the submission's end (cq_resolve: the idle between submissions)
         vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, cq[cur_sub].pool, CQ_MAX + 1);
@@ -5844,15 +5851,25 @@ static void gfast_prepare(VkCommandBuffer cb) {
 // the GPU (TOTK: ~60 dispatches a frame, most 1x1x1 at ~45 us each, runs of 20+ of the same shader). Between such
 // dispatches no barrier then; the one owed after a storing dispatch comes before the next thing that isn't a dispatch,
 // a bind or state. LARECOMP_VK_DISPATCH_CHAIN=0: a barrier around every dispatch, as before.
-static bool dchain;              // the last GPU work recorded was a dispatch; since then only binds and state
-static VkCommandBuffer dchain_cb;
-static bool dchain_after;        // that dispatch's barrier after it is still owed
 static bool dchain_ok(void) {
     int ab = AB("dbar");
     if (ab >= 0) return ab == 1;
     static int on = -1;
     if (on < 0) on = !getenv("LARECOMP_VK_DISPATCH_CHAIN") || atoi(getenv("LARECOMP_VK_DISPATCH_CHAIN")) != 0;
     return on;
+}
+// Copy mode (no heap on the GPU, global memory through the arena): chained too, with one barrier owed after a dispatch
+// that stores or writes an image, paid before the next thing that isn't a dispatch, a bind or state, a copy-in of the
+// arena (gres_get) or the submission's end (from BOTWRecomp 7845d58). LARECOMP_VK_GCOPY_DCHAIN=0: a barrier around
+// every dispatch, as before. Other modes (placed heap, import) are untouched.
+static bool gcopy_dchain(void) {
+#ifdef __ANDROID__
+    static int on = -1;
+    if (on < 0) on = !getenv("LARECOMP_VK_GCOPY_DCHAIN") || atoi(getenv("LARECOMP_VK_GCOPY_DCHAIN")) != 0;
+    return on && gcopy_mode && !gmem_buf && dchain_ok();
+#else
+    return false;
+#endif
 }
 static bool dchain_keeps(uint32_t op) {  // (records no GPU work: binds, state, the CPU's uniform updates, list jumps)
     return (op >= CMD_BIND_PROGRAM && op <= CMD_SET_RENDER_ENABLE) || op == CMD_END || op == CMD_JUMP || op == CMD_CALL ||
@@ -6191,6 +6208,7 @@ static GaRes *gres_get(uint64_t lo, uint64_t hi, bool create) {
             e->live = false, e->dead_seq = vk_pending_seq();  // (its space and index back once that's done: gres_reclaim)
         }
         vk_full_barrier(cb);
+        dchain_after = false;  // (this barrier covers what a chained dispatch owed: from BOTWRecomp 7845d58)
     }
     return n;
 }
@@ -6620,6 +6638,7 @@ static void gcopy_prepare(unsigned stage_mask, bool store) {
 static void gcopy_prepare_(unsigned stage_mask, bool store) {
     memset(gmap_tab, 0, sizeof gmap_tab);
     gfast_n = 0;
+    gfast_win = (VkDescriptorBufferInfo){0};  // (from BOTWRecomp 7845d58)
     gc_size = 0;
     GcRange r[6 * 16];
     int m = gcopy_ranges(stage_mask, store, r);
@@ -7055,6 +7074,8 @@ void vk_exec_reset(void) {
         LOG("[vk] reboot: %d programs, %d pipelines and %d compute programs freed (%d still building kept)\n", np, ng, nc, kept);
     }
     gcopy_gen++;
+    dchain = dchain_after = false;  // (from BOTWRecomp 7845d58)
+    dchain_cb = VK_NULL_HANDLE;
     if (gmem_buf) {
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
         vkFreeMemory(g_vk.dev, gmem_mem, NULL);
@@ -7065,6 +7086,8 @@ void vk_exec_reset(void) {
     g_inplace_copy = -1;  // (the next boot reads the setting again: resolve_feedback)
 #ifdef __ANDROID__
     gmem_bda = 0;
+    gwin_mode = false;  // (from BOTWRecomp 7845d58)
+    gfast_win = (VkDescriptorBufferInfo){0};
     gcopy_mode = !g_vk.host_import && !getenv("LARECOMP_VK_NO_GCOPY");  // (until the next heap is placed: vk_heap_place)
     gres_reset();  // (the arena's resident ranges: keyed by the old heap's addresses)
 #endif
@@ -7502,6 +7525,14 @@ static int compute_reset(void) {
     return n;
 }
 
+#ifdef __ANDROID__
+static bool cs_writes_image(const ShaderInfo *si) {  // (from BOTWRecomp 7845d58)
+    for (int i = 0; si && i < si->ntex; i++)
+        if (si->tex[i].is_image) return true;
+    return false;
+}
+#endif
+
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
@@ -7558,11 +7589,13 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     vk_bc_shadows_resolve(NULL, NULL, NULL, 0);  // (BC textures drawn into: decoded before anything outside a pass reads them)
 #endif
     VkCommandBuffer cb = vk_cmd_rp();  // (the barrier, binds and dispatch: packets for the replay thread while rp_on)
+    bool gc = gcopy_dchain();  // (copy mode: the barrier owed by a chained dispatch is carried on, from BOTWRecomp 7845d58)
     bool chained = dchain && cb == dchain_cb && dchain_ok();
+    bool owe_after = gc && chained && dchain_after;
     if (chained) stat_dchained++;
     else rpFullBarrier(cb);
     dchain = false;
-    dchain_after = false;
+    dchain_after = owe_after;
     gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx gmem %d", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
             (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
     dl_note("dispatch %ux%ux%u cs %llx gmem %d", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
@@ -7585,10 +7618,16 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     rpCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
     rpCmdDispatch(cb, gx, gy, gz);
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
+#ifdef __ANDROID__
+    if (gc && (cp->si->uses_gmem_store || cs_writes_image(cp->si))) {  // (owes one barrier after it; at once if the buffer changed)
+        if (vk_cmd_rp() == cb) dchain_after = true;
+        else rpFullBarrier(vk_cmd_rp());
+    }
+#endif
     if (cp->si->uses_gmem_store) vc_mark_sbufs(5), note_gmem_store(5);
     stat_dispatches++;
 #ifdef __ANDROID__
-    dchain = !gcopy_mode && !gfast_n;  // (a copy mode's ranges go through gfast_buf: those keep their barriers)
+    dchain = gc ? !gfast_n && vk_cmd_rp() == cb : !gcopy_mode && !gfast_n;  // (else a copy mode's ranges keep their barriers)
 #endif
     dchain_cb = cb;
 }
@@ -9666,7 +9705,7 @@ static void exec_list(uint64_t handle, int depth) {
             p += r->size;
             continue;
         }
-        if (dchain && r->op != CMD_DISPATCH && !dchain_keeps(r->op)) {  // (the dispatches' run ends)
+        if ((dchain || dchain_after) && r->op != CMD_DISPATCH && !dchain_keeps(r->op)) {  // (the dispatches' run ends)
             dchain = false;
             if (dchain_after) rpFullBarrier(vk_cmd_rp());
             dchain_after = false;
