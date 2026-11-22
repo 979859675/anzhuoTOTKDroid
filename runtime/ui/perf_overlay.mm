@@ -245,9 +245,13 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     else if (gen && isfinite(presented)) snprintf(f, sizeof f, "%s > %s FPS", number(a, fps), number(b, presented));
     else if (isfinite(presented) && presented > fps + 1) snprintf(f, sizeof f, "%s > %s FPS", number(a, fps), number(b, presented));
     else snprintf(f, sizeof f, "%s FPS", number(a, fps));
-    char ram[24];
+    // the app's memory in use, the phone's total and what is still free (MemAvailable): all three, in both styles
+    char ram[24], mem[80];
     if (rss < 0) strcpy(ram, "--");
     else snprintf(ram, sizeof ram, "%ld MB", rss);
+    if (rss < 0) strcpy(mem, "--");
+    else if (total <= 0) snprintf(mem, sizeof mem, "RAM %ld MB, free %ld MB", rss, avail);
+    else snprintf(mem, sizeof mem, "RAM %ld / %ld MB, free %ld MB", rss, total, avail);
 
     font = g_overlay_font ? g_overlay_font : ImGui::GetFont();
     // compact: Swap2's items, each as wide as its widest reading (so the panel keeps its size) and a gap apart
@@ -255,10 +259,11 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     char cs[5][48];
     float cw[5], csz[5] = {15, 13, 13, 13, 13};
     static const uint32_t ccol[5] = {0xFF6DE6EF, 0xFFFFFFFF, 0xFFE3EAF5, 0xFFFFD477, 0xFFFFD477};
-    const char *widest[5] = {gen ? "88.8 > 88.8 FPS" : "88.8 FPS", "888.8 ms", "RAM 8888 MB", "SoC 88.8\xc2\xb0", "BAT 88.8\xc2\xb0"};
+    const char *widest[5] = {gen ? "88.8 > 88.8 FPS" : "88.8 FPS", "888.8 ms", "RAM 8888 / 16384 MB, free 8888 MB",
+                             "SoC 88.8\xc2\xb0", "BAT 88.8\xc2\xb0"};
     snprintf(cs[0], sizeof cs[0], "%s", f);
     snprintf(cs[1], sizeof cs[1], "%s ms", number(a, ms));
-    snprintf(cs[2], sizeof cs[2], "RAM %s", ram);
+    snprintf(cs[2], sizeof cs[2], "%s", mem);
     snprintf(cs[3], sizeof cs[3], "SoC %s\xc2\xb0", number(a, soc));
     snprintf(cs[4], sizeof cs[4], "BAT %s\xc2\xb0", number(a, bat));
     float cx = 12;
@@ -307,7 +312,7 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         chart(0, 82, 0xFF50DBEB, "FPS");
         chart(1, 123, 0xFFFFCE78, "ms");
         chart(2, 164, 0xFFA699FF, "RAM MB");
-        snprintf(s, sizeof s, "GPU %s ms  |  RAM %s", number(a, gms), ram);
+        snprintf(s, sizeof s, "GPU %s ms  |  App RAM %s", number(a, gms), ram);
         text(s, 12, 212, 11, 0xFFE3EAF5);
         snprintf(s, sizeof s, "CPU cap %s%s", cpu, turnip ? "  |  Turnip (Mesa)" : "");
         text(s, 12, 229, 10, turnip ? 0xFFFF9F43 : 0xFFE3EAF5);
@@ -316,12 +321,12 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         else snprintf(lv, sizeof lv, "%d%%", level);
         snprintf(s, sizeof s, "SoC %s\xc2\xb0  BAT %s\xc2\xb0  %s", number(a, soc), number(b, bat), lv);
         text(s, 12, 246, 11, 0xFFFFD477);
-        char fr[32], th[8];
+        char fr[64], th[8];
         if (total <= 0) strcpy(fr, "--");
-        else snprintf(fr, sizeof fr, "%.1f / %.1f GB", avail / 1024.0f, total / 1024.0f);
+        else snprintf(fr, sizeof fr, "%.1f GB total, %.1f GB free", total / 1024.0f, avail / 1024.0f);
         if (thermal < 0) strcpy(th, "--");
         else snprintf(th, sizeof th, "%d", thermal);
-        snprintf(s, sizeof s, "Free RAM %s  T:%s", fr, th);
+        snprintf(s, sizeof s, "Phone RAM %s  T:%s", fr, th);
         text(s, 12, 263, 10, 0xFFE3EAF5);
         text("500 ms samples \xc2\xb7 48 s history", 12, 279, 9, 0xFF92A5BC);
     }
