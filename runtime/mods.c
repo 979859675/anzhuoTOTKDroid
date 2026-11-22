@@ -72,6 +72,13 @@ static bool cheats_dir_in(const char *base, char *out, size_t cap) {
     return false;
 }
 
+// the ExeFS folder of a mod (exefs/, or an Atmosphere place of its patches): a mod of ExeFS patches alone is a mod
+static bool exefs_dir_in(const char *base) {
+    char d[1200], atm[1200];
+    if (sub_dir(base, "exefs", d, sizeof d)) return true;
+    return sub_dir(base, "atmosphere", atm, sizeof atm) && sub_dir(atm, "exefs_patches", d, sizeof d);
+}
+
 // A mod's folder: mods/<name>, or the folder mods/<name>.link names (a mod used in place - Mods > Import a mod folder
 // with Game Files > Game files: Use them in place; TOTKRecompAndroidActivity.importMod). false: neither is there.
 static bool mod_base(const char *name, char *out, size_t cap) {
@@ -81,6 +88,7 @@ static bool mod_base(const char *name, char *out, size_t cap) {
     snprintf(p, sizeof p, "%s/romfs", out);
     if (!stat(p, &sb) && S_ISDIR(sb.st_mode)) return true;
     if (cheats_dir_in(out, NULL, 0)) return true;   // (a mod of cheats only)
+    if (exefs_dir_in(out)) return true;             // (a mod of ExeFS patches only, e.g. Linkle-Armor-Fix)
     snprintf(p, sizeof p, "mods/%s.link", name);
     FILE *f = fopen(p, "rb");
     if (!f) return false;
