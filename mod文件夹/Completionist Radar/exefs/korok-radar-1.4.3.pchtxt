@@ -1,0 +1,48 @@
+@nsobid-277178B7DBA1B6D4949A84778D4ABC58B31B34F5
+# Korok Radar for TOTK 1.4.3: the map and the minimap show the Korok seeds you have NOT found yet, at the two
+# closest zoom levels, and each one disappears once collected (inverts the game's own "found" check; 128 icons, not 20).
+# Part of the Completionist Radar mod.
+@flag offset_shift 0x100
+@enabled
+020FC7FC 08030034  // hidden Korok: show while not found (cbnz -> cbz)
+020FC858 60F6FF54  // carry Korok: show while not delivered (b.ne -> b.eq)
+00B9FF8C E8FEBFF2  // minimap mask 0x3fef7bffe -> 0x3fff7bffe (bit 24 = Koroks)
+020FC720 28010836  // zoom levels 0 and 1 of 0-3 (cbz w8 -> tbz w8, #1)
+02101680 2F000014  // cursor: skip the 20 Korok slots
+003F9098 000B80D2  // part object 0x50 -> 0x58 bytes (mov x0, #0x58)
+003F9110 58039F14  // -> cave 0x2bb9e70: slot min(i, 19) = part, chain head = part
+02BB9E70 A84E00D1  //   cave
+02BB9E74 09FD7F93  //   cave
+02BB9E78 0801098A  //   cave
+02BB9E7C 084D0091  //   cave
+02BB9E80 694E40F9  //   cave
+02BB9E84 092800F9  //   cave
+02BB9E88 607A28F8  //   cave
+02BB9E8C 604E00F9  //   cave
+02BB9E90 A1FC6017  //   cave back
+003F9118 BF0202F1  // make 128 parts
+0073557C 752647F9  // x21 = chain head
+00735588 B52A40F9  // busy: next part
+0073558C B5FFFFB5  // loop
+00735590 24FCFF17  // none free: next Korok
+0091CF9C 752647F9  // x21 = chain head
+0091CFA8 B52A40F9  // busy: next part
+0091CFAC B5FFFFB5  // loop
+0091CFB0 591601F0  // adrp x25 (moved)
+0091CFB4 39430491  // add x25 (moved)
+0091CFB8 F80340F9  // ldr x24, [sp] (moved)
+0091CFBC C3FCFF17  // none free: next Korok
+0210037C 742647F9  // hide all: x20 = chain head
+02100380 01008052  // mov w1, #0
+02100384 E00314AA  // mov x0, x20
+02100388 B455A997  // hide
+0210038C 881240F9  // 
+02100398 942A40F9  // next part
+0210039C 34FFFFB5  // loop
+021003A0 04000014  // done
+0096FEDC 762747F9  // x22 = chain head
+0096FEE8 73060011  // count first (add w19, w19, #1), so its old place can hold the chain step
+0096FEEC 1F2003D5  // no slot load
+0096FF08 D62A40F9  // next part
+0096FF0C 7F020271  // all 128 parts
+@stop

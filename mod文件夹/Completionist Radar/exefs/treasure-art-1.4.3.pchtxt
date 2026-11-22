@@ -1,0 +1,58 @@
+@nsobid-277178B7DBA1B6D4949A84778D4ABC58B31B34F5
+# Treasure Art for TOTK 1.4.3: compass, star and chest pictures on the Completionist Radar markers,
+# taken from the game's own loaded textures, so it works at every screen shape.
+@flag offset_shift 0x100
+@enabled
+009700A8 D6268914  // -> cave 0x2bb9c00: marker picture from the game's own stamp and shop textures
+02BB9C00 1C1B00F9  //   cave
+02BB9C04 091340F9  //   cave
+02BB9C08 290D40F9  //   cave
+02BB9C0C 291140F9  //   cave
+02BB9C10 290D40F9  //   cave
+02BB9C14 2A6940F9  //   cave
+02BB9C18 6B7342F9  //   cave
+02BB9C1C 6B0140F9  //   cave
+02BB9C20 6B2940F9  //   cave
+02BB9C24 6B1540F9  //   cave
+02BB9C28 6C6F45F9  //   cave
+02BB9C2C 8C2940F9  //   cave
+02BB9C30 8C1540F9  //   cave
+02BB9C34 6D2140F9  //   cave
+02BB9C38 6E1D40F9  //   cave
+02BB9C3C 8F2540F9  //   cave
+02BB9C40 D17E00D1  //   cave
+02BB9C44 31FE7F93  //   cave
+02BB9C48 CBCE00D1  //   cave
+02BB9C4C 6BFD7F93  //   cave
+02BB9C50 CCB601D1  //   cave
+02BB9C54 8CFD7F93  //   cave
+02BB9C58 502D40F9  //   cave
+02BB9C5C 00020DCA  //   cave
+02BB9C60 00000C8A  //   cave
+02BB9C64 100200CA  //   cave
+02BB9C68 00020ECA  //   cave
+02BB9C6C 00000B8A  //   cave
+02BB9C70 100200CA  //   cave
+02BB9C74 00020FCA  //   cave
+02BB9C78 0000118A  //   cave
+02BB9C7C 100200CA  //   cave
+02BB9C80 502D00F9  //   cave
+02BB9C84 302540F9  //   cave
+02BB9C88 0D40A8D2  //   cave
+02BB9C8C AD810DAA  //   cave
+02BB9C90 0E40A8D2  //   cave
+02BB9C94 CE810EAA  //   cave
+02BB9C98 0F3CA8D2  //   cave
+02BB9C9C EF810FAA  //   cave
+02BB9CA0 00020DCA  //   cave
+02BB9CA4 00000C8A  //   cave
+02BB9CA8 100200CA  //   cave
+02BB9CAC 00020ECA  //   cave
+02BB9CB0 00000B8A  //   cave
+02BB9CB4 100200CA  //   cave
+02BB9CB8 00020FCA  //   cave
+02BB9CBC 0000118A  //   cave
+02BB9CC0 100200CA  //   cave
+02BB9CC4 302500F9  //   cave
+02BB9CC8 F9D87617  //   cave back
+@stop

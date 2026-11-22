@@ -1,0 +1,51 @@
+@nsobid-277178B7DBA1B6D4949A84778D4ABC58B31B34F5
+# Shrine Radar for TOTK 1.4.3: undiscovered shrines show on the map too, in the
+# normal orange (not cleared) look. Code only, works at every resolution.
+# Part of the Completionist Radar mod.
+@flag offset_shift 0x100
+@enabled
+020F6FA8 960B2B14  // -> cave 0x2bb9e00: DungeonState handle args
+02BB9E00 FF0B00F9  //   cave
+02BB9E04 FF1B00B9  //   cave
+02BB9E08 FF730039  //   cave
+02BB9E0C 82FB8252  //   cave
+02BB9E10 A2CEBD72  //   cave
+02BB9E14 E1430091  //   cave
+02BB9E18 65F4D417  //   cave back
+020F6FB0 9B0B2B14  // -> cave 0x2bb9e1c: x0 = GameDataMgr
+02BB9E1C B5FA47F9  //   cave
+02BB9E20 A00240F9  //   cave
+02BB9E24 64F4D417  //   cave back
+020F6FB4 0D648B97  // get DungeonState table
+020F6FB8 80000036  // no table -> normal check
+020F6FBC 9B0B2B14  // -> cave 0x2bb9e28: enum args
+02BB9E28 A00240F9  //   cave
+02BB9E2C E1330091  //   cave
+02BB9E30 E2430091  //   cave
+02BB9E34 831E40B9  //   cave
+02BB9E38 62F4D417  //   cave back
+020F6FC0 B6F99897  // DungeonState[entry]
+020F6FC4 80010037  // has a DungeonState = shrine -> show
+020F6FC8 9D0B2B14  // -> cave 0x2bb9e3c: found-table handle args
+02BB9E3C FF0B00F9  //   cave
+02BB9E40 FF1B00B9  //   cave
+02BB9E44 FF730039  //   cave
+02BB9E48 62569352  //   cave
+02BB9E4C 623DAB72  //   cave
+02BB9E50 E1430091  //   cave
+02BB9E54 A00240F9  //   cave
+02BB9E58 5DF4D417  //   cave back
+020F6FD4 A20B2B14  // -> cave 0x2bb9e5c: bool args
+02BB9E5C A00240F9  //   cave
+02BB9E60 E1330091  //   cave
+02BB9E64 E2430091  //   cave
+02BB9E68 831E40B9  //   cave
+02BB9E6C 5BF4D417  //   cave back
+020F6FD8 C8E48297  // found[entry]
+020F6FDC E0020036  // lookup failed -> hide
+020F6FE0 E8334039  // w8 = found
+020F6FE4 A8020034  // not found -> hide
+020F6FE8 03000014  // found -> show
+020F6FEC 1F2003D5  // unused
+020F6FF0 1F2003D5  // unused
+@stop
