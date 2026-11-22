@@ -827,7 +827,7 @@ static void tab_display(void) {
             launcher_restart_app();
     }
     {   // Memory saving (platform/android.c plat_guest_file): read as the app starts
-        extern bool plat_guest_file_active(void);
+        extern "C" bool plat_guest_file_active(void);  // (platform/android.c: a C function)
         void launcher_restart_app(void);  // (ui/launcher.mm)
         opt_toggle("Memory saving", &g_settings.mem_file, false,
                    "Keeps the game's memory in a file on the phone's storage instead of in RAM, so Android can take back "
