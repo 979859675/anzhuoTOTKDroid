@@ -26,6 +26,10 @@
   `runtime/cheat_vm.h`, are ported from [valentderah/totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp)
   (`runtime/cheats.c` there, MIT). Its MIT License notice: Copyright (c) 2026 Valiantsin Dzerakh (the full text is in that repository's LICENSE). `runtime/cheats.c`
   and `runtime/cheats.h` here are TOTKDroid's glue to the phone's memory, and are MIT as well. See [docs/CHEATS.md](docs/CHEATS.md).
+- **Ported from PC TotK Recomp (MIT):** the game's resource size table (RESTBL), `runtime/services/restbl.c` and
+  `runtime/services/restbl.h`, with its host test `tests/restbl/`, are ported from
+  [valentderah/totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp) (`runtime/restbl.c` and `runtime/restbl.h`
+  there, MIT). Same MIT License notice as above. The table's merge into `runtime/services/fs.c` is TOTKDroid's own.
 - **Third-party code** keeps its own license, listed in [README.md](README.md#credits).
 - **Ideas and layouts from [totk-android](https://github.com/AurelioB/totk-android)** (AurelioB, MIT): the HD rumble
   mixing in `runtime/hle/input.c` (two bands to one strength, the silence threshold, the 250 ms stale value) follows its
