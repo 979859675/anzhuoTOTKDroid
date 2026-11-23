@@ -720,3 +720,7 @@
  "Sceglie il tuo Lossless.dll con il selettore di file di Android e ne tiene una copia nei file dell'app, che l'app può sempre leggere - per quando dice di non riuscire ad aprire il file dove l'hai messo."},
 {"Lossless.dll imported: %s",
  "Lossless.dll importato: %s"},
+{"Shadows",
+ "Ombre"},
+{"The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. Applies at once.",
+ "Le ombre del gioco: del sole, di Link e di tutto ciò che lo circonda. Disattivato: non ne viene disegnata nessuna - l'immagine è più piatta e illuminata in modo uniforme, e la GPU lavora un po' meno a ogni fotogramma; conviene solo su un telefono al limite. Si applica subito."},

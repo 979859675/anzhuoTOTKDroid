@@ -720,3 +720,7 @@
  "Выбирает ваш Lossless.dll через выбор файлов Android и сохраняет копию в собственных файлах приложения, которые оно всегда может прочитать - на случай, если оно пишет, что не может открыть файл там, куда вы его положили."},
 {"Lossless.dll imported: %s",
  "Lossless.dll импортирован: %s"},
+{"Shadows",
+ "Тени"},
+{"The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. Applies at once.",
+ "Тени в игре: от солнца, от Линка и от всего вокруг. Выкл.: тени не рисуются - картинка становится более плоской и равномерно освещённой, а GPU работает в каждом кадре немного меньше; имеет смысл только на телефоне, работающем на пределе. Применяется сразу."},

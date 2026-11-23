@@ -720,3 +720,7 @@
  "用 Android 的檔案選擇器選擇你的 Lossless.dll,並在應用程式自己的檔案中保留一份應用程式總能讀取的副本 - 用於應用程式提示無法開啟你放置的檔案時。"},
 {"Lossless.dll imported: %s",
  "已匯入 Lossless.dll:%s"},
+{"Shadows",
+ "陰影"},
+{"The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. Applies at once.",
+ "遊戲的陰影：太陽、林克以及周圍一切的陰影。關閉：不繪製任何陰影 - 畫面更平、光照均勻，每幀 GPU 的工作稍少；只適合效能已到極限的手機。立即生效。"},

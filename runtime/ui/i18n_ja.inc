@@ -720,3 +720,7 @@
  "Android のファイル選択で Lossless.dll を選び、アプリが必ず読めるアプリ自身のファイルにコピーを保存します - 置いた場所のファイルを開けないと表示されるときに。"},
 {"Lossless.dll imported: %s",
  "Lossless.dll を取り込みました: %s"},
+{"Shadows",
+ "影"},
+{"The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. Applies at once.",
+ "ゲームの影（太陽、リンク、周囲のすべての影）。オフ：影を描画しません。画面は平坦で均一に明るくなり、GPU の負荷がフレームごとに少し減ります。性能に余裕のない端末でのみおすすめです。すぐに反映されます。"},

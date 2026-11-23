@@ -45,6 +45,8 @@ typedef struct {
     int rumble;           // the game's vibration, % strength (0 off) on the controller, or the phone without one (hle/input.c)
     int shadow_res;       // the game's shadow map size: 0 its own, 288, 256 (native.c fix_shadow_size)
     bool game_fxaa;       // the game's own FXAA pass (native.c fix_game_fxaa)
+    bool shadows;         // the game's shadows drawn (off: the depth-only passes outside the 3D scene's targets skipped -
+                          // a flatter picture, a little less GPU work; vulkan/exec.c)
     int far_clip;         // the render far plane capped at this many metres, 0: the game's (native.c fix_far_clamp)
     int shadow_cascades;  // the sun's shadow cascades capped at 1..3, 0: the game's (4; native.c fix_shadow_cascades)
     int point_shadows;    // the point light shadows' pool capped at this many (1..64), 0: the game's (native.c fix_point_shadows)

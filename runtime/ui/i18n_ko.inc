@@ -720,3 +720,7 @@
  "Android 파일 선택기로 Lossless.dll을 골라 앱이 항상 읽을 수 있는 앱 자체 파일에 사본을 둡니다 - 넣어 둔 곳의 파일을 열 수 없다고 나올 때 사용하세요."},
 {"Lossless.dll imported: %s",
  "Lossless.dll 가져옴: %s"},
+{"Shadows",
+ "그림자"},
+{"The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. Applies at once.",
+ "게임의 그림자: 태양, 링크, 주변의 모든 것의 그림자. 끄기: 그림자를 그리지 않습니다 - 화면이 더 평평하고 고르게 밝아지며, 프레임마다 GPU 작업이 조금 줄어듭니다. 성능이 한계인 휴대폰에서만 권장합니다. 즉시 적용됩니다."},

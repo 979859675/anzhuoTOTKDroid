@@ -31,6 +31,7 @@ Settings g_settings = {
     .motion = true,
     .rumble = 100,
     .game_fxaa = 1,
+    .shadows = true,
     .lsfg_mult = 2,
     .lsfg_flow = 75,
 #ifdef __ANDROID__
@@ -222,6 +223,7 @@ void settings_reset_defaults(void) {
     g_settings.rumble = d->rumble;
     g_settings.shadow_res = d->shadow_res;
     g_settings.game_fxaa = d->game_fxaa;
+    g_settings.shadows = d->shadows;
     g_settings.far_clip = d->far_clip;
     g_settings.shadow_cascades = d->shadow_cascades;
     g_settings.point_shadows = d->point_shadows;
@@ -278,6 +280,7 @@ void settings_load(void) {
         else if (!strcmp(key, "rumble")) g_settings.rumble = atoi(val) >= 0 && atoi(val) <= 300 ? atoi(val) : 100;
         else if (!strcmp(key, "shadow_res")) g_settings.shadow_res = atoi(val) == 288 || atoi(val) == 256 ? atoi(val) : 0;
         else if (!strcmp(key, "game_fxaa")) g_settings.game_fxaa = atoi(val) != 0;
+        else if (!strcmp(key, "shadows")) g_settings.shadows = atoi(val) != 0;
         else if (!strcmp(key, "far_clip")) g_settings.far_clip = atoi(val) >= 1000 && atoi(val) <= 100000 ? atoi(val) : 0;
         else if (!strcmp(key, "shadow_cascades")) g_settings.shadow_cascades = atoi(val) >= 1 && atoi(val) <= 3 ? atoi(val) : 0;
         else if (!strcmp(key, "point_shadows")) g_settings.point_shadows = atoi(val) >= 1 && atoi(val) <= 64 ? atoi(val) : 0;
@@ -398,6 +401,7 @@ void settings_save(void) {
     fprintf(f, "rumble = %d\n", g_settings.rumble);
     fprintf(f, "shadow_res = %d\n", g_settings.shadow_res);
     fprintf(f, "game_fxaa = %d\n", g_settings.game_fxaa);
+    fprintf(f, "shadows = %d\n", g_settings.shadows ? 1 : 0);
     fprintf(f, "far_clip = %d\n", g_settings.far_clip);
     fprintf(f, "shadow_cascades = %d\n", g_settings.shadow_cascades);
     fprintf(f, "point_shadows = %d\n", g_settings.point_shadows);

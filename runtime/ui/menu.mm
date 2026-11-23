@@ -748,6 +748,10 @@ static void tab_display(void) {
                        "The size of the sun's shadow maps. Lower ones cost the GPU less, with softer, blockier shadows. "
                        "It may help a weaker GPU; on a Snapdragon 8 Elite it made no difference.", false))
             g_settings.shadow_res = shadow_px[si];
+        opt_toggle("Shadows", &g_settings.shadows, true,
+                   "The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is "
+                   "flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. "
+                   "Applies at once.");
         opt_toggle("Game's anti-aliasing", &g_settings.game_fxaa, true,
                    "The game's own FXAA pass, apart from the Anti-aliasing above. Off saves a little GPU time; edges and "
                    "grass shimmer more.");

@@ -8269,6 +8269,36 @@ static void draw_(CmdRec *r, bool indexed) {
             }
         }
         for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { stat_skipped++; return; }
+        {   // Video > Shadows off (g_settings.shadows; LARECOMP_SHADOWS=0 / 1 over it), from BOTWRecomp 0de85d3: the draws
+            // of a depth-only pass into a target outside the 3D scene's skipped - the shadow maps (the sun's cascades and
+            // the point lights'). No shader hash, so not tied to one game version. LARECOMP_AB=<n>:shadow draws them on
+            // side B; LARECOMP_LOG_SHADOW=1 names each target the first time its draws are skipped. On the Great Sky
+            // Island (TOTK 1.4.3) five targets: 192x192, 848x848 and 800x800 with 4 layers (the sun's cascades), 1440x1440
+            // and 720x720 with 2; the picture is shadowless and clean. A/B in one run on the POCO F7 Ultra (Turnip) at a
+            // forced 60: 52.4 -> 54.4 fps.
+            static int env = -2;
+            if (env == -2) env = getenv("LARECOMP_SHADOWS") ? atoi(getenv("LARECOMP_SHADOWS")) != 0 : -1;
+            if (!(env >= 0 ? env : g_settings.shadows) && AB("shadow") != 1 &&
+                st.rt.ncolor == 0 && st.rt.depth && vk_texture_scale_group(st.rt.depth) != RS_SCENE) {
+                static int logon = -1;
+                if (logon < 0) logon = getenv("LARECOMP_LOG_SHADOW") && atoi(getenv("LARECOMP_LOG_SHADOW"));
+                if (logon) {
+                    static NvnTexture *seen[64];
+                    static int nseen;
+                    int k = 0;
+                    while (k < nseen && seen[k] != st.rt.depth) k++;
+                    if (k == nseen && nseen < 64) {
+                        seen[nseen++] = st.rt.depth;
+                        LOG("[shadow] skipped: depth target %p %ux%u depth %u target %u fmt %u group %d '%s'\n",
+                            (void *)st.rt.depth, st.rt.depth->width, st.rt.depth->height, st.rt.depth->depth,
+                            st.rt.depth->target, st.rt.depth->format, vk_texture_scale_group(st.rt.depth),
+                            st.rt.depth->label);
+                    }
+                }
+                stat_skipped++;
+                return;
+            }
+        }
         if (g_debug_frame && getenv("LARECOMP_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
 #ifdef __ANDROID__
