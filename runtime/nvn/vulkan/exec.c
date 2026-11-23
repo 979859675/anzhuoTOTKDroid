@@ -2306,6 +2306,30 @@ static int debug_pass_no;
 // gain was measured on an Adreno 830. draw_ / clear say what opens the pass (pass_open_dw: 1 a draw writing depth,
 // 0 one that doesn't, -1 anything else).
 static void rec_clear(int index), rec_pass(uint32_t ncleared), rec_dump(void), rec_copy(const NvnTexture *src, const NvnTexture *dst);  // (LARECOMP_REC: below debug_draw)
+// The screen kept through its clear (#76, TOTK 1.4.3): the game draws its 3D scene onto the screen target with one opaque,
+// full-screen draw a frame, after clearing it. Some frames that open a menu skip that draw (the world paused already)
+// and still copy the screen for the menu's blurred background, which then came out black - with a player's touch,
+// 1 to 6 openings in 11 (on the Switch never seen). The screen target is the one such a draw went to in the last two
+// frames; its clear is skipped there (the draw covers all of it in a normal frame anyway), so a frame without the
+// draw keeps the last world for the menu's copy. LARECOMP_KEEP_SCREEN=0: cleared, as before.
+static NvnTexture *keep_screen_rt;
+static uint64_t keep_screen_frame;
+static uint64_t stat_keep_screen;
+static bool keep_screen_on(void) {
+    static int on = -1;
+    if (on < 0) on = (!getenv("LARECOMP_KEEP_SCREEN") || atoi(getenv("LARECOMP_KEEP_SCREEN")) != 0);
+    return on && g_game_version == GAME_V_143;
+}
+static bool keep_screen_active(const NvnTexture *t) {  // (t is the screen target, its scene draw recent)
+    extern uint64_t renderer_present_count(void);
+    return keep_screen_on() && t && t == keep_screen_rt && renderer_present_count() <= keep_screen_frame + 2;
+}
+static bool keep_screen_skip(const NvnTexture *t) {  // (a color clear of t, whole: skipped?)
+    if (!keep_screen_active(t)) return false;
+    if (stat_keep_screen++ == 0)
+        LOG("[vk] screen target %ux%u at %llx: kept through its clears (#76)\n", t->width, t->height, (unsigned long long)t->addr);
+    return true;
+}
 static int pass_open_dw = -1;
 static bool pass_dnone;
 // (depth targets a pass that wasn't storing them had to end for a depth write: stored from the start for the rest of
@@ -3059,6 +3083,7 @@ static void begin_pass(void) {
                 if (q->op == CMD_CLEAR_COLOR) {
                     int idx = (int)q->x[0];
                     if (idx < 0 || idx >= (int)pass_ncolor || !ca[idx].imageView || (q->x[2] & 0xF) != 0xF || (done >> idx & 1)) break;
+                    if (keep_screen_active(st.rt.color[idx])) break;  // (kept: keep_screen_skip)
                     ca[idx].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
                     memcpy(ca[idx].clearValue.color.float32, q->extra, 16);
                     done |= 1u << idx;
@@ -3362,6 +3387,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     }
     if (in_pass && pass_dnone && depth) st.rt_dirty = true, stat_dnone_split++, dnone_note_split(st.rt.depth);  // (a depth clear: stored again)
     rec_clear(index);
+    if (index >= 0 && index < st.rt.ncolor && (mask & 0xF) == 0xF && keep_screen_skip(st.rt.color[index])) return;  // (#76)
     begin_pass();
     for (int i = 0; i < nlclear; i++) {  // (done by the pass's load operations: begin_pass - each once)
         if (lclear[i].rec != g_cur_rec) continue;
@@ -8684,6 +8710,19 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     if (g_debug_frame) debug_draw(pr, r, indexed);
     rec_draw(pr);
+    if (keep_screen_on() && st.rt.ncolor && st.rt.color[0] && !(st.color_state[0] & 1) && (st.channel_mask & 0xF) == 0xF &&
+        st.viewport[0][0] == 0 && st.viewport[0][1] == 0 && st.viewport[0][2] >= (float)st.rt.color[0]->width &&
+        st.viewport[0][3] >= (float)st.rt.color[0]->height && vk_texture_scale_group(st.rt.color[0]) == RS_OUT) {
+        // (the scene onto the screen: opaque, all of it, from a 3D scene image - keep_screen_skip)
+        for (int i = 0; i < pr->fi->ntex; i++) {
+            NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+            if (t && t->backend && vk_texture_scale_group(t) == RS_SCENE) {
+                keep_screen_rt = st.rt.color[0];
+                keep_screen_frame = renderer_present_count();
+                break;
+            }
+        }
+    }
     {   // LARECOMP_LOG_RT=<w>x<h>[:<fmt hex>][+<w>x<h>[:<fmt>]...][,<max>[,<from frame>]]: draws into one color target of
         // those guest sizes (and formats), described as in a debug frame, with the frame number (the pause menu's
         // capture of the world and its blur)
