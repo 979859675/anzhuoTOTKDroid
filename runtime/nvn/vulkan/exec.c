@@ -319,6 +319,7 @@ static bool vc_alias_on(void) {
 #ifdef __ANDROID__
 static bool gwin_mode;    // (heap placed, larger than a storage buffer reaches, no pointer: draws get a window of it, gwin_prepare)
 static uint64_t gmem_bda;  // the placed heap's device address when shaders reach it by pointer (vk_heap_place), else 0
+static uint64_t hch_size;  // (the heap in blocks: bytes a block, 0 one buffer - hch below gmem_buf)
 #endif
 static VkSpan gc_span;    // this draw's / dispatch's copy, gc_size bytes (0: none)
 static uint64_t gc_size;
@@ -1592,6 +1593,7 @@ static void guest_copy_invalidate(uint64_t lo, uint64_t hi) {
 // The CPU copy they replace was in guest memory at once, so a draw reading one (guest_copy) reads the GPU's bytes.
 #define BCOPY_PEND 16
 static VkBuffer gmem_buf;  // (the heap's GPU buffer, below)
+static bool heap_at(uint64_t off, uint64_t size, VkBuffer *b, VkDeviceSize *o);  // (the heap in blocks: below gmem_buf)
 static struct { uint64_t lo, hi, seq; } bcopy_pend[BCOPY_PEND];
 static int bcopy_npend;
 static uint64_t bcopy_done, bcopy_done_at;  // (bcopy_pending: the GPU's progress as last asked, and in which submission)
@@ -1634,8 +1636,10 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size, int kind) {
     // alignment can't be bound in place: it gets the bytes from before the copy (logged).
     if (bcopy_npend && bcopy_pending(addr, addr + size)) {
         uint64_t off = addr - HEAP_BASE;
-        if (kind == GC_VTX || !(off % g_vk.props.limits.minUniformBufferOffsetAlignment))
-            return (VkSpan){gmem_buf, off, (void *)(uintptr_t)addr};
+        VkBuffer hb;
+        VkDeviceSize ho;
+        if ((kind == GC_VTX || !(off % g_vk.props.limits.minUniformBufferOffsetAlignment)) && heap_at(off, size, &hb, &ho))
+            return (VkSpan){hb, ho, (void *)(uintptr_t)addr};
         static int nlog;
         if (nlog++ < 8) LOG("[vk] uniforms at %llx read before a GPU buffer copy into them lands (offset not aligned)\n", (unsigned long long)addr);
     }
@@ -3564,6 +3568,7 @@ static void trans_cfg_get(MwTransCfg *c) {
     if (!g_vk.shader_int64 || g_settings.shader_int32 || getenv("LARECOMP_VK_INT32") != NULL) f |= MW_TF_NO_INT64;
     if (gcopy_mode || gwin_mode) f |= MW_TF_GMEM_MAP_ALL;
     if (gmem_bda != 0) f |= MW_TF_GMEM_BDA;
+    if (gmem_bda != 0 && hch_size) f |= MW_TF_GMEM_CHUNKS | (uint32_t)(__builtin_ctzll(hch_size) - 2) << 16;
     if (gcopy_mode && !getenv("LARECOMP_NO_GMISS")) f |= MW_TF_GMEM_MISS_LOG;
     if (!getenv("LARECOMP_BRX_ALL_LABELS")) f |= MW_TF_BRX_WINDOW;
     if (!getenv("LARECOMP_DYN_STACKS")) f |= MW_TF_STATIC_STACKS;
@@ -3603,6 +3608,7 @@ static void trans_cfg_apply(const MwTransCfg *c) {
     maxwell_subgroup_stages = c->subgroup_stages;
     maxwell_gmem_map_all = (c->flags & MW_TF_GMEM_MAP_ALL) != 0;
     maxwell_gmem_bda = (c->flags & MW_TF_GMEM_BDA) != 0;
+    maxwell_gmem_chunk_shift = c->flags & MW_TF_GMEM_CHUNKS ? (int)(c->flags >> 16 & 31) : 0;
     maxwell_gmem_miss_log = (c->flags & MW_TF_GMEM_MISS_LOG) != 0;
     maxwell_gmem_miss_stages = c->miss_stages;
     maxwell_brx_window = (c->flags & MW_TF_BRX_WINDOW) != 0;
@@ -5495,6 +5501,26 @@ static uint64_t gmem_size;
 #ifdef __ANDROID__
 static bool gmem_file;    // (placed through a shared file / the driver's map moved: Driver compatibility's heap_file)
 static bool gmem_placed;  // (gmem_buf is the guest heap itself, usable as a uniform buffer: vk_heap_place)
+#endif
+
+// The heap in blocks (vk_heap_place, LARECOMP_VK_MEMFD_AHB=3: an Android hardware buffer per block, as Swap2-Native's
+// pools - the POCO's gralloc refused one 2 GB buffer, and a Mali's has never been asked): each block its own VkBuffer
+// and memory, mapped at its place in the heap. Shaders reach them by pointer (translate.c maxwell_gmem_chunk_shift);
+// whatever else bound the heap buffer at a heap offset asks heap_at for the block, and a range across two blocks goes
+// the other way (a copy). gmem_buf is then block 0's. hch_size 0: one buffer, gmem_buf, as before.
+#define HCH_MAX 16
+static struct { VkBuffer buf; VkDeviceMemory mem; uint64_t size; } hch[HCH_MAX];
+static int hch_n;
+static uint64_t hch_size;
+static bool heap_at(uint64_t off, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
+    if (!hch_size) { *b = gmem_buf, *o = off; return gmem_buf != VK_NULL_HANDLE; }
+    uint64_t k = off / hch_size, lo = off - k * hch_size;
+    if (k >= (uint64_t)hch_n || lo + size > hch[k].size) return false;
+    *b = hch[k].buf, *o = lo;
+    return true;
+}
+static void heap_copy(VkCommandBuffer cb, VkBuffer other, uint32_t n, const VkBufferCopy *cp, bool from_heap);  // (below copy_buffer)
+#ifdef __ANDROID__
 
 // CopyBufferToBuffer within the heap's GPU buffer, done by the GPU in its place in the queue. The CPU copy waited for
 // the GPU to finish everything before it (renderer_flush): TOTK copies 304 bytes a compute shader just wrote into one
@@ -5512,11 +5538,14 @@ static bool gpu_buffer_copy(uint64_t src, uint64_t dst, uint64_t size) {
     if (src < HEAP_BASE || src + size > HEAP_BASE + gmem_size || dst < HEAP_BASE || dst + size > HEAP_BASE + gmem_size) return false;
     if (src < dst + size && dst < src + size) return false;
     if (bcopy_pending(src, src + size)) return false;
+    VkBuffer sb, db;
+    VkDeviceSize so, dof;
+    if (!heap_at(src - HEAP_BASE, size, &sb, &so) || !heap_at(dst - HEAP_BASE, size, &db, &dof)) return false;  // (across blocks)
     vk_end_pass();
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
-    VkBufferCopy c = {src - HEAP_BASE, dst - HEAP_BASE, size};
-    vkCmdCopyBuffer(cb, gmem_buf, gmem_buf, 1, &c);
+    VkBufferCopy c = {so, dof, size};
+    vkCmdCopyBuffer(cb, sb, db, 1, &c);
     vk_full_barrier(cb);
     bcopy_pend[bcopy_npend].lo = dst; bcopy_pend[bcopy_npend].hi = dst + size;
     bcopy_pend[bcopy_npend++].seq = vk_pending_seq();
@@ -5534,7 +5563,10 @@ static bool ubo_direct(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out
         return false;
     for (uint64_t blk = addr >> 8; blk <= (addr + size - 1) >> 8; blk++)
         if (ubo_inline_has(blk)) return false;
-    *out = (VkDescriptorBufferInfo){gmem_buf, off, size};
+    VkBuffer hb;
+    VkDeviceSize ho;
+    if (!heap_at(off, size, &hb, &ho)) return false;
+    *out = (VkDescriptorBufferInfo){hb, ho, size};
     return true;
 }
 
@@ -5596,6 +5628,9 @@ static bool cbwin_bind(int stage, int k, uint64_t addr, uint64_t size, VkDescrip
     if ((off & (g_vk.props.limits.minUniformBufferOffsetAlignment - 1)) || size > g_vk.props.limits.maxUniformBufferRange ||
         off > 0xFFFFFFFFull)
         return false;
+    VkBuffer hb;
+    VkDeviceSize ho;
+    if (!heap_at(off, size, &hb, &ho)) return false;  // (across two blocks of the heap: copied)
     uint64_t rows = cbwin_rows(addr, size), first = rows & ((1ull << 48) - 1), n = (rows >> 48) + 1;
     if (!rows) return false;
     memcpy(cbw_patch[stage].rows, (const void *)(uintptr_t)first, n * 16);
@@ -5603,7 +5638,7 @@ static bool cbwin_bind(int stage, int k, uint64_t addr, uint64_t size, VkDescrip
     cbw_patch[stage].m[1] = (uint32_t)((first - addr) >> 4);
     cbw_patch[stage].m[2] = (uint32_t)n;
     stat_cbwin++;
-    *out = (VkDescriptorBufferInfo){gmem_buf, off, size};
+    *out = (VkDescriptorBufferInfo){hb, ho, size};
     return true;
 }
 static bool gmem_placed_(void) { return gmem_placed; }
@@ -5777,6 +5812,71 @@ static bool heap_ahb_place(uint64_t size, VkBufferUsageFlags usage, bool bda, Vk
     return false;
 }
 
+// The heap in blocks (LARECOMP_VK_MEMFD_AHB=3: hch above): one Android hardware buffer per block of
+// LARECOMP_VK_AHB_BLOCK_MB (256 by default; 64-1024, a power of two), each mapped at its place in the heap and
+// imported with a device address; the GPU and the CPU checked on block 0. All of them or none: a block refused frees
+// the others and the heap goes back to CPU copies. LARECOMP_VK_AHB_BLOCKS_MAX=<n> (a test): stop after n blocks, as
+// if the next were refused - one gralloc allocation at a time on a phone whose system_server once restarted.
+static bool heap_ahb_blocks(uint64_t size, VkBufferUsageFlags usage) {
+    const char *why = NULL;
+    uint64_t mb = getenv("LARECOMP_VK_AHB_BLOCK_MB") ? strtoull(getenv("LARECOMP_VK_AHB_BLOCK_MB"), NULL, 10) : 256;
+    if (mb < 64 || mb > 1024 || (mb & (mb - 1))) mb = 256;
+    uint64_t bs = mb << 20;
+    int n = (int)((size + bs - 1) / bs), maxn = getenv("LARECOMP_VK_AHB_BLOCKS_MAX") ? atoi(getenv("LARECOMP_VK_AHB_BLOCKS_MAX")) : HCH_MAX;
+    uint64_t t0 = plat_now_ns();
+    int k = 0;
+    if (!g_vk.mem_ahb) why = "no VK_ANDROID_external_memory_android_hardware_buffer";
+    else if (!g_vk.bda) why = "no buffer device address";
+    else if (n > HCH_MAX) why = "more blocks than the shaders' table holds";
+    for (; !why && k < n; k++) {
+        uint64_t sz = size - (uint64_t)k * bs < bs ? size - (uint64_t)k * bs : bs;
+        if (k >= maxn) { why = "LARECOMP_VK_AHB_BLOCKS_MAX"; break; }
+        AHardwareBuffer *ahb = NULL;
+        int fd = vk_ahb_alloc(sz, &ahb, &why);
+        if (fd < 0) break;
+        void *at = (void *)(uintptr_t)(HEAP_BASE + (uint64_t)k * bs);
+        void *p = mmap(at, sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+        close(fd);
+        VkBuffer buf = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        int type = -1;
+        const VkBufferUsageFlags check = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bool ok = false;
+        if (p != at) why = "mmap of its file at its place in the heap";
+        else if (!vk_ahb_import(ahb, sz, usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, true, &buf, &mem, &type, &why)) {}
+        else if (k == 0 && !vk_ahb_coherent((uint8_t *)at, buf, mem, 8u << 20, check, &why)) {}
+        else ok = true;
+        AHardwareBuffer_release(ahb);  // (the import and the map hold it)
+        if (!ok) {
+            if (buf) vkDestroyBuffer(g_vk.dev, buf, NULL);
+            if (mem) vkFreeMemory(g_vk.dev, mem, NULL);
+            break;
+        }
+        hch[k].buf = buf, hch[k].mem = mem, hch[k].size = sz;
+        if (k == 0) {
+            VkPhysicalDeviceMemoryProperties mp;
+            vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+            LOG("[vk] game memory in blocks of Android hardware buffers: block 0 coherent, memory type %d (flags 0x%x)\n", type,
+                (unsigned)mp.memoryTypes[type].propertyFlags);
+        }
+    }
+    if (!why) {
+        hch_n = n, hch_size = bs;
+        LOG("[vk] game memory in blocks of Android hardware buffers: %d of %llu MB in %.0f ms\n", n,
+            (unsigned long long)mb, (plat_now_ns() - t0) / 1e6);
+        return true;
+    }
+    LOG("[vk] game memory in blocks of Android hardware buffers: failed at block %d of %d (%s, errno %d) - CPU copies\n", k, n,
+        why, errno);
+    for (int j = 0; j < k && j < HCH_MAX; j++) {
+        if (hch[j].buf) vkDestroyBuffer(g_vk.dev, hch[j].buf, NULL);
+        if (hch[j].mem) vkFreeMemory(g_vk.dev, hch[j].mem, NULL);
+        hch[j].buf = VK_NULL_HANDLE, hch[j].mem = VK_NULL_HANDLE;
+    }
+    plat_reset_guest(HEAP_BASE, HEAP_BASE + size);  // (the window's own pages back)
+    return false;
+}
+
 // The heap through an exported file asked for (the setting, or LARECOMP_VK_MEMFD) and possible here (vk_heap_place)
 // Not with RADV unless forced: on the Xclipse 530 / 540 its exported memory, mapped at the heap's address, took a SIGBUS
 // at the game's first access (its first malloc, atomics on that memory: #234, #383, #387); the setting is ignored there
@@ -5876,6 +5976,32 @@ bool vk_heap_place(uint64_t size) {
         return NOT_PLACED();                                                                                           \
     } while (0)
     VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (memfd && heap_ahb_mode() == 3) {  // (the heap in blocks of Android hardware buffers: heap_ahb_blocks)
+        if (!heap_ahb_blocks(size, bi.usage & ~VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)) return NOT_PLACED();
+        gmem_buf = hch[0].buf;
+        gmem_mem = hch[0].mem;
+        gmem_size = size;
+        gmem_placed = true;
+        gmem_file = true;
+        gcopy_mode = false;
+        gwin_mode = false;
+        VkBufferDeviceAddressInfo di = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = hch[0].buf};
+        gmem_bda = vkGetBufferDeviceAddress(g_vk.dev, &di);
+        if (!gmem_bda || !gaddr_write(gmem_bda)) {  // (no table for the shaders: none of it)
+            LOG("[vk] game memory in blocks: no device address table - CPU copies\n");
+            gmem_buf = VK_NULL_HANDLE, gmem_mem = VK_NULL_HANDLE, gmem_size = 0, gmem_placed = gmem_file = false, gmem_bda = 0;
+            for (int k = 0; k < hch_n; k++) vkDestroyBuffer(g_vk.dev, hch[k].buf, NULL), vkFreeMemory(g_vk.dev, hch[k].mem, NULL);
+            hch_n = 0, hch_size = 0;
+            plat_reset_guest(HEAP_BASE, HEAP_BASE + size);
+            gcopy_mode = true;
+            return NOT_PLACED();
+        }
+        if (vc_alias_on() && VC_TRACK_LO < HEAP_BASE) plat_write_tracking_enable(VC_TRACK_LO, HEAP_BASE);  // (vcache_lookup alias_fill)
+        LOG("[vk] guest heap %llu MB is GPU memory (%d blocks of %llu MB, Android hardware buffers mapped at %llx): shaders "
+            "reach it by pointer\n", (unsigned long long)(size >> 20), hch_n, (unsigned long long)(hch_size >> 20),
+            (unsigned long long)HEAP_BASE);
+        return true;
+    }
     if (memfd && heap_ahb_mode() == 2) MEMFD_FAILED();
     bool dedicated = false;  // (the driver exports this kind of memory only as a buffer's own allocation)
     const VkMemoryPropertyFlags need = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -6049,13 +6175,25 @@ static bool gaddr_write(uint64_t a) {
         }
         ptr = inf.pMappedData;
     }
-    ptr[0] = (uint32_t)a;
-    ptr[1] = (uint32_t)(a >> 32);
+    if (hch_size) {  // (the heap in blocks: block k's address less k blocks, so a heap-relative index reaches it; translate.c)
+        for (int k = 0; k < HCH_MAX; k++) {
+            int j = k < hch_n ? k : hch_n - 1;  // (past the heap's end: the last block's, as one buffer would)
+            VkBufferDeviceAddressInfo di = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = hch[j].buf};
+            uint64_t b = vkGetBufferDeviceAddress(g_vk.dev, &di);
+            if (!b) return false;
+            b -= (uint64_t)j * hch_size;
+            ptr[k * 2] = (uint32_t)b;
+            ptr[k * 2 + 1] = (uint32_t)(b >> 32);
+        }
+    } else {
+        ptr[0] = (uint32_t)a;
+        ptr[1] = (uint32_t)(a >> 32);
+    }
     vmaFlushAllocation(g_vk.vma, gaddr_mem, 0, VK_WHOLE_SIZE);
     return true;
 }
 
-static VkDescriptorBufferInfo gaddr_info(void) { return (VkDescriptorBufferInfo){gaddr_buf, 0, 16}; }
+static VkDescriptorBufferInfo gaddr_info(void) { return (VkDescriptorBufferInfo){gaddr_buf, 0, hch_size ? 8 * HCH_MAX : 16}; }
 #else
 const char *vk_fatal_hint(VkResult r) { (void)r; return ""; }
 #endif
@@ -6071,7 +6209,8 @@ static VkDescriptorBufferInfo gmem_info(void) {
     }
 #ifdef __ANDROID__
     if (gmem_buf) {  // (a storage buffer's range is limited: 2 GB on Adreno; the heap may be larger)
-        uint64_t range = gmem_size < g_vk.props.limits.maxStorageBufferRange ? gmem_size : g_vk.props.limits.maxStorageBufferRange & ~3ull;
+        uint64_t whole = hch_size ? hch[0].size : gmem_size;  // (in blocks: block 0, gmem_buf - shaders go by pointer)
+        uint64_t range = whole < g_vk.props.limits.maxStorageBufferRange ? whole : g_vk.props.limits.maxStorageBufferRange & ~3ull;
         return (VkDescriptorBufferInfo){gmem_buf, 0, range};
     }
 #endif
@@ -6117,6 +6256,35 @@ static void copy_buffer_(VkCommandBuffer cb, VkBuffer src, VkBuffer dst, uint32_
             return;
         }
     vkCmdCopyBuffer(cb, src, dst, n, regions);
+}
+
+// Copies between the heap (its offsets: srcOffset from it, or dstOffset into it) and another buffer, by the heap's
+// blocks when it is in blocks (hch): each region cut where a block ends, each block's own buffer
+static void heap_copy(VkCommandBuffer cb, VkBuffer other, uint32_t n, const VkBufferCopy *cp, bool from_heap) {
+    if (!hch_size) {
+        if (from_heap) copy_buffer(cb, gmem_buf, other, n, cp);
+        else copy_buffer(cb, other, gmem_buf, n, cp);
+        return;
+    }
+    for (int k = 0; k < hch_n; k++) {
+        VkBufferCopy part[64];
+        uint32_t m = 0;
+        uint64_t blo = (uint64_t)k * hch_size, bhi = blo + hch[k].size;
+        for (uint32_t i = 0; i < n; i++) {
+            uint64_t hlo = from_heap ? cp[i].srcOffset : cp[i].dstOffset, hhi = hlo + cp[i].size;
+            uint64_t lo = hlo > blo ? hlo : blo, hi = hhi < bhi ? hhi : bhi;
+            if (lo >= hi) continue;
+            uint64_t ofs = (from_heap ? cp[i].dstOffset : cp[i].srcOffset) + (lo - hlo);
+            part[m++] = from_heap ? (VkBufferCopy){lo - blo, ofs, hi - lo} : (VkBufferCopy){ofs, lo - blo, hi - lo};
+            if (m == 64) {
+                if (from_heap) copy_buffer(cb, hch[k].buf, other, m, part);
+                else copy_buffer(cb, other, hch[k].buf, m, part);
+                m = 0;
+            }
+        }
+        if (m && from_heap) copy_buffer(cb, hch[k].buf, other, m, part);
+        else if (m) copy_buffer(cb, other, hch[k].buf, m, part);
+    }
 }
 
 static VkBufferCopy gfast_cp[GMAP_MAX];       // its copies heap -> gfast_buf (reversed after a storing dispatch)
@@ -6173,6 +6341,12 @@ static void gfast_prepare(VkCommandBuffer cb) {
     // copy of the ranges and back, with full barriers around each dispatch, only cost time (~3 ms a frame of the
     // overworld's light lists). Only its descriptor's reach is limited (maxStorageBufferRange, 2 GB on Adreno, the
     // heap is larger): the table points into a window of the heap that starts at the first range instead.
+    if (gmem_buf && hch_size) {  // (the heap in blocks: no table - every access by pointer, gmem_w; a window of block 0 bound)
+        gmap_tab[GMAP_MAX * 4] = 0;
+        uint64_t reach = g_vk.props.limits.maxStorageBufferRange & ~3ull;
+        gfast_win = (VkDescriptorBufferInfo){hch[0].buf, 0, hch[0].size < reach ? hch[0].size : reach};
+        return;
+    }
     if (gmem_buf && !g_vk.host_import && m && m <= GMAP_MAX) {
         uint64_t al = g_vk.props.limits.minStorageBufferOffsetAlignment ? g_vk.props.limits.minStorageBufferOffsetAlignment : 256;
         uint64_t base = r[0].lo / al * al;
@@ -6210,7 +6384,7 @@ static void gfast_prepare(VkCommandBuffer cb) {
             LOG("\n");
         }
     }
-    copy_buffer(cb, gmem_buf, gfast_buf, (uint32_t)m, cp);
+    heap_copy(cb, gfast_buf, (uint32_t)m, cp, true);
     vk_full_barrier(cb);
     gmap_tab[GMAP_MAX * 4] = (uint32_t)m;
     memcpy(gfast_cp, cp, (size_t)m * sizeof cp[0]);
@@ -6261,7 +6435,7 @@ static void gfast_finish(VkCommandBuffer cb) {
     VkBufferCopy back[GMAP_MAX];
     for (int i = 0; i < gfast_n; i++) back[i] = (VkBufferCopy){gfast_cp[i].dstOffset, gfast_cp[i].srcOffset, gfast_cp[i].size};
     vk_full_barrier(cb);
-    copy_buffer(cb, gfast_buf, gmem_buf, (uint32_t)gfast_n, back);
+    heap_copy(cb, gfast_buf, (uint32_t)gfast_n, back, false);
     vk_full_barrier(cb);
     gfast_n = 0;
 }
@@ -7150,12 +7324,14 @@ static int pt_state = -1;  // 1: tracking, 0: none
 static bool pt_init(void) {
     if (pt_state >= 0) return pt_state;
     uint64_t pg = VC_PAGE, one;
-    int n = plat_written_pages(HEAP_BASE, VC_PAGE, &one, 1, &pg);  // (is there write tracking?)
+    // (is there write tracking? the heap in blocks tracks only the region below the heap: asked there)
+    uint64_t probe = hch_size && VC_TRACK_LO < HEAP_BASE ? VC_TRACK_LO : HEAP_BASE;
+    int n = plat_written_pages(probe, VC_PAGE, &one, 1, &pg);
     pt_state = n >= 0 && pg == VC_PAGE;
     if (!pt_state) { LOG("[vk] no page write tracking (%d, page %llu)\n", n, (unsigned long long)pg); return false; }
     vc_page_gen = calloc(VC_SPAN / VC_PAGE, sizeof *vc_page_gen);
     vc_page_gpu = calloc(VC_SPAN / VC_PAGE, 1);
-    vc_page_gen[VC_HEAP_OFF / VC_PAGE] = ++vc_gen;  // (the probe took the heap's first page's tracking)
+    vc_page_gen[(probe - VC_BASE) / VC_PAGE] = ++vc_gen;  // (the probe took that page's tracking)
     return true;
 }
 
@@ -7243,14 +7419,17 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
     }
 #ifdef __ANDROID__
     bool cpu_fill = !gmem_buf && gcopy_mode;  // (Qualcomm's driver: filled from the CPU - vc_flush)
+    // (the heap in blocks, no placed maps for the physical memory region: that region's ranges filled from the CPU, by
+    // the write tracking turned on for it alone - vk_heap_place; the heap's as with any placed heap)
+    bool alias_fill = gmem_buf && hch_size;
 #else
-    bool cpu_fill = false;
+    bool cpu_fill = false, alias_fill = false;
 #endif
     if (!vc_on || (!gmem_buf && !cpu_fill)) return false;
     if (size > VC_MAX_RANGE) { prof_vc_why[0] += size; return false; }
     // (the heap; with CPU fills also the physical memory region, where TOTK keeps its vertices - VC_BASE)
     bool in_heap = addr >= HEAP_BASE && addr + size <= HEAP_BASE + (gmem_buf ? gmem_size : HEAP_MAX);
-    bool in_alias = cpu_fill && vc_alias_on() && addr >= ALIAS_BASE && addr + size <= ALIAS_BASE + ALIAS_SIZE && ALIAS_BASE >= VC_BASE;
+    bool in_alias = (cpu_fill || alias_fill) && vc_alias_on() && addr >= ALIAS_BASE && addr + size <= ALIAS_BASE + ALIAS_SIZE && ALIAS_BASE >= VC_BASE;
     if (!in_heap && !in_alias) { prof_vc_why[1] += size; return false; }
     uint64_t lo = (addr - VC_BASE) & ~(VC_PAGE - 1), hi = (addr - VC_BASE + size + VC_PAGE - 1) & ~(VC_PAGE - 1);
     uint64_t pend = vk_pending_seq(), frame = renderer_present_count();
@@ -7359,9 +7538,9 @@ void vc_flush(void) {
             if (nc == 64) { nc = 1; cp[0] = (VkBufferCopy){e->lo, 0, e->hi - e->lo}; break; }  // (scattered: the whole range)
             cp[nc++] = (VkBufferCopy){o, o - e->lo, VC_PAGE};
         }
-        if (nc && gmem_buf) {  // (heap entries only: their offsets from the page tables' base -> the heap buffer's)
+        if (nc && gmem_buf && e->lo >= VC_HEAP_OFF) {  // (heap entries only: their offsets from the page tables' base -> the heap buffer's)
             for (int k = 0; k < nc; k++) cp[k].srcOffset -= VC_HEAP_OFF;
-            copy_buffer(cb, gmem_buf, e->buf, (uint32_t)nc, cp);
+            heap_copy(cb, e->buf, (uint32_t)nc, cp, true);
         }
         else if (nc) {  // (copy mode: no heap buffer - the written pages go through the upload ring)
             uint64_t tot = 0, o = 0;
@@ -7393,14 +7572,13 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     if (copy) return false;
 #ifdef __ANDROID__
     if (gcopy_mode && !gmem_buf) return vcache_lookup(addr, size, buf, off);  // (heap or physical memory region; else copied)
+    if (hch_size && addr < HEAP_BASE) return vcache_lookup(addr, size, buf, off);  // (the heap in blocks: the region below)
 #endif
     if (addr < HEAP_BASE) return false;
     if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
-    if (vcache_lookup(addr, size, buf, off)) return true;
-    *buf = gmem_buf;
-    *off = addr - HEAP_BASE;
-    return true;
+    if (!hch_size && vcache_lookup(addr, size, buf, off)) return true;  // (in blocks: the heap read in place, untracked)
+    return heap_at(addr - HEAP_BASE, size, buf, off);  // (the heap in blocks: across two of them, copied)
 }
 
 static VkObjectCache compute_cache;  // (compute programs below)
@@ -7451,6 +7629,15 @@ void vk_exec_reset(void) {
     gcopy_gen++;
     dchain = dchain_after = false;  // (from BOTWRecomp 7845d58)
     dchain_cb = VK_NULL_HANDLE;
+    if (gmem_buf && hch_size) {  // (the heap in blocks: every block; runtime/main.c remaps the window after)
+        for (int k = 0; k < hch_n; k++) {
+            vkDestroyBuffer(g_vk.dev, hch[k].buf, NULL);
+            vkFreeMemory(g_vk.dev, hch[k].mem, NULL);
+        }
+        hch_n = 0, hch_size = 0;
+        gmem_buf = VK_NULL_HANDLE;
+        gmem_mem = VK_NULL_HANDLE;
+    }
     if (gmem_buf) {
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
         vkFreeMemory(g_vk.dev, gmem_mem, NULL);
@@ -7850,6 +8037,7 @@ static CsProg *compute_program(NvnProgram *np) {
     maxwell_subgroup_stages = g_vk.subgroup_stages;
     maxwell_gmem_map_all = gcopy_mode || gwin_mode;
     maxwell_gmem_bda = gmem_bda != 0;
+    maxwell_gmem_chunk_shift = gmem_bda && hch_size ? __builtin_ctzll(hch_size) - 2 : 0;
     maxwell_gmem_miss_log = gcopy_mode && !getenv("LARECOMP_NO_GMISS");
     if (getenv("LARECOMP_GMISS_STAGES"))  // (a test: which stages log misses - 1 vertex, 2 fragment, 32 compute)
         maxwell_gmem_miss_stages = (unsigned)strtoul(getenv("LARECOMP_GMISS_STAGES"), NULL, 0);

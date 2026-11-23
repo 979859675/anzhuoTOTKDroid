@@ -801,7 +801,11 @@ static void create_device(void) {
         f12.storageBuffer8BitAccess = h12.storageBuffer8BitAccess;
         // device addresses: shaders reach the heap placed in GPU memory through a pointer where a storage buffer's
         // range can't cover it (exec.c vk_heap_place; Turnip on Adreno 7xx: 128 MB). Required from Vulkan 1.3 on.
-        g_vk.bda = g_vk.api >= VK_API_VERSION_1_2 && h12.bufferDeviceAddress && g_vk.map_placed;
+        // Also for the heap in blocks of Android hardware buffers (exec.c heap_ahb_blocks, LARECOMP_VK_MEMFD_AHB=3), on
+        // drivers without placed maps (Mali): its shaders reach every block by pointer.
+        const char *ahb_mode = getenv("LARECOMP_VK_MEMFD_AHB");
+        g_vk.bda = g_vk.api >= VK_API_VERSION_1_2 && h12.bufferDeviceAddress &&
+                   (g_vk.map_placed || (ahb_mode && atoi(ahb_mode) == 3));
         f12.bufferDeviceAddress = g_vk.bda;
         // nor 16-bit storage: no translated or built-in shader declares it, and the Adreno 610 under Turnip lacks it
         // (LAS Recomp's issue #4). LARECOMP_VK_NO_STORAGE16=1 (test): as if it lacked it.

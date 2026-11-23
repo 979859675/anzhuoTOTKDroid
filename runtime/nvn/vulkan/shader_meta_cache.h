@@ -59,6 +59,7 @@ enum {
     MW_TF_FAST_MINMAX     = 1u << 12,
     MW_TF_CB_WINDOW       = 1u << 13,
     MW_TF_VK_OPT          = 1u << 14,  // (shaders.c: another SPIR-V hash)
+    MW_TF_GMEM_CHUNKS     = 1u << 15,  // (the heap in blocks: maxwell_gmem_chunk_shift in bits 16-20)
 };
 enum {
     MW_TE_NO_VS_SNAP        = 1u << 0,

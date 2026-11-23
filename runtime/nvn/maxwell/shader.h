@@ -104,6 +104,10 @@ extern bool maxwell_gmem_map_all;
 // GMem storage buffer, whose range a driver may cap far below the heap (Turnip on Adreno 7xx: 128 MB). Binding
 // GMEM_BUFFER_INDEX then holds the heap's device address: `readonly buffer GHeapAddr { uvec2 a; }`.
 extern bool maxwell_gmem_bda;
+// (with maxwell_gmem_bda) the heap in blocks of 4 << maxwell_gmem_chunk_shift bytes, each its own GPU memory (an Android
+// hardware buffer per block: the Mali's gralloc takes no 2 GB one), 0: one block. GHeapAddr is then `uvec2 a[16]`, block
+// k's device address less k blocks, so every access keeps its heap-relative word index: gmem_w(i) picks a[i >> shift].
+extern int maxwell_gmem_chunk_shift;
 // Vulkan drivers without shaderInt64: preserve address/carry semantics using 32-bit words.
 extern bool maxwell_no_int64;
 // (GLSL) the stages (1 << STAGE_*) where VOTE, SHFL and the lane ids use subgroup operations; elsewhere, as in vertex
