@@ -58,7 +58,8 @@ typedef struct {
     int overlay_scale, overlay_opacity;  // its size and opacity, % (40..150, 20..100): Swap2-Native's
     int overlay_items;    // OVERLAY_* bits: what it shows (all by default)
     float overlay_pos[2]; // its top left, a share of the screen, dragged there with a finger (negative: the corner)
-    int fps_mode;         // 0 Auto, 1 30 fps, 2 60 fps, 3 20 fps, 4 40/45 fps (display dependent)
+    int fps_mode;         // 0 Auto, 1 30 fps, 2 60 fps, 3 20 fps, 4 40/45 fps (display dependent), 5 unlocked (TOTK on
+                          // Android: up to the screen's fastest refresh, at most 120 - nvn/objects.c, vulkan/device.c)
     bool fps60_hysteresis;  // the game's frame controller drops to 30 after 7 late frames, not 3 (native.c fix_hyst_*): off
     bool shader_int32;    // shader address math in 32-bit words even where the driver offers 64-bit (vulkan/exec.c)
     bool files_in_place;  // Android: a setup reads the picked romfs/ where it is, no copy (services/fs.c); off by default

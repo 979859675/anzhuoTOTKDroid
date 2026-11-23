@@ -724,3 +724,7 @@
  "그림자"},
 {"The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. Applies at once.",
  "게임의 그림자: 태양, 링크, 주변의 모든 것의 그림자. 끄기: 그림자를 그리지 않습니다 - 화면이 더 평평하고 고르게 밝아지며, 프레임마다 GPU 작업이 조금 줄어듭니다. 성능이 한계인 휴대폰에서만 권장합니다. 즉시 적용됩니다."},
+{"Unlocked (up to 120 fps)",
+ "제한 없음 (최대 120fps)"},
+{"As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock stays right. Cutscenes stay at 30. The phone works harder and heats more.",
+ "기기가 그릴 수 있는 만큼 빠르게, 화면의 최고 주사율까지 (최대 120fps). 게임 시간은 정확하게 유지됩니다. 컷신은 30으로 유지됩니다. 휴대폰이 더 많이 일하고 더 뜨거워집니다."},

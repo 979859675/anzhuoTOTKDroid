@@ -724,3 +724,7 @@
  "阴影"},
 {"The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. Applies at once.",
  "游戏的阴影：太阳、林克以及周围一切的阴影。关闭：不绘制任何阴影 - 画面更平、光照均匀，每帧 GPU 的工作稍少；只适合性能已到极限的手机。立即生效。"},
+{"Unlocked (up to 120 fps)",
+ "不限（最高 120 fps）"},
+{"As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock stays right. Cutscenes stay at 30. The phone works harder and heats more.",
+ "按设备的绘制速度运行，最高到屏幕的最高刷新率（最多 120 fps）。游戏时钟保持准确。过场动画保持 30。手机负载更高，发热更多。"},

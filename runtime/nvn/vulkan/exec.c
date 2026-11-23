@@ -760,7 +760,7 @@ static uint64_t pace_end_counter(const uint64_t *start_entry, const uint64_t *en
 #ifdef __ANDROID__
     static int fast = -1;
     if (fast < 0) fast = getenv("LARECOMP_FAST_COUNTERS") ? atoi(getenv("LARECOMP_FAST_COUNTERS")) : 0;
-    if ((!pace_slow && pace_on > 0 && (fast || g_settings.fps_mode == 2 || g_settings.fps_mode == 4)) || fast == 2) {  // (2: with LARECOMP_PACE=0 too, a test)
+    if ((!pace_slow && pace_on > 0 && (fast || g_settings.fps_mode == 2 || g_settings.fps_mode == 4 || g_settings.fps_mode == 5)) || fast == 2) {  // (2: with LARECOMP_PACE=0 too, a test)
         uint64_t max = start_entry[1] + ns_to_gpu_ticks(PACE_FAST_NS);
         return value > max ? max : value;
     }

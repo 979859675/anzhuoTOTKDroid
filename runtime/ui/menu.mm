@@ -599,9 +599,10 @@ static void tab_display(void) {
         int version = g_game_version ? g_game_version : 143;
         bool sixty = version == 182 || version == 143;
         if (!sixty && g_settings.fps_mode > 1) g_settings.fps_mode = 1;
+        if (version != 143 && g_settings.fps_mode == 5) g_settings.fps_mode = 2;  // (Unlocked: TOTK only)
         static const char *fr[] = {"Auto (20 / 30)", "30 fps"};
-        static const char *fr60[] = {"Auto (30 / 60)", "30 fps", "60 fps", "20 fps", "40 / 45 fps"};
-        opt_choice("Frame rate", &g_settings.fps_mode, sixty ? fr60 : fr, sixty ? 5 : 2, 1,
+        static const char *fr60[] = {"Auto (30 / 60)", "30 fps", "60 fps", "20 fps", "40 / 45 fps", "Unlocked (up to 120 fps)"};
+        opt_choice("Frame rate", &g_settings.fps_mode, sixty ? fr60 : fr, sixty ? (version == 143 ? 6 : 5) : 2, 1,
                    sixty ? "Auto: 60 fps where your device keeps up, 30 where it doesn't (the game's clock stays right "
                            "either way). 30 fps: steady and cooler - the phone heats less. 60 fps: always aims for 60."
                          : "Auto: the game's own pacing, as on the Switch. 30 fps: never more than 30 frames a "
@@ -617,6 +618,9 @@ static void tab_display(void) {
 
 #ifdef __ANDROID__
     if (g_settings.fps_mode == 4) ImGui::TextWrapped("%s", tr("40 fps on a 120 Hz display, 45 on 90 Hz, 30 on 60 Hz."));
+    if (g_settings.fps_mode == 5)
+        ImGui::TextWrapped("%s", tr("As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock "
+                                    "stays right. Cutscenes stay at 30. The phone works harder and heats more."));
     {   // Frame generation (Lossless Scaling's LSFG with the player's own Lossless.dll: nvn/vulkan/framegen.c)
         static const char *fg[] = {"Off", "2x", "3x", "4x"};
         int v = g_settings.lsfg ? g_settings.lsfg_mult - 1 : 0;

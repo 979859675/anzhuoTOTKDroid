@@ -745,3 +745,7 @@
  "Sombras"},
 {"The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. Applies at once.",
  "As sombras do jogo: do sol, do Link e de tudo ao redor. Desligado: nenhuma é desenhada - a imagem fica mais chapada e iluminada por igual, e a GPU trabalha um pouco menos a cada quadro; só compensa num celular no limite. Vale na hora."},
+{"Unlocked (up to 120 fps)",
+ "Sem limite (até 120 fps)"},
+{"As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock stays right. Cutscenes stay at 30. The phone works harder and heats more.",
+ "Tão rápido quanto o aparelho desenhar, até a taxa de atualização mais alta da tela (no máximo 120 fps). O relógio do jogo continua certo. As cenas continuam a 30. O celular trabalha mais e esquenta mais."},

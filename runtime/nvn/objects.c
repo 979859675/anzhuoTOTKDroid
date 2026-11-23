@@ -1852,7 +1852,7 @@ static void totk_auto_present(uint64_t now) {
 
 int64_t rt_frame_ticks(int64_t ticks) {
     if (!g_settings.fps_mode) return ticks;
-    if (g_settings.fps_mode == 4) {
+    if (g_settings.fps_mode == 4 || g_settings.fps_mode == 5) {
         const int64_t cap = 19200000ll * 90 / 100 / 60;
         return ticks > cap ? cap : ticks;
     }
@@ -2021,7 +2021,7 @@ NVN(nvnWindowSetPresentInterval) {
     // TOTK at Frame rate 60: always 1. Its controller (rt_fps60) went back to 2 within a second each time it tried 1
     // in the cave (2026-10-29: 6 tries in 200 s, 30.8 fps on average); held at 1 the same walk ran 35 fps there (GPU
     // and the ~18 ms render thread: 42 at a 960x540 scene) - Auto leaves the choice to the game.
-    if (g_game_version == GAME_V_143 && (g_settings.fps_mode == 2 || g_settings.fps_mode == 4 || rt_totk_auto60()) && rt_fps60() && force <= 0 &&
+    if (g_game_version == GAME_V_143 && (g_settings.fps_mode == 2 || g_settings.fps_mode == 4 || g_settings.fps_mode == 5 || rt_totk_auto60()) && rt_fps60() && force <= 0 &&
         !rt_cutscene())
         c->x[1] = 1;
     if (g_game_version == GAME_V_143 && g_settings.fps_mode == 3 && force <= 0) c->x[1] = 3;
@@ -2131,11 +2131,11 @@ NVN(nvnQueuePresentTexture) {
         if (on < 0) on = !getenv("LARECOMP_PRESENT_WAIT") || atoi(getenv("LARECOMP_PRESENT_WAIT"));
         extern volatile uint64_t g_vsync_count;
         extern __thread uint64_t g_blocked_ns;  // (kernel.c: the pacer counts this as idle, not frame work)
-        int cap = g_settings.fps_mode == 2 || (!g_settings.fps_mode && rt_fps60()) ? 1 : 2;
+        int cap = g_settings.fps_mode == 2 || g_settings.fps_mode == 5 || (!g_settings.fps_mode && rt_fps60()) ? 1 : 2;
         int n = w->interval > cap ? w->interval : cap;
         // (TOTK at Frame rate 60: 1 whatever the window kept - the controller calls it only on a change, and a
         // cutscene's 2 stayed there after it; a cutscene at 30, as on the Switch)
-        if (g_game_version == GAME_V_143 && (g_settings.fps_mode == 2 || g_settings.fps_mode == 4) && rt_fps60()) n = 1;
+        if (g_game_version == GAME_V_143 && (g_settings.fps_mode == 2 || g_settings.fps_mode == 4 || g_settings.fps_mode == 5) && rt_fps60()) n = 1;
         if (g_game_version == GAME_V_143 && g_settings.fps_mode == 3) n = 3;
         if (rt_totk_auto()) {  // (Auto: rt_totk_auto60's pick)
             totk_auto_present(plat_now_ns());
@@ -2156,7 +2156,7 @@ NVN(nvnQueuePresentTexture) {
             g_blocked_ns += t1 - t0;
             last = last && t1 < target + period ? target : t1;
             framepace_presented(last, last == target);
-        } else if (on) {
+        } else if (on && !(g_game_version == GAME_V_143 && g_settings.fps_mode == 5 && n == 1)) {  // (Unlocked: below)
             uint64_t want = last_vs + (uint64_t)n, t0 = plat_now_ns();
 #ifdef __ANDROID__
             extern void vk_tl(const char *what, uint64_t a, uint64_t b);
@@ -2176,10 +2176,13 @@ NVN(nvnQueuePresentTexture) {
         static uint64_t previous;
         static int mode = -1;
         if (mode != g_settings.fps_mode) previous = 0, mode = g_settings.fps_mode;
-        if (mode == 4) {
-            extern int vk_between_fps(void);
+        // Unlocked (5, from peanuts-native's fps_limit_max): the 60 path paced by time at the screen's fastest refresh,
+        // at most 120 (vk_unlocked_fps), not by the 60 Hz vsync; the world already steps by the measured time (down to
+        // 1/120 s, frame_step_update). A cutscene stays at 30 through the vsync wait above.
+        if (mode == 4 || (mode == 5 && !rt_cutscene())) {
+            extern int vk_between_fps(void), vk_unlocked_fps(void);
             extern __thread uint64_t g_blocked_ns;
-            uint64_t now = plat_now_ns(), period = 1000000000ull / (rt_cutscene() ? 30 : vk_between_fps());
+            uint64_t now = plat_now_ns(), period = 1000000000ull / (mode == 5 ? vk_unlocked_fps() : rt_cutscene() ? 30 : vk_between_fps());
             if (previous && now < previous + period) {
                 plat_sleep_until_ns(previous + period);
                 g_blocked_ns += plat_now_ns() - now;

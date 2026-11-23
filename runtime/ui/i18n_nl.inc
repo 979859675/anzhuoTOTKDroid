@@ -724,3 +724,7 @@
  "Schaduwen"},
 {"The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. Applies at once.",
  "De schaduwen van het spel: van de zon, van Link en van alles eromheen. Uit: er wordt er geen getekend - het beeld is vlakker en gelijkmatig belicht, en de GPU werkt per beeld iets minder; alleen de moeite waard op een telefoon die op zijn limiet zit. Geldt meteen."},
+{"Unlocked (up to 120 fps)",
+ "Onbeperkt (tot 120 fps)"},
+{"As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock stays right. Cutscenes stay at 30. The phone works harder and heats more.",
+ "Zo snel als je toestel tekent, tot de hoogste verversingssnelheid van het scherm (hoogstens 120 fps). De klok van het spel blijft kloppen. Tussenfilmpjes blijven op 30. De telefoon werkt harder en wordt warmer."},

@@ -727,3 +727,7 @@
  "Sombras"},
 {"The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. Applies at once.",
  "Las sombras del juego: del sol, de Link y de todo lo que lo rodea. Desactivado: no se dibuja ninguna - la imagen queda más plana e iluminada por igual, y la GPU trabaja un poco menos en cada fotograma; solo compensa en un móvil al límite. Se aplica al instante."},
+{"Unlocked (up to 120 fps)",
+ "Sin límite (hasta 120 fps)"},
+{"As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock stays right. Cutscenes stay at 30. The phone works harder and heats more.",
+ "Tan rápido como dibuje tu dispositivo, hasta la frecuencia más alta de la pantalla (como máximo 120 fps). El reloj del juego sigue correcto. Las cinemáticas siguen a 30. El teléfono trabaja más y se calienta más."},

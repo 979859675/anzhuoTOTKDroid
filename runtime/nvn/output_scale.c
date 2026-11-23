@@ -43,6 +43,7 @@ static void dyn_update(double now, double gpu_ms) {
 #ifdef __ANDROID__
     if (g_settings.fps_mode == 3) want = 50.0;
     else if (g_settings.fps_mode == 4) { extern int vk_between_fps(void); want = 1000.0 / vk_between_fps(); }
+    else if (g_settings.fps_mode == 5) { extern int vk_unlocked_fps(void); want = 1000.0 / vk_unlocked_fps(); }
 #endif
     g_dyn_dt_sum += dt;
     g_dyn_n++;

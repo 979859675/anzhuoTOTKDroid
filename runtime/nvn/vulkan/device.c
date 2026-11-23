@@ -1212,15 +1212,17 @@ static void android_create_surface(struct ANativeWindow *aw) {
 #include <dlfcn.h>
 int vk_between_fps(void);
 int vk_between_target(void);
+int vk_unlocked_fps(void);
 static void android_frame_rate(struct ANativeWindow *aw) {
     static struct ANativeWindow *asked_aw;
     static float asked = -1;
     int mode = g_settings.fps_mode;
-    float want = mode == 4 && vk_between_target() != 30 ? (float)vk_between_target() : 0.0f;
+    float want = mode == 4 && vk_between_target() != 30 ? (float)vk_between_target()
+               : mode == 5 && vk_unlocked_fps() > 60 ? (float)vk_unlocked_fps() : 0.0f;
     bool fg = false;
     extern int vk_fg_state(void);
     if (vk_fg_state() > 0) {  // (1 generating, 2 waiting, 3 no refresh left)
-        int base = mode == 1 ? 30 : mode == 3 ? 20 : mode == 4 ? vk_between_fps() : 60;
+        int base = mode == 1 ? 30 : mode == 3 ? 20 : mode == 4 ? vk_between_fps() : mode == 5 ? vk_unlocked_fps() : 60;
         int mult = g_settings.lsfg_mult < 2 ? 2 : g_settings.lsfg_mult > 4 ? 4 : g_settings.lsfg_mult;
         want = (float)(base * mult), fg = true;
     }
@@ -2066,6 +2068,20 @@ int vk_between_target(void) {
         LOG("[vk] Frame rate 40 / 45: the screen offers up to %.0f Hz\n", hz);
     }
     return fps > 0 ? fps : vk_between_fps();
+}
+
+// Frame rate Unlocked (5): the fastest refresh the screen offers, at most 120 and at least 60 (60 when unknown);
+// LARECOMP_UNLOCKED_FPS=<30-240> over it. The window asks for that rate (android_frame_rate) so HyperOS leaves 60 Hz.
+int vk_unlocked_fps(void) {
+    static int fps;
+    if (!fps) {
+        const char *e = getenv("LARECOMP_UNLOCKED_FPS");
+        extern float plat_max_refresh_hz(void);
+        float hz = e ? (float)atof(e) : plat_max_refresh_hz();
+        fps = e ? (hz < 30 ? 30 : hz > 240 ? 240 : (int)(hz + 0.5f)) : hz > 119 ? 120 : hz > 60 ? (int)(hz + 0.5f) : 60;
+        LOG("[vk] Frame rate Unlocked: up to %d fps (the screen offers up to %.0f Hz)\n", fps, hz);
+    }
+    return fps;
 }
 
 static bool g_lrz_at_start = true;

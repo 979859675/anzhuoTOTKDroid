@@ -724,3 +724,7 @@
  "Schatten"},
 {"The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. Applies at once.",
  "Die Schatten des Spiels: der Sonne, von Link und von allem ringsum. Aus: keine werden gezeichnet - das Bild wirkt flacher und gleichmäßig beleuchtet, und die GPU arbeitet pro Bild etwas weniger; lohnt sich nur auf einem Handy am Limit. Gilt sofort."},
+{"Unlocked (up to 120 fps)",
+ "Unbegrenzt (bis 120 fps)"},
+{"As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock stays right. Cutscenes stay at 30. The phone works harder and heats more.",
+ "So schnell, wie dein Gerät zeichnet, bis zur höchsten Bildwiederholrate des Bildschirms (höchstens 120 fps). Die Spielzeit bleibt korrekt. Zwischensequenzen bleiben bei 30. Das Handy arbeitet mehr und wird wärmer."},

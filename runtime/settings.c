@@ -296,7 +296,7 @@ void settings_load(void) {
 #ifdef __ANDROID__
         else if (!strcmp(key, "touch_controls")) g_settings.touch_controls = atoi(val) != 0;
         else if (!strcmp(key, "fps60_hysteresis")) g_settings.fps60_hysteresis = atoi(val) != 0;
-        else if (!strcmp(key, "frame_rate")) g_settings.fps_mode = !strcmp(val, "30") ? 1 : !strcmp(val, "60") ? 2 : !strcmp(val, "20") ? 3 : (!strcmp(val, "40") || !strcmp(val, "45")) ? 4 : 0;
+        else if (!strcmp(key, "frame_rate")) g_settings.fps_mode = !strcmp(val, "30") ? 1 : !strcmp(val, "60") ? 2 : !strcmp(val, "20") ? 3 : (!strcmp(val, "40") || !strcmp(val, "45")) ? 4 : !strcmp(val, "unlocked") ? 5 : 0;
         else if (!strcmp(key, "shader_int32")) g_settings.shader_int32 = atoi(val) != 0;
         else if (!strcmp(key, "sync_lag")) g_settings.sync_lag = atoi(val) != 0;
         else if (!strcmp(key, "files_in_place")) g_settings.files_in_place = atoi(val) != 0;
@@ -416,7 +416,7 @@ void settings_save(void) {
 #ifdef __ANDROID__
     fprintf(f, "touch_controls = %d\n", g_settings.touch_controls);
     fprintf(f, "fps60_hysteresis = %d\n", g_settings.fps60_hysteresis);
-    fprintf(f, "frame_rate = %s\n", g_settings.fps_mode == 1 ? "30" : g_settings.fps_mode == 2 ? "60" : g_settings.fps_mode == 3 ? "20" : g_settings.fps_mode == 4 ? "45" : "auto");
+    fprintf(f, "frame_rate = %s\n", g_settings.fps_mode == 1 ? "30" : g_settings.fps_mode == 2 ? "60" : g_settings.fps_mode == 3 ? "20" : g_settings.fps_mode == 4 ? "45" : g_settings.fps_mode == 5 ? "unlocked" : "auto");
     fprintf(f, "shader_int32 = %d\nsync_lag = %d\nfiles_in_place = %d\nnative_code = %d\n", g_settings.shader_int32,
             g_settings.sync_lag, g_settings.files_in_place, g_settings.native_code);
     static const char *const tri[] = {"auto", "0", "1"};  // (-1 / 0 / 1)
