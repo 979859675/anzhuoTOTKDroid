@@ -2297,6 +2297,40 @@ static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
 static bool pass_noatt;
 static int debug_pass_no;
 
+// Depth the pass only reads (from Swap2-Native's DM_VK_DEPTH_NONE, after Erick's Ocarina fork): a pass that loads its
+// depth and opens for a draw with depth writes off (a colour pass over a finished depth pre-pass, decals, transparents)
+// stored the unchanged depth back at its end anyway - on a tiler (Mali) the whole attachment from tile memory to RAM.
+// Such a pass ends its depth with storeOp NONE: the contents stay as they were. A later draw of the pass that writes
+// depth, or a depth clear in it, ends it first (the next one begins with STORE). Depth-only formats only (no stencil),
+// dynamic rendering on Vulkan 1.3. LARECOMP_DEPTH_NONE=1 / 0: on / off; by default on Mali (vendor 0x13B5) only - no
+// gain was measured on an Adreno 830. draw_ / clear say what opens the pass (pass_open_dw: 1 a draw writing depth,
+// 0 one that doesn't, -1 anything else).
+static int pass_open_dw = -1;
+static bool pass_dnone;
+// (depth targets a pass that wasn't storing them had to end for a depth write: stored from the start for the rest of
+// that frame and the next - in TOTK ~1 in 3 such passes did, and on a tiler each split is a store and load of them all)
+static struct { const NvnTexture *t; uint64_t frame; } dnone_split[32];
+static bool dnone_recent_split(const NvnTexture *t) {
+    uint64_t f = renderer_present_count();
+    for (int i = 0; i < 32; i++)
+        if (dnone_split[i].t == t && dnone_split[i].frame + 1 >= f) return true;
+    return false;
+}
+static void dnone_note_split(const NvnTexture *t) {
+    static unsigned next;
+    dnone_split[next++ & 31] = (typeof(dnone_split[0])){t, renderer_present_count()};
+}
+static uint64_t stat_dnone, stat_dnone_split;
+static bool depth_none_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_DEPTH_NONE");
+        on = (e ? atoi(e) != 0 : g_vk.props.vendorID == 0x13B5) && g_vk.dyn_render && g_vk.api >= VK_API_VERSION_1_3;
+        LOG("[vk] depth the pass only reads, not stored: %s\n", on ? "on" : "off");
+    }
+    return on;
+}
+
 // Attachment-less render pass sizing (ported from valentderah/totk-pc-recomp commit 7ceda94):
 // TotK draws a fragment shader that only writes a storage buffer into an offset 1x1 viewport; sizing the pass by
 // the viewport's far corner (x + w, y + h) keeps the offset viewport inside the render area and scissor so cave
@@ -3042,6 +3076,22 @@ static void begin_pass(void) {
             }
         }
     }
+    pass_dnone = false;
+    if (has_d && !has_s && pass_open_dw == 0 && da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD && depth_none_on() &&
+        !dnone_recent_split(st.rt.depth)) {
+        da.storeOp = VK_ATTACHMENT_STORE_OP_NONE;  // (depth the pass only reads: depth_none_on)
+        pass_dnone = true;
+        stat_dnone++;
+        static uint64_t next;
+        uint64_t now = plat_now_ns();
+        if (now >= next) {
+            next = now + 10000000000ull;
+            extern _Atomic uint64_t stat_fs_elided;
+            LOG("[vk] depth not stored: %llu passes so far, %llu ended early by a depth write or clear; pipelines without "
+                "their fragment shader: %llu\n", (unsigned long long)stat_dnone, (unsigned long long)stat_dnone_split,
+                (unsigned long long)atomic_load(&stat_fs_elided));
+        }
+    }
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {minw, minh}}, .layerCount = 1,
                           .colorAttachmentCount = pass_ncolor, .pColorAttachments = ca,
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
@@ -3296,6 +3346,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
         noatt_dims(&nw, &nh);
         if (nw > pass_w || nh > pass_h) st.rt_dirty = true;
     }
+    if (in_pass && pass_dnone && depth) st.rt_dirty = true, stat_dnone_split++, dnone_note_split(st.rt.depth);  // (a depth clear: stored again)
     begin_pass();
     for (int i = 0; i < nlclear; i++) {  // (done by the pass's load operations: begin_pass - each once)
         if (lclear[i].rec != g_cur_rec) continue;
@@ -4270,6 +4321,27 @@ static VkPrimitiveTopology topo_class_base(uint8_t c) {
     return c == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : c == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 }
 
+// Fragment shaders with nothing to do (from Swap2-Native's DM_VK_FS_ELIDE, after Erick's Ocarina fork): a draw whose
+// colour writes are all masked (or that has no colour target) and whose fragment shader has no other effect - no
+// discard, no depth write, no memory store - gets a pipeline without it: depth-only passes, shadow maps and depth
+// pre-passes, which NVN games draw with a fragment shader bound and the colour masked. Depth tests and writes and
+// occlusion counts come from the rasterized depth alone, as with the shader; a tiler saves the shader's work. Not with
+// alpha to coverage. LARECOMP_FS_ELIDE=1 / 0: on / off; by default on Mali (vendor 0x13B5) only.
+_Atomic uint64_t stat_fs_elided;
+static bool fs_elide(const PipeKey *k) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_FS_ELIDE");
+        on = e ? atoi(e) != 0 : g_vk.props.vendorID == 0x13B5;
+    }
+    const ShaderInfo *fi = k->prog->fi;
+    if (!on || !fi || k->a2c || fi->writes_depth || fi->uses_discard || fi->uses_gmem_store) return false;
+    for (uint32_t i = 0; i < k->ncolor; i++)
+        if (k->write_mask[i]) return false;
+    atomic_fetch_add(&stat_fs_elided, 1);
+    return true;
+}
+
 static void build_pipeline(void *arg) {
     Pipe *pp = arg;
     if (atomic_load_explicit(&jobs_abort, memory_order_acquire)) { signal_build_done(&pp->state, 2); return; }  // (jobs_drain)
@@ -4354,7 +4426,7 @@ static void build_pipeline(void *arg) {
     VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k->ncolor,
                                         .pColorAttachmentFormats = k->color, .depthAttachmentFormat = k->depth,
                                         .stencilAttachmentFormat = k->stencil};
-    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 2,
+    VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = fs_elide(k) ? 1u : 2u,
                                        .pStages = stages, .pVertexInputState = g_vk.dyn_vi ? NULL : &vi, .pInputAssemblyState = &ia,
                                        .pViewportState = &vs, .pRasterizationState = &rs, .pMultisampleState = &ms,
                                        .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
@@ -8719,7 +8791,13 @@ static void draw_(CmdRec *r, bool indexed) {
     if (gcopy_mode && (pr->vi->uses_gmem_store || pr->fi->uses_gmem_store) && (pr->vi->uses_gmem_map || pr->fi->uses_gmem_map))
         gres_premerge((pr->vi->uses_gmem_map ? 1u : 0u) | (pr->fi->uses_gmem_map ? 2u : 0u));  // (before the pass opens)
 #endif
-    begin_pass();
+    {   // (depth the pass only reads: depth_none_on) a draw writing depth into a pass that won't store it ends it first
+        bool writes_depth = st.ds[0] && st.ds[1];
+        if (in_pass && pass_dnone && writes_depth) st.rt_dirty = true, stat_dnone_split++, dnone_note_split(st.rt.depth);
+        pass_open_dw = writes_depth;
+        begin_pass();
+        pass_open_dw = -1;
+    }
     VkCommandBuffer cb = vk_cmd_rp();  // (the draw's commands: packets for the replay thread while rp_on, replay.h)
 
     uint32_t mode = (uint32_t)r->x[0];
