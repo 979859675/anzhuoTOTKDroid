@@ -26,6 +26,7 @@
 extern "C" {
 #include "platform.h"
 #include "../settings.h"
+const char *vk_driver_rejected(void);  // vulkan/android_driver.c: the chosen driver package the system's stood in for ("" none)
 const char *vk_gpu_desc(void);  // vulkan/device.c: "<device> - <driver>"
 double vk_frame_gpu_ms(void);   // vulkan/exec.c
 uint64_t vk_presented_images(void);    // vulkan/device.c: the window images shown, the game's and the generated ones
@@ -203,7 +204,13 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     static char gpu[96];
     static const char *brand = "GPU";
     static bool turnip;
+    static char drvname[48];  // the custom driver package (its folder: the zip's name), shown instead of "Turnip (Mesa)"
     if (!gpu[0]) {
+        const char *p = getenv("LARECOMP_VK_DRIVER"), *e = p ? strrchr(p, '/') : NULL, *s0 = e;
+        if (e && !vk_driver_rejected()[0]) {
+            while (s0 > p && s0[-1] != '/') s0--;
+            snprintf(drvname, sizeof drvname, "%.*s", (int)(e - s0), s0);
+        }
         const char *d = vk_gpu_desc();
         const char *sep = strstr(d, " - ");
         if (d[0]) {
@@ -286,7 +293,8 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         chart(2, 164, 0xFFA699FF, "RAM MB");
         snprintf(s, sizeof s, "GPU %s ms  |  RAM %s", number(a, gms), ram);
         text(s, 12, 212, 11, 0xFFE3EAF5);
-        snprintf(s, sizeof s, "CPU cap %s%s", cpu, turnip ? "  |  Turnip (Mesa)" : "");
+        if (turnip) snprintf(s, sizeof s, "CPU cap %s  |  %s", cpu, drvname[0] ? drvname : "Turnip (Mesa)");
+        else snprintf(s, sizeof s, "CPU cap %s", cpu);
         text(s, 12, 229, 10, turnip ? 0xFFFF9F43 : 0xFFE3EAF5);
         char lv[8];
         if (level < 0) strcpy(lv, "--");

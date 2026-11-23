@@ -961,9 +961,14 @@ static void create_device(void) {
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     uint64_t fpcr = vk_fp_host("vkCreateDevice");  // (the driver's threads made here inherit the FPCR: vk_fpenv.h)
+#ifdef __ANDROID__
+    extern void vk_gpu_floor_before(bool turnip), vk_gpu_floor_after(void);  // (gpu_floor.c: the KGSL clock floor)
+    vk_gpu_floor_before(driver.driverID == VK_DRIVER_ID_MESA_TURNIP);
+#endif
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
     vk_fp_put(fpcr);
 #ifdef __ANDROID__
+    vk_gpu_floor_after();
     volkLoadDevice(g_vk.dev);
     compat_aliases();
     if (g_vk.dyn_vi && !vkCmdSetVertexInputEXT) {
@@ -1516,6 +1521,9 @@ static void present_game_half(void) {
     fnprof_frame(renderer_present_count());
     extern void reboot_test_frame(uint64_t frame);  // runtime/main.c (LARECOMP_REBOOT_AT)
     reboot_test_frame(renderer_present_count());
+    extern void vk_gpu_floor_frame(uint64_t frame), vk_gpu_floor_clock_log(void);  // (gpu_floor.c)
+    vk_gpu_floor_frame(renderer_present_count());
+    vk_gpu_floor_clock_log();
 }
 
 void vk_present_now(NvnTexture *t);
