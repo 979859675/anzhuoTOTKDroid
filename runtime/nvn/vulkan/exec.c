@@ -2305,6 +2305,7 @@ static int debug_pass_no;
 // dynamic rendering on Vulkan 1.3. LARECOMP_DEPTH_NONE=1 / 0: on / off; by default on Mali (vendor 0x13B5) only - no
 // gain was measured on an Adreno 830. draw_ / clear say what opens the pass (pass_open_dw: 1 a draw writing depth,
 // 0 one that doesn't, -1 anything else).
+static void rec_clear(int index), rec_pass(uint32_t ncleared), rec_dump(void), rec_copy(const NvnTexture *src, const NvnTexture *dst);  // (LARECOMP_REC: below debug_draw)
 static int pass_open_dw = -1;
 static bool pass_dnone;
 // (depth targets a pass that wasn't storing them had to end for a depth write: stored from the start for the rest of
@@ -3076,6 +3077,7 @@ static void begin_pass(void) {
             }
         }
     }
+    rec_pass((uint32_t)nlclear);
     pass_dnone = false;
     if (has_d && !has_s && pass_open_dw == 0 && da.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD && depth_none_on() &&
         !dnone_recent_split(st.rt.depth)) {
@@ -3118,6 +3120,18 @@ static void begin_pass(void) {
                     st.rt.color[i]->depth, st.rt.color[i]->format, st.rt.color[i]->target, (unsigned long long)st.rt.color[i]->addr,
                     (void *)st.rt.color[i], st.rt.has_cview[i], st.rt.cview[i].setmask, st.rt.cview[i].min_layer,
                     st.rt.cview[i].num_layers, st.rt.cview[i].base_level);
+        // LARECOMP_WATCH_DEBUG=<n>: the rest of the frame where the watched texture becomes a render target is a debug
+        // frame (its draws and what they sample, as LARECOMP_DEBUG_FRAME's), the first n times - #76's menu background
+        // is drawn only when a menu opens, at a frame no one can name in advance
+        static int dbg_left = -2;
+        if (dbg_left == -2) dbg_left = getenv("LARECOMP_WATCH_DEBUG") ? atoi(getenv("LARECOMP_WATCH_DEBUG")) : 0;
+        for (int i = 0; wa && dbg_left > 0 && !g_debug_frame && i < st.rt.ncolor; i++)
+            if (st.rt.color[i] && st.rt.color[i]->addr <= wa && wa < st.rt.color[i]->addr + tegra_total_size(&st.rt.color[i]->layout)) {
+                dbg_left--;
+                g_debug_frame = true;
+                rec_dump();
+                LOG("===== debug frame %llu (the watched texture as render target) =====\n", (unsigned long long)renderer_present_count());
+            }
     }
     ss_forget();  // (whatever ran between the passes may have set its own state)
     in_pass = true;
@@ -3347,6 +3361,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
         if (nw > pass_w || nh > pass_h) st.rt_dirty = true;
     }
     if (in_pass && pass_dnone && depth) st.rt_dirty = true, stat_dnone_split++, dnone_note_split(st.rt.depth);  // (a depth clear: stored again)
+    rec_clear(index);
     begin_pass();
     for (int i = 0; i < nlclear; i++) {  // (done by the pass's load operations: begin_pass - each once)
         if (lclear[i].rec != g_cur_rec) continue;
@@ -8279,6 +8294,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
 
 // ================================================================== draws
 static void debug_draw(Prog *pr, CmdRec *r, bool indexed);
+static void rec_draw(Prog *pr);  // (LARECOMP_REC)
 
 // Quads / fans / polygons as a 32-bit triangle index list.
 static uint32_t *expand_indices(uint32_t mode, uint32_t count, const void *indices, int itype, uint32_t first, uint32_t *out_count) {
@@ -8667,6 +8683,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (st.ubuf[0][5].addr) widescreen_scene_ubo((const float *)(uintptr_t)st.ubuf[0][5].addr, st.ubuf[0][5].size);
     }
     if (g_debug_frame) debug_draw(pr, r, indexed);
+    rec_draw(pr);
     {   // LARECOMP_LOG_RT=<w>x<h>[:<fmt hex>][+<w>x<h>[:<fmt>]...][,<max>[,<from frame>]]: draws into one color target of
         // those guest sizes (and formats), described as in a debug frame, with the frame number (the pause menu's
         // capture of the world and its blur)
@@ -9415,6 +9432,96 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 }
 
+// LARECOMP_REC=1 (diagnosis, #76): the last frames' draws, clears, copies and pass starts in a ring - each one's color
+// target and up to three of its fragment stage's textures, and whether those are GPU images (drawn) or bytes uploaded
+// from memory - written to <LARECOMP_DEBUG_DIR>/rec_<frame>.txt when LARECOMP_WATCH_DEBUG fires (the watched texture
+// becomes a render target: a menu opening). The menus' black background is decided before that point, in the frame
+// before or in the opening one's first passes, which a debug frame that starts there never shows.
+typedef struct {
+    uint64_t frame;
+    uint8_t kind;  // 0 draw, 1 clear, 2 copy (src in t[0], dst as the target), 3 pass start
+    uint8_t n;     // textures in t[]
+    uint8_t rgpu, rup;  // the target's backend: drawn by the GPU, uploaded from memory
+    uint32_t rw, rh, rf;
+    uint64_t ra, code;  // the target's address; draws: the fragment shader's code address; clears: index (or ~0: depth)
+    struct { uint64_t a; uint32_t w, h, f; uint8_t gpu, up; } t[3];
+} RecEnt;
+enum { REC_N = 16384 };
+static RecEnt *rec_ring;
+static uint64_t rec_pos;
+static bool rec_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("LARECOMP_REC") && atoi(getenv("LARECOMP_REC")) != 0;
+        if (on) rec_ring = calloc(REC_N, sizeof *rec_ring), on = rec_ring != NULL;
+    }
+    return on;
+}
+static RecEnt *rec_new(int kind, const NvnTexture *rt) {
+    RecEnt *e = &rec_ring[rec_pos++ % REC_N];
+    memset(e, 0, sizeof *e);
+    e->frame = renderer_present_count();
+    e->kind = (uint8_t)kind;
+    if (rt) {
+        const TexBackend *b = rt->backend;
+        e->ra = rt->addr, e->rw = rt->width, e->rh = rt->height, e->rf = rt->format;
+        e->rgpu = b && b->gpu_owned, e->rup = b && b->uploaded;
+    }
+    return e;
+}
+static void rec_tex(RecEnt *e, const NvnTexture *t) {
+    if (!t || e->n >= 3) return;
+    const TexBackend *b = t->backend;
+    e->t[e->n].a = t->addr, e->t[e->n].w = t->width, e->t[e->n].h = t->height, e->t[e->n].f = t->format;
+    e->t[e->n].gpu = b && b->gpu_owned, e->t[e->n].up = b && b->uploaded;
+    e->n++;
+}
+static void rec_draw(Prog *pr) {
+    if (!rec_on()) return;
+    RecEnt *e = rec_new(0, st.rt.ncolor ? st.rt.color[0] : st.rt.depth);
+    e->code = pr->code[1];
+    for (int i = 0; i < pr->fi->ntex && e->n < 3; i++) rec_tex(e, shader_texture_object(1, &pr->fi->tex[i]));
+}
+static void rec_clear(int index) {
+    if (!rec_on()) return;
+    RecEnt *e = rec_new(1, index >= 0 && index < st.rt.ncolor ? st.rt.color[index] : st.rt.depth);
+    e->code = index >= 0 ? (uint64_t)index : ~0ull;
+}
+static void rec_copy(const NvnTexture *src, const NvnTexture *dst) {
+    if (!rec_on()) return;
+    rec_tex(rec_new(2, dst), src);
+}
+static void rec_pass(uint32_t ncleared) {
+    if (!rec_on()) return;
+    RecEnt *e = rec_new(3, st.rt.ncolor ? st.rt.color[0] : st.rt.depth);
+    e->code = ncleared;
+}
+static void rec_dump(void) {
+    if (!rec_on() || !getenv("LARECOMP_DEBUG_DIR")) return;
+    char path[512];
+    uint64_t now = renderer_present_count();
+    snprintf(path, sizeof path, "%s/rec_%llu.txt", getenv("LARECOMP_DEBUG_DIR"), (unsigned long long)now);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    static const char *const kinds[] = {"draw", "clear", "copy", "pass"};
+    uint64_t from = rec_pos > REC_N ? rec_pos - REC_N : 0;
+    for (uint64_t i = from; i < rec_pos; i++) {
+        const RecEnt *e = &rec_ring[i % REC_N];
+        if (e->frame + 2 < now) continue;  // (the opening frame and the two before it)
+        fprintf(f, "f%llu %s rt %ux%u f%#x @%llx%s%s", (unsigned long long)e->frame, kinds[e->kind], e->rw, e->rh, e->rf,
+                (unsigned long long)e->ra, e->rgpu ? " gpu" : "", e->rup ? " up" : "");
+        if (e->kind == 0) fprintf(f, " fs %llx", (unsigned long long)e->code);
+        if (e->kind == 1) fprintf(f, e->code == ~0ull ? " depth" : " color %llu", (unsigned long long)e->code);
+        if (e->kind == 3) fprintf(f, " cleared-by-load %llu", (unsigned long long)e->code);
+        for (int k = 0; k < e->n; k++)
+            fprintf(f, " | %s %ux%u f%#x @%llx%s%s", e->kind == 2 ? "src" : "tex", e->t[k].w, e->t[k].h, e->t[k].f,
+                    (unsigned long long)e->t[k].a, e->t[k].gpu ? " gpu" : "", e->t[k].up ? " up" : "");
+        fputc('\n', f);
+    }
+    fclose(f);
+    LOG("[rec] %s written\n", path);
+}
+
 static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     LOG("[draw] %s inst %llu mode %llu count %llu prog vs=%llx fs=%llx | vs cb %#x fs cb %#x | rt %d", indexed ? "e" : "a",
         (unsigned long long)(indexed ? r->x[6] : r->x[4]), (unsigned long long)r->x[0], (unsigned long long)r->x[2],
@@ -9756,6 +9863,7 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
                 wd ? wd->width : 0, wd ? wd->height : 0, wd ? wd->format : 0, wd ? (unsigned long long)wd->addr : 0ull);
     }
     snap_reason = "tex2tex"; snapshots_invalidate(NULL);
+    rec_copy((const NvnTexture *)(uintptr_t)src->tex, (const NvnTexture *)(uintptr_t)dst->tex);  // (LARECOMP_REC)
     NvnTexture *st_ = (NvnTexture *)(uintptr_t)src->tex, *dt = (NvnTexture *)(uintptr_t)dst->tex;
     if (!st_ || !dt) return;
     vk_end_pass();

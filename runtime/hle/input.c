@@ -397,6 +397,7 @@ static void host_test_frame(uint64_t frame) {
     }
 }
 
+static void input_latch_frame(void);  // (below fill_state's TOUCH_* definitions)
 static uint64_t g_pad_obj;
 volatile int g_inject_plus;  // frames to hold Plus for the game (movie.c: A/B skip a skippable movie)
 RT_ON_RESET(input_reboot_reset) { g_pad_obj = 0; g_inject_plus = 0; }  // (reboot: the controller object was guest memory)
@@ -417,6 +418,7 @@ void input_frame(uint64_t frame) {
     extern void watch_arm(void);
     watch_arm();
     host_test_frame(frame);
+    input_latch_frame();
     const char *spec = getenv("LARECOMP_INPUT");
     if (!spec) return;
     static const char *const names[] = {"A", "B", "X", "Y", "LSTICK", "RSTICK", "L", "R", "ZL", "ZR", "PLUS",
@@ -475,6 +477,24 @@ static int32_t clamp_axis(int32_t v) { return v > 32767 ? 32767 : v < -32767 ? -
 
 // NpadFullKeyState / NpadHandheldState / NpadJoy*State share this layout (0x28 bytes):
 // {int64 sampling, u64 buttons, AnalogStick L {x,y}, AnalogStick R {x,y}, u32 attributes}
+// The host's input (keys, controllers, the on-screen controls) as the game's polls see it: read once a presented frame
+// (input_frame), so every poll of a frame - TOTK polls several times a frame - sees the same buttons, as the scripted
+// input always was. Read live, a touch landing mid-frame was "no menu" to the part of the frame that draws the world and
+// "menu" to the part that captures it for the menu's blurred background: the weapon wheel opened over black (#76, only
+// with a player's touch, never with LARECOMP_INPUT) - or so it seemed: latched, 3 of 11 openings were still black
+// (2026-11-23), so it is off by default. LARECOMP_INPUT_LATCH=1: latched.
+static _Atomic uint64_t latch_b;
+static _Atomic int32_t latch_lx, latch_ly, latch_rx, latch_ry;
+static void input_latch_frame(void) {  // (input_frame: once a presented frame, on the game's thread)
+    latch_b = key_buttons | pad_buttons | TOUCH_BUTTONS;
+    latch_lx = key_lx + pad_lx + TOUCH_LX, latch_ly = key_ly + pad_ly + TOUCH_LY;
+    latch_rx = key_rx + pad_rx + TOUCH_RX, latch_ry = key_ry + pad_ry + TOUCH_RY;
+}
+static bool input_latch_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("LARECOMP_INPUT_LATCH") && atoi(getenv("LARECOMP_INPUT_LATCH")) != 0;
+    return on;
+}
 static void fill_state(Cpu *c) {
     uint8_t *s = (uint8_t *)(uintptr_t)c->x[0];
     uint32_t id = *(uint32_t *)(uintptr_t)c->x[1];
@@ -493,15 +513,18 @@ static void fill_state(Cpu *c) {
         LOG("[input] watching controller object %llx\n", c->x[1] - 8);
     }
     bool menu = menu_input_captured();  // the overlay menu / name entry has the controls (typing there isn't for the game)
-    uint64_t b = menu ? script_buttons : key_buttons | pad_buttons | TOUCH_BUTTONS | script_buttons;
+    bool latch = input_latch_on();
+    uint64_t b = menu ? script_buttons : (latch ? latch_b : key_buttons | pad_buttons | TOUCH_BUTTONS) | script_buttons;
     {   // injected Plus: held for ~10 presented frames (the game polls several times per frame)
         extern uint64_t renderer_present_count(void);
         static uint64_t until;
         if (g_inject_plus > 0) { until = renderer_present_count() + 10; g_inject_plus = 0; }
         if (renderer_present_count() < until) b |= 1ull << BTN_PLUS;
     }
-    int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx + TOUCH_LX) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly + TOUCH_LY) + script_ly);
-    int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx + TOUCH_RX) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry + TOUCH_RY) + script_ry);
+    int32_t lx = clamp_axis((menu ? 0 : latch ? latch_lx : key_lx + pad_lx + TOUCH_LX) + script_lx);
+    int32_t ly = clamp_axis((menu ? 0 : latch ? latch_ly : key_ly + pad_ly + TOUCH_LY) + script_ly);
+    int32_t rx = clamp_axis((menu ? 0 : latch ? latch_rx : key_rx + pad_rx + TOUCH_RX) + script_rx);
+    int32_t ry = clamp_axis((menu ? 0 : latch ? latch_ry : key_ry + pad_ry + TOUCH_RY) + script_ry);
     // stick directions also appear as buttons (bits 16-23)
     if (lx < -16000) b |= 1ull << 16;
     if (ly > 16000) b |= 1ull << 17;

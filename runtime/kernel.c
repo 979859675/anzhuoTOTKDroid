@@ -776,7 +776,27 @@ static void mutex_release(uint64_t addr) {
 
 KThread *g_waitlist;
 
-static void waitlist_add(KThread *t) { t->wnext = g_waitlist; g_waitlist = t; }
+// The waiters in arrival order (FIFO, with LARECOMP_WAIT_FIFO=1), as Horizon keeps them: mutex_release and svc_signal_process_wide_key pick by
+// priority and, on a tie, the first one met - the oldest; arbiter_wake picks the same way. Until 2026-11-23 the list was
+// newest first and the arbiter ignored priority, so threads of one priority woke in the reverse order (peanuts-native
+// #3): suspected in TOTK's menus opening over a black background now and then (#76), but on the POCO with a player
+// opening the weapon wheel 11 times a round it made no clear difference (FIFO 1 and 2 black, LIFO 6, 3, 3 and 1;
+// 2026-11-23). So it stays opt-in: LARECOMP_WAIT_FIFO=1. (LARECOMP_WAIT_LIFO=1: the old order, whatever the other says.)
+static int wait_lifo(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *lifo = getenv("LARECOMP_WAIT_LIFO"), *fifo = getenv("LARECOMP_WAIT_FIFO");
+        v = (lifo && atoi(lifo) != 0) || !(fifo && atoi(fifo) != 0);
+    }
+    return v;
+}
+static void waitlist_add(KThread *t) {
+    t->wnext = NULL;
+    if (wait_lifo() || !g_waitlist) { t->wnext = g_waitlist; g_waitlist = t; return; }
+    KThread *e = g_waitlist;
+    while (e->wnext) e = e->wnext;
+    e->wnext = t;
+}
 static void waitlist_remove(KThread *t) {
     for (KThread **p = &g_waitlist; *p; p = &(*p)->wnext)
         if (*p == t) { *p = t->wnext; return; }
@@ -932,14 +952,27 @@ static uint32_t svc_wait_for_address(uint64_t addr, uint32_t type, int32_t value
 
 static int arbiter_wake(uint64_t addr, int32_t count) {
     int woken = 0;
-    for (KThread *t = g_waitlist; t; t = t->wnext) {
-        if (count > 0 && woken >= count) break;
-        if (t->wait_kind == WAIT_ARBITER && t->wait_addr == addr) {
-            t->wait_kind = WAIT_NONE;
-            t->wait_result = R_OK;
-            wake(t);
-            woken++;
+    if (wait_lifo() || count <= 0) {  // (all of them: the order matters less; LARECOMP_WAIT_LIFO: as before)
+        for (KThread *t = g_waitlist; t; t = t->wnext) {
+            if (count > 0 && woken >= count) break;
+            if (t->wait_kind == WAIT_ARBITER && t->wait_addr == addr) {
+                t->wait_kind = WAIT_NONE;
+                t->wait_result = R_OK;
+                wake(t);
+                woken++;
+            }
         }
+        return woken;
+    }
+    while (woken < count) {  // (Horizon: the highest priority first, the oldest of a priority first)
+        KThread *best = NULL;
+        for (KThread *t = g_waitlist; t; t = t->wnext)
+            if (t->wait_kind == WAIT_ARBITER && t->wait_addr == addr && (!best || t->prio < best->prio)) best = t;
+        if (!best) break;
+        best->wait_kind = WAIT_NONE;
+        best->wait_result = R_OK;
+        wake(best);
+        woken++;
     }
     return woken;
 }

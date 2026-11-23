@@ -1413,10 +1413,12 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     {   // LARECOMP_LOG_STALE_UPLOAD=1 (diagnosis): an upload from guest memory that a render target the GPU drew into
         // covers - its object's own image, where the drawing never reaches memory: the texture reads what was there
         // before (MacNativeGames PR #511: BOTW's terrain height map, drawn through one object and sampled through
-        // another, kept zeros - Link's feet under the ground). Each pair once, 60 at most.
-        static int on = -1, n;
-        if (on < 0) on = getenv("LARECOMP_LOG_STALE_UPLOAD") != NULL;
-        for (int i = 0; on && n < 60 && i < g_nlive; i++) {
+        // another, kept zeros - Link's feet under the ground). Each pair once, 60 at most. =<frame> (above 1): from that
+        // frame on (the weapon wheel's icons, #76, come long after the terrain's height maps fill the 60)
+        static long on = -1;
+        static int n;
+        if (on < 0) on = getenv("LARECOMP_LOG_STALE_UPLOAD") ? atol(getenv("LARECOMP_LOG_STALE_UPLOAD")) : 0;
+        for (int i = 0; on && (long)frame >= on && n < 60 && i < g_nlive; i++) {
             NvnTexture *e = g_live[i];
             if (e == t || !e->addr || !e->backend || !((TexBackend *)e->backend)->gpu_owned) continue;
             uint64_t ee = e->addr + tegra_total_size(&e->layout);
