@@ -5520,6 +5520,7 @@ static bool heap_at(uint64_t off, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
     return true;
 }
 static void heap_copy(VkCommandBuffer cb, VkBuffer other, uint32_t n, const VkBufferCopy *cp, bool from_heap);  // (below copy_buffer)
+static void vc_mark_gpu(uint64_t lo, uint64_t hi);  // (pages the GPU writes: below)
 #ifdef __ANDROID__
 
 // CopyBufferToBuffer within the heap's GPU buffer, done by the GPU in its place in the queue. The CPU copy waited for
@@ -5547,6 +5548,7 @@ static bool gpu_buffer_copy(uint64_t src, uint64_t dst, uint64_t size) {
     VkBufferCopy c = {so, dof, size};
     vkCmdCopyBuffer(cb, sb, db, 1, &c);
     vk_full_barrier(cb);
+    if (hch_size) vc_mark_gpu(dst - HEAP_BASE, dst + size - HEAP_BASE);  // (the heap in blocks is write-tracked: no fault for this)
     bcopy_pend[bcopy_npend].lo = dst; bcopy_pend[bcopy_npend].hi = dst + size;
     bcopy_pend[bcopy_npend++].seq = vk_pending_seq();
     guest_copy_invalidate(dst, dst + size);
@@ -5996,7 +5998,14 @@ bool vk_heap_place(uint64_t size) {
             gcopy_mode = true;
             return NOT_PLACED();
         }
-        if (vc_alias_on() && VC_TRACK_LO < HEAP_BASE) plat_write_tracking_enable(VC_TRACK_LO, HEAP_BASE);  // (vcache_lookup alias_fill)
+        {   // Write tracking: the region below (vcache_lookup alias_fill) and the heap's blocks themselves (mprotect on their
+            // maps), so textures over pages the CPU left alone skip their checks, as in copy mode; the GPU's writes there
+            // (storing shaders, buffer copies) are marked GPU-written instead (vc_mark_gpu). LARECOMP_AHB_TRACK_HEAP=0: the
+            // region below only (an A/B).
+            const char *e = getenv("LARECOMP_AHB_TRACK_HEAP");
+            uint64_t lo = vc_alias_on() ? VC_TRACK_LO : HEAP_BASE, hi = !e || atoi(e) ? HEAP_BASE + HEAP_MAX : HEAP_BASE;
+            if (lo < hi) plat_write_tracking_enable(lo, hi);
+        }
         LOG("[vk] guest heap %llu MB is GPU memory (%d blocks of %llu MB, Android hardware buffers mapped at %llx): shaders "
             "reach it by pointer\n", (unsigned long long)(size >> 20), hch_n, (unsigned long long)(hch_size >> 20),
             (unsigned long long)HEAP_BASE);
