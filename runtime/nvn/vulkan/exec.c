@@ -127,6 +127,43 @@ static int nlclear;
 static uint32_t pass_written;  // (the attachments this pass's draws wrote so far: draw_writes)
 static uint32_t pass_dup_null;  // (color slots left unbound: their image is bound in another slot - begin_pass)
 
+// ---- Color targets a pass never draws into, left out of it (a tiler's: Mali; LARECOMP_DETACH=0 / 1: off / on any
+// GPU). A tiler loads every attachment into tile memory when a pass begins and stores it all back when it ends, and
+// the game's lighting passes keep the whole G-buffer bound while drawing into one target. Which targets a pass writes
+// is known only once its draws have run, so it is remembered per pass (its targets and first fragment shader) and the
+// next time that pass begins the others are left out (as pass_dup_null's: a draw writing one ends the pass first, so a
+// wrong guess costs a pass, not a picture). From SavageWindRecomp's Mali branch (087f2c5, MIT).
+#define DET_TAB 4096
+static struct { uint64_t key; uint8_t written; } det_tab[DET_TAB];
+static uint64_t pass_key;      // (the open pass's, 0: none)
+static uint8_t pass_detached;  // color slots left out of the open pass
+static bool det_clear_next;    // (a clear begins the next pass: everything attached)
+static uint64_t stat_det_passes, stat_det_slots, stat_det_miss;
+static uint64_t g_cur_fs_hash;  // (below)
+static int det_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_DETACH");
+        on = e ? atoi(e) != 0 : g_vk.props.vendorID == 0x13B5;
+        if (on) LOG("[vk] color targets a pass doesn't draw into left out of it\n");
+    }
+    return on;
+}
+static uint64_t det_key(void);  // (st's targets: below)
+static uint8_t det_predict(uint64_t key, uint8_t present, bool depth) {  // the color slots to leave out
+    if (!key || det_clear_next) return 0;
+    uint32_t slot = (uint32_t)(key >> 40) & (DET_TAB - 1);
+    if (det_tab[slot].key != key) return 0;
+    uint8_t out = (uint8_t)(present & ~det_tab[slot].written);
+    return out == present && !depth ? 0 : out;  // (never all of them without a depth target)
+}
+static void det_note(uint64_t key, uint8_t written) {
+    if (!key) return;
+    uint32_t slot = (uint32_t)(key >> 40) & (DET_TAB - 1);
+    if (det_tab[slot].key == key) det_tab[slot].written |= written;
+    else det_tab[slot].key = key, det_tab[slot].written = written;
+}
+
 // (diagnosis) LARECOMP_DRV_TIMES=1: time in the driver calls around submissions, per frame every 120 frames ("[drvt]")
 enum { DT_RESET_DS, DT_RESET_CMD, DT_BEGIN, DT_END, DT_SUBMIT, DT_COMPLETED, DT_ALLOC_SET, DT_AFTER, DT_N };
 static uint64_t drvt_ns[DT_N], drvt_n[DT_N];
@@ -1060,7 +1097,25 @@ VkCommandBuffer vk_upload_cmd(void) {
     return s->upload;
 }
 
+// Pass barriers held to fragment work (begin_pass, frag_barrier_on): GPU work outside passes (copies, dispatches - each
+// behind a full barrier) or a draw storing to memory may have written what a later pass's vertex stage reads (vertex
+// data, instances a compute shader culled): the next pass begins behind a full barrier then. From SavageWindRecomp's
+// Mali branch (8defa9b, MIT).
+static bool vtx_hazard = true;
+static bool pass_frag_only;      // the open pass began behind a fragment-only barrier
+static bool pass_vs_reads_next;  // the pass about to begin has a draw whose vertex stage reads textures or memory
+static uint64_t stat_frag_barriers, stat_frag_restarts;
+static bool frag_barrier_on(void) {  // (Mali only by default; LARECOMP_BARRIER_FRAG=0 / 1: off / on any GPU)
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_BARRIER_FRAG");
+        on = e ? atoi(e) != 0 : g_vk.props.vendorID == 0x13B5;
+        if (on) LOG("[vk] pass barriers hold back fragment work only, unless a vertex stage may read fresh GPU writes\n");
+    }
+    return on;
+}
 void vk_full_barrier(VkCommandBuffer cb) {
+    vtx_hazard = true;  // (begin_pass clears it after its own)
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
@@ -2075,6 +2130,14 @@ static struct {
     uint64_t copy_row_stride, copy_image_stride;
 } st;
 
+static uint64_t det_key(void) {  // (a pass's targets, views and first fragment shader: det_tab)
+    if (!det_on()) return 0;
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t *p = (const uint8_t *)&st.rt;
+    for (size_t i = 0; i < sizeof st.rt; i++) h = (h ^ p[i]) * 1099511628211ull;
+    return (h ^ g_cur_fs_hash) * 0x9E3779B97F4A7C15ull | 1;
+}
+
 uint32_t nvn_window_origin(void);
 uint32_t nvn_depth_mode(void);
 bool renderer_origin_lower_left(void) { return nvn_window_origin() == 0; }
@@ -2747,6 +2810,9 @@ static void vk_end_pass_at(int line) {
     if (g_vk.dyn_render && rp_on) rpCmdEndRendering(vk_cmd_rp());  // (a packet for the replay thread, replay.h)
     else vk_end_rendering(vk_cmd());
     in_pass = false;
+    det_note(pass_key, (uint8_t)(pass_written & 0xFF));  // (what it drew into or cleared: the next such pass, begin_pass)
+    pass_key = 0;
+    pass_detached = 0;
     {   extern TexBackend *g_dump_sampled;
         if (g_dump_sampled) { TexBackend *db = g_dump_sampled; g_dump_sampled = NULL; dump_layers_raw(db); }
     }
@@ -2832,7 +2898,26 @@ static bool no_chunks_now(void) {
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     pipeline_dirty = true;
-    vk_end_pass();
+    uint64_t new_key = det_key();
+    uint8_t present = 0;
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++) if (st.rt.color[i]) present |= (uint8_t)(1u << i);
+    uint8_t new_detached = det_predict(new_key, present, st.rt.depth != NULL);
+    det_clear_next = false;
+    vk_end_pass();  // (notes what the pass that ends wrote under its own key)
+    pass_key = new_key;
+    pass_detached = new_detached;
+    if (new_key) {
+        stat_det_passes++;
+        stat_det_slots += (uint64_t)__builtin_popcount(new_detached);
+        static uint64_t next;
+        uint64_t now = plat_now_ns();
+        if (now >= next) {
+            if (next) LOG("[vk] passes %llu, color targets left out %llu, wrong guesses %llu (10 s)\n",
+                          (unsigned long long)stat_det_passes, (unsigned long long)stat_det_slots, (unsigned long long)stat_det_miss);
+            next = now + 10000000000ull;
+            stat_det_passes = stat_det_slots = stat_det_miss = 0;
+        }
+    }
     if (st.rt.depth && st.rt.ncolor >= 3 && st.rt.color[0] && vk_texture_scale_group(st.rt.color[0]) == RS_SCENE) {
         // (LARECOMP_LOG_SCENE=1: the game's dynamic resolution - the first such pass of each frame, its target's size,
         // when it differs from the last frame's; TOTK draws several of them a frame, at other sizes too)
@@ -2896,7 +2981,29 @@ static void begin_pass(void) {
     static int no_barrier = -1;  // (LARECOMP_VK_NO_PASS_BARRIER=1: none - unsafe, a measurement of what it costs)
     if (no_barrier < 0) no_barrier = getenv("LARECOMP_VK_NO_PASS_BARRIER") != NULL;
     extern int vk_ab(const char *what);
-    if (!no_barrier && AB("nobarrier") != 1) rpFullBarrier(cb);  // passes, copies and dispatches see each other's results
+    bool frag_only = frag_barrier_on() && !vtx_hazard && !pass_vs_reads_next;
+    pass_frag_only = frag_only;
+    pass_vs_reads_next = false;
+    if (no_barrier || AB("nobarrier") == 1) {
+    } else if (frag_only) {  // (only the fragment work waits: the vertex work may overlap the passes before - a tiler's)
+        stat_frag_barriers++;
+        rpMemBarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                         VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                     VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    } else
+        rpFullBarrier(cb);  // passes, copies and dispatches see each other's results
+    vtx_hazard = false;
+    {
+        static uint64_t next;
+        uint64_t now = plat_now_ns();
+        if (frag_barrier_on() && now >= next) {
+            if (next) LOG("[vk] pass barriers: %llu held to fragment work, %llu passes restarted for a vertex stage's reads (10 s)\n",
+                          (unsigned long long)stat_frag_barriers, (unsigned long long)stat_frag_restarts);
+            next = now + 10000000000ull;
+            stat_frag_barriers = stat_frag_restarts = 0;
+        }
+    }
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
@@ -3015,6 +3122,12 @@ static void begin_pass(void) {
             ca[drop].imageView = VK_NULL_HANDLE;
             pass_color[drop] = VK_FORMAT_UNDEFINED;
             pass_dup_null |= 1u << drop;
+        }
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++)  // (the color targets this pass is known not to draw into: det_tab)
+        if (((pass_detached >> i) & 1) && ca[i].imageView) {
+            ca[i].imageView = VK_NULL_HANDLE;
+            pass_color[i] = VK_FORMAT_UNDEFINED;
+            pass_dup_null |= 1u << i;
         }
     pass_depth = pass_stencil = VK_FORMAT_UNDEFINED;
     bool has_d = false, has_s = false;
@@ -3388,7 +3501,13 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     if (in_pass && pass_dnone && depth) st.rt_dirty = true, stat_dnone_split++, dnone_note_split(st.rt.depth);  // (a depth clear: stored again)
     rec_clear(index);
     if (index >= 0 && index < st.rt.ncolor && (mask & 0xF) == 0xF && keep_screen_skip(st.rt.color[index])) return;  // (#76)
+    if (index >= 0 && index < 8 && det_on()) {  // (a color target left out of the open pass: it ends, the next has it)
+        if (in_pass && !st.rt_dirty && ((pass_detached >> index) & 1))
+            det_note(pass_key, (uint8_t)(1u << index)), st.rt_dirty = true, stat_det_miss++;
+        if (!in_pass || st.rt_dirty) det_clear_next = true;
+    }
     begin_pass();
+    if (index >= 0 && index < 8) det_note(pass_key, (uint8_t)(1u << index));
     for (int i = 0; i < nlclear; i++) {  // (done by the pass's load operations: begin_pass - each once)
         if (lclear[i].rec != g_cur_rec) continue;
         uint32_t asp = lclear[i].aspects;
@@ -4152,6 +4271,29 @@ static int rt_kind(uint32_t f) {
 // (BC: float), the fragment shader wrote floats to an integer target - zero blocks on Mali (BOTWRecompAndroid bdbe389)
 static uint32_t rt_format(int i) {
     return st.rt.has_cview[i] && (st.rt.cview[i].setmask & 4) ? st.rt.cview[i].format : st.rt.color[i]->format;
+}
+
+// The shader key's kind for an output into format f: rt_kind's, and on a Mali 5 / 6 (unsigned) and 7 / 8 (signed) for
+// 16 / 8-bit integer components, so the fragment shader writes the register's low bits (translate.c) as NVIDIA's
+// hardware stores them. Mali saturates a wider value instead: the BC4 blocks drawn through an RGBA16_UINT view (above)
+// with bits above 16 left over (SavageWindRecomp 9950b9e, BOTWRecomp 86ac04d). Other GPUs: as before (their shaders and
+// pipeline keys unchanged). LARECOMP_RT_NARROW=0 / 1: off / on any GPU.
+static int rt_kind_key(uint32_t f) {
+    int k = rt_kind(f);
+    if (!k) return 0;
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_RT_NARROW");
+        on = e ? atoi(e) != 0 : g_vk.props.vendorID == 0x13B5;
+    }
+    if (!on) return k;
+    switch (vk_format(f)) {
+    case VK_FORMAT_R16_UINT: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16B16_UINT: case VK_FORMAT_R16G16B16A16_UINT: return 5;
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8_UINT: case VK_FORMAT_R8G8B8A8_UINT: return 6;
+    case VK_FORMAT_R16_SINT: case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16_SINT: case VK_FORMAT_R16G16B16A16_SINT: return 7;
+    case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8_SINT: case VK_FORMAT_R8G8B8A8_SINT: return 8;
+    default: return k;
+    }
 }
 
 // ================================================================== graphics pipelines
@@ -7526,6 +7668,7 @@ static void vc_mark_gpu(uint64_t lo, uint64_t hi) {
 // the stage, its shader's code address, the submission and the storage buffers bound (where its stores may land)
 static void note_gmem_store(int stage) {
     atomic_store(&g_gmem_store_seq, vk_pending_seq());
+    vtx_hazard = true;  // (the next pass's vertex stage may read it: begin_pass's barrier)
     static long at = -2;
     if (at == -2) at = getenv("LARECOMP_LOG_STORES") ? atol(getenv("LARECOMP_LOG_STORES")) : -1;
     if (at < 0 || (long)renderer_present_count() != at || !st.program) return;
@@ -8329,6 +8472,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     rpCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     rpCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
     rpCmdDispatch(cb, gx, gy, gz);
+    vtx_hazard = true;  // (a later pass's vertex stage may read what it wrote: begin_pass)
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
 #ifdef __ANDROID__
     if (gc && (cp->si->uses_gmem_store || cs_writes_image(cp->si))) {  // (owes one barrier after it; at once if the buffer changed)
@@ -8531,7 +8675,7 @@ static void draw_(CmdRec *r, bool indexed) {
     vkey.flip_y = fkey.flip_y = nvn_window_origin() == 0;
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
-    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(rt_format(i));
+    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind_key(rt_format(i));
 #ifdef __ANDROID__
     if (maxwell_gmem_miss_log)  // (copy mode: early depth tests for the shaders that log misses - ShaderKey)
         fkey.no_ds_write = !st.rt.depth || !((st.ds[0] && st.ds[1]) || (st.ds[3] && ((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF)));
@@ -8853,6 +8997,8 @@ static void draw_(CmdRec *r, bool indexed) {
         if (fb) snapshots_mark_fb_dirty(st.rt.depth);
         else snapshots_invalidate(st.rt.depth);
     }
+    if (in_pass && !st.rt_dirty && (draw_w & pass_detached))  // (a color target left out of the pass: det_tab learns it)
+        det_note(pass_key, (uint8_t)(draw_w & 0xFF)), stat_det_miss++;
     if (in_pass && (draw_w & pass_dup_null)) st.rt_dirty = true, prof_dirty[2]++;  // (writes a slot begin_pass left unbound)
     snap_reason = "draw-colorwrite";
     for (int i = 0; i < st.rt.ncolor; i++) {
@@ -8877,6 +9023,12 @@ static void draw_(CmdRec *r, bool indexed) {
         bool writes_depth = st.ds[0] && st.ds[1];
         if (in_pass && pass_dnone && writes_depth) st.rt_dirty = true, stat_dnone_split++, dnone_note_split(st.rt.depth);
         pass_open_dw = writes_depth;
+        // (pass barriers held to fragment work: a vertex stage reading textures or memory another pass or dispatch may
+        // have just written begins its pass behind a full barrier - ending one held to fragment work)
+        if (frag_barrier_on() && (pr->vi->ntex > 0 || pr->vi->uses_gmem)) {
+            if (in_pass && pass_frag_only && !st.rt_dirty) st.rt_dirty = true, stat_frag_restarts++;
+            pass_vs_reads_next = true;
+        }
         begin_pass();
         pass_open_dw = -1;
     }
