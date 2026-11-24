@@ -5264,6 +5264,13 @@ static bool up_patch_frag(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *
 // counted, the hearts and the rupee too, and moved out g times farther: they jumped when the menu's page turned).
 // Off the middle too when it still covers the wide screen there (half its width past the offset by 960 units: a
 // menu's dark bands, 4590 wide, slide with its pages - clipped as narrower panes, they left lighter strips each side).
+// (#66) the map's layout spread out with its stretched terrain on the wide image (cbuf_info); LARECOMP_WIDE_MAP=0: off
+static bool wide_map_on(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("LARECOMP_WIDE_MAP") || atoi(getenv("LARECOMP_WIDE_MAP")) != 0;
+    return on;
+}
+
 static bool full_width_pane(const float *f) {
     float ax = fabsf(f[19]);
     return f[132] >= 1279.5f && fabsf(f[134] + f[132] * 0.5f) < 0.5f && (ax < 1.0f || f[132] * 0.5f - ax >= 960.0f);
@@ -5511,9 +5518,28 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 VkSpan c = vk_transient_copy(f, size, 256);
                 float *m = (float *)c.ptr;
                 if (!(widescreen_allowed() && g > 1.001f)) g = 1.0f;
+                // The map (#66, BOTWRecomp c9fb160): its terrain, a 2250x1080 pane about the middle drawn first, is
+                // stretched across the wide image as below, while its markers, names and frame stayed in the middle
+                // 16:9 part - they drifted off their places as the map moved sideways. With it drawn this frame or the
+                // one before, the layout spreads out with the terrain: each pane goes g times farther from the middle
+                // keeping its shape (past the 16:9 side, 960: moved by the margin it gained), a piece reaching past
+                // the sides (the frame's bands, -1125..1125) stretches whole, and text keeps its origin.
+                static uint64_t map_frame;
+                uint64_t pf = renderer_present_count();
+                if (size >= 0x230 && fabsf(f[132] - 2250.0f) < 0.5f && fabsf(f[133] - 1080.0f) < 0.5f &&
+                    fabsf(f[134] + 1125.0f) < 0.5f && fabsf(f[19]) < 1.0f)
+                    map_frame = pf;
+                bool map = g > 1.001f && map_frame && pf - map_frame <= 1 && wide_map_on();
+                bool full = size >= 0x230 && f[132] >= 1919.5f && fabsf(f[134] + f[132] * 0.5f) < 0.5f && fabsf(f[19]) < 1.0f;
                 for (int i = 0; i < 4; i++) m[i] /= g;
-                if (size >= 0x230 && f[132] >= 1919.5f && fabsf(f[134] + f[132] * 0.5f) < 0.5f && fabsf(f[19]) < 1.0f)
+                if (full)
                     for (int i = 16; i < 20; i++) m[i] *= g;
+                else if (map && size >= 0x230) {
+                    bool past = fabsf(f[19]) < 1.0f && (f[134] < -960.5f || f[134] + f[132] > 960.5f);
+                    if (past) for (int i = 16; i < 20; i++) m[i] *= g;
+                    else m[19] = fabsf(f[19]) <= 960.0f ? f[19] * g : f[19] + copysignf(960.0f * (g - 1), f[19]);
+                } else if (map)
+                    m[3] = f[3];  // (text: its origin where the spread layout puts it)
                 m[23] += dy;
                 return ubo_span(c, size);
             }
