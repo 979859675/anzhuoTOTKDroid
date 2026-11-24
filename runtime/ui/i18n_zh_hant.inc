@@ -728,3 +728,7 @@
  "不限（最高 120 fps）"},
 {"As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock stays right. Cutscenes stay at 30. The phone works harder and heats more.",
  "依裝置的繪製速度執行，最高到螢幕的最高更新率（最多 120 fps）。遊戲時鐘保持準確。過場動畫維持 30。手機負載更高，發熱更多。"},
+{"Stretched",
+ "拉伸"},
+{"Unlocked: on screens wider than 16:9 the view widens to fill them. Original 16:9: the game's own framing, with bars. Stretched: the 16:9 image stretched to fill the screen, for 4:3 and other narrower screens. Applies when the game starts again.",
+ "自由：在比 16:9 更寬的螢幕上，視野會擴展以填滿螢幕。原始 16:9：遊戲本身的畫面比例，帶黑邊。拉伸：將 16:9 畫面拉伸以填滿螢幕，適用於 4:3 等更窄的螢幕。下次啟動遊戲時生效。"},

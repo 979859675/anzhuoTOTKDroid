@@ -728,3 +728,7 @@
  "上限なし（最大 120 fps）"},
 {"As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock stays right. Cutscenes stay at 30. The phone works harder and heats more.",
  "端末が描画できる速さで、画面の最大リフレッシュレートまで（最大 120 fps）。ゲーム内の時間は正しく進みます。ムービーは 30 のままです。端末の負荷と発熱が増えます。"},
+{"Stretched",
+ "引き伸ばし"},
+{"Unlocked: on screens wider than 16:9 the view widens to fill them. Original 16:9: the game's own framing, with bars. Stretched: the 16:9 image stretched to fill the screen, for 4:3 and other narrower screens. Applies when the game starts again.",
+ "フリー：16:9より横長の画面では、視野が広がって画面を埋めます。オリジナル 16:9：ゲーム本来の画角で、帯が付きます。引き伸ばし：16:9の映像を画面いっぱいに引き伸ばします。4:3など横幅の狭い画面向けです。次にゲームを起動したときに反映されます。"},

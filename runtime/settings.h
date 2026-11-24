@@ -5,7 +5,7 @@ enum { OVERLAY_FPS = 1, OVERLAY_THROTTLE = 2, OVERLAY_GPU = 4, OVERLAY_CPU = 8, 
        OVERLAY_ALL = 63 };
 #include <stdbool.h>
 
-enum { ASPECT_UNLOCKED = 0, ASPECT_ORIGINAL = 1 };
+enum { ASPECT_UNLOCKED = 0, ASPECT_ORIGINAL = 1, ASPECT_STRETCH = 2 };
 enum { RES_MATCH = 0, /* 1..8 = 1x..8x */ RES_DYNAMIC = 9, RES_Q75 = 10, RES_Q25 = 11, RES_Q50 = 12 };
 // (11 was 67% of the display: larecomp.ini "67%" now loads as RES_Q75)
 enum { OUT_AUTO = -1 };  // (Settings.out_lines)
@@ -25,7 +25,8 @@ extern const char *const g_language_codes[N_LANGUAGES];  // what the game is tol
 extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto", "Japanese", ..., "Spanish")
 
 typedef struct {
-    int aspect;          // ASPECT_*: unlocked = fill the window (wider/taller views), original = 16:9 with bars
+    int aspect;          // ASPECT_*: unlocked = fill the window (wider/taller views), original = 16:9 with bars,
+                         // stretch = the 16:9 image stretched to the window (#59: 4:3 screens)
     bool fullscreen;
     int res_mode;        // RES_MATCH, 1..4 (N x the Switch's 1080p), RES_DYNAMIC, RES_Q75/50/25 (share of the display)
     int upscaler;        // UPSCALE_*: how a lower internal resolution reaches the window (MetalFX: macOS, FSR 1: Windows)

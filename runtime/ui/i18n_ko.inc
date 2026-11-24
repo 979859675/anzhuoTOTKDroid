@@ -728,3 +728,7 @@
  "제한 없음 (최대 120fps)"},
 {"As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock stays right. Cutscenes stay at 30. The phone works harder and heats more.",
  "기기가 그릴 수 있는 만큼 빠르게, 화면의 최고 주사율까지 (최대 120fps). 게임 시간은 정확하게 유지됩니다. 컷신은 30으로 유지됩니다. 휴대폰이 더 많이 일하고 더 뜨거워집니다."},
+{"Stretched",
+ "늘이기"},
+{"Unlocked: on screens wider than 16:9 the view widens to fill them. Original 16:9: the game's own framing, with bars. Stretched: the 16:9 image stretched to fill the screen, for 4:3 and other narrower screens. Applies when the game starts again.",
+ "자유: 16:9보다 넓은 화면에서는 시야가 넓어져 화면을 채웁니다. 원본 16:9: 게임 본래의 화면 구성이며, 여백 띠가 생깁니다. 늘이기: 16:9 화면을 늘여서 화면을 채웁니다. 4:3 등 더 좁은 화면용입니다. 게임을 다시 시작하면 적용됩니다."},

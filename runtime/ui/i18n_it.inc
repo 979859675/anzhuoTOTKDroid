@@ -728,3 +728,7 @@
  "Sbloccato (fino a 120 fps)"},
 {"As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock stays right. Cutscenes stay at 30. The phone works harder and heats more.",
  "Veloce quanto il dispositivo riesce a disegnare, fino alla frequenza più alta dello schermo (al massimo 120 fps). L'orologio del gioco resta corretto. Le scene animate restano a 30. Il telefono lavora di più e si scalda di più."},
+{"Stretched",
+ "Allungata"},
+{"Unlocked: on screens wider than 16:9 the view widens to fill them. Original 16:9: the game's own framing, with bars. Stretched: the 16:9 image stretched to fill the screen, for 4:3 and other narrower screens. Applies when the game starts again.",
+ "Libero: sugli schermi più larghi di 16:9 la visuale si allarga per riempirli. Originale 16:9: l'inquadratura del gioco, con bande. Allungata: l'immagine 16:9 allungata fino a riempire lo schermo, per il 4:3 e altri schermi più stretti. Si applica al prossimo avvio del gioco."},

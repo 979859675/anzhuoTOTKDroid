@@ -267,7 +267,8 @@ void settings_load(void) {
         char val[128] = "";
         if (sscanf(line, " %63[^= ] = %127[^\r\n]", key, val) < 1) continue; val[strcspn(val, "\r\n")] = 0;
 #endif
-        if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : ASPECT_UNLOCKED;
+        if (!strcmp(key, "aspect"))
+            g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : !strcmp(val, "stretch") ? ASPECT_STRETCH : ASPECT_UNLOCKED;
         else if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
@@ -391,7 +392,8 @@ void settings_save(void) {
     FILE *f = fopen(SETTINGS_FILE, "w");
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
     fprintf(f, "# TOTKDroid settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
-    fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original" : "unlocked");
+    fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original"
+                                    : g_settings.aspect == ASPECT_STRETCH ? "stretch" : "unlocked");
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "reverb = %d\n", g_settings.reverb);

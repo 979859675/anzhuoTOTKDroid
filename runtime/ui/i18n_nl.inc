@@ -728,3 +728,7 @@
  "Onbeperkt (tot 120 fps)"},
 {"As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock stays right. Cutscenes stay at 30. The phone works harder and heats more.",
  "Zo snel als je toestel tekent, tot de hoogste verversingssnelheid van het scherm (hoogstens 120 fps). De klok van het spel blijft kloppen. Tussenfilmpjes blijven op 30. De telefoon werkt harder en wordt warmer."},
+{"Stretched",
+ "Uitgerekt"},
+{"Unlocked: on screens wider than 16:9 the view widens to fill them. Original 16:9: the game's own framing, with bars. Stretched: the 16:9 image stretched to fill the screen, for 4:3 and other narrower screens. Applies when the game starts again.",
+ "Vrij: op schermen breder dan 16:9 wordt het beeld breder en vult het ze. Origineel 16:9: de eigen beelduitsnede van het spel, met balken. Uitgerekt: het 16:9-beeld uitgerekt tot het het scherm vult, voor 4:3 en andere smallere schermen. Geldt vanaf de volgende keer dat het spel start."},

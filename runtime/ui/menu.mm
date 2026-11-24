@@ -540,10 +540,11 @@ static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
     opt_begin("##video", scale);
     opt_section("Display");
-    const char *aspects[] = {"Unlocked", "Original 16:9"};
-    opt_choice("Aspect ratio", &g_settings.aspect, aspects, 2, ASPECT_UNLOCKED,
-               "Unlocked: the view will fill wider screens once the game's cameras are widened - not done yet for this "
-               "game, so it stays 16:9 with bars for now. Original 16:9: the game's own framing, with bars.");
+    const char *aspects[] = {"Unlocked", "Original 16:9", "Stretched"};
+    opt_choice("Aspect ratio", &g_settings.aspect, aspects, 3, ASPECT_UNLOCKED,
+               "Unlocked: on screens wider than 16:9 the view widens to fill them. Original 16:9: the game's own "
+               "framing, with bars. Stretched: the 16:9 image stretched to fill the screen, for 4:3 and other narrower "
+               "screens. Applies when the game starts again.");
 #ifndef __ANDROID__  // (Android: always the whole screen)
     bool fs = g_settings.fullscreen;
     if (opt_toggle("Fullscreen", &fs, false, "Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.")) {
