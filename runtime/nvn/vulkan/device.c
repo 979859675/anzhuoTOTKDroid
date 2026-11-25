@@ -1482,6 +1482,8 @@ uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
 
 static uint64_t frames, total_frames, g_frame_counter;
+// The game's own frames presented (the overlay's raw rate, runtime/ui/perf_overlay.mm)
+uint64_t vk_game_frames(void) { return total_frames; }
 #ifdef __ANDROID__
 // LARECOMP_VK_ASYNC (vulkan/async.c): the game's threads count the presents they queued, the render thread the ones
 // it ran - each side's "this frame" stays its own

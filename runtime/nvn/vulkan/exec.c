@@ -53,6 +53,7 @@ static uint64_t stat_dchained;  // (dispatches with no barrier before them: dcha
 static uint64_t stat_feedback_reads;  // (attachments sampled as they are: only read, resolve_feedback)
 static uint64_t stat_inplace_breaks;  // (passes ended so a draw reads a target the pass wrote: resolve_feedback)
 static uint64_t stat_upload_bytes;
+static uint64_t stat_upload_total;  // (the uploads since the start: vk_upload_total_bytes, the [device] log)
 static uint64_t stat_cb_bytes[2], stat_cb_n[2], stat_cb_copied, stat_cbwin;  // (LARECOMP_LOG_CBUF_BYTES: game constant buffers bound,
                                                                  // fixed [0] / dynamically indexed [1], and bytes copied)
 static uint64_t stat_pipe_binds, stat_set_binds;  // (graphics draws: pipelines / descriptor sets bound)
@@ -1097,6 +1098,8 @@ static void dl_note(const char *fmt, ...) {
     va_end(ap);
 }
 void vk_dl_note_upload(void *img, uint32_t w, uint32_t h, uint32_t lv) { dl_note("  upload %p %ux%u lv%u", img, w, h, lv); }
+// The bytes uploaded to the GPU since the start, as of the last [vk] report (runtime/ui/perf_overlay.mm)
+uint64_t vk_upload_total_bytes(void) { return stat_upload_total + stat_upload_bytes; }
 void vk_devlost_dump(void) {
     if (!dl_on) return;
     LOG("[vk] last GPU operations before the device loss (oldest first):\n");
@@ -2108,6 +2111,7 @@ const char *renderer_stats(void) {
              (unsigned long long)stat_dispatches, (unsigned long long)stat_dchained, (unsigned long long)stat_flushes, (double)stat_wait_ns / 1e6,
              atomic_exchange(&stat_compiles, 0), (double)stat_build_wait_ns / 1e6, (unsigned long long)stat_feedback_copies, (unsigned long long)stat_feedback_reads, (unsigned long long)stat_inplace_breaks, (double)stat_upload_bytes / 1048576.0,
              (unsigned long long)stat_pipe_binds, (unsigned long long)stat_set_binds);
+    stat_upload_total += stat_upload_bytes;
     stat_feedback_copies = stat_feedback_reads = stat_inplace_breaks = stat_upload_bytes = stat_build_wait_ns = stat_pipe_binds = stat_set_binds = 0;
     up_log();
     {   // (BOTWRecomp b4e80e7) programs built from the .smeta cache (no translation, no shaderc) and those translated, this interval / since the start

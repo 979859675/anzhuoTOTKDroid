@@ -10,11 +10,12 @@
 // item switched off reads "--", as there. The readings: runtime/platform/android.c plat_device_stats (the battery and
 // thermal state from the activity, reportDeviceStats), the CPU caps from cpufreq (each cluster's scaling_max_freq),
 // frame generation from vulkan/framegen.c. (TOTKDroid: BOTWRecompAndroid's d304e64; a generated frame redraws the last
-// overlay - ui/menu.mm menu_render_again - so this counts the game's frames, and the shown ones are the window images
-// presented: vulkan/device.c vk_presented_images.)
+// overlay - ui/menu.mm menu_render_again - so the raw rate counts the game's own frames (vulkan/device.c vk_game_frames),
+// and the shown ones are the window images presented: vulkan/device.c vk_presented_images.)
 #ifdef __ANDROID__
 #include <SDL3/SDL.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
@@ -22,6 +23,7 @@
 #include <string.h>
 
 #include "imgui.h"
+#include "i18n.h"  // (the overlay's text in Chinese: tr_zh)
 
 extern "C" {
 #include "platform.h"
@@ -30,7 +32,9 @@ const char *vk_driver_rejected(void);  // vulkan/android_driver.c: the chosen dr
 const char *vk_gpu_desc(void);  // vulkan/device.c: "<device> - <driver>"
 double vk_frame_gpu_ms(void);   // vulkan/exec.c
 uint64_t vk_presented_images(void);    // vulkan/device.c: the window images shown, the game's and the generated ones
+uint64_t vk_game_frames(void);         // vulkan/device.c: the game's own frames presented (not the generated ones)
 int vk_fg_state(void);                  // vulkan/framegen.c: 1 generating, 2 on and waiting, 0 off, -1 unavailable
+uint64_t vk_upload_total_bytes(void);  // vulkan/exec.c: the bytes uploaded since the start (the [device] line)
 }
 
 extern ImFont *g_overlay_font;  // ui/menu.mm: Android's Roboto (Swap2-Native's draws with Android's sans-serif)
@@ -143,28 +147,44 @@ static void chart(int metric, float y, uint32_t color, const char *label) {
 
 void perf_overlay_draw(ImVec2 display, float scale) {
     // the readings, twice a second (Swap2's samples)
-    static uint64_t next_ns, t0, shown0, last_sample;
-    static int frames;
+    static uint64_t next_ns, t0, shown0, game0, last_sample;
     static float shown = NAN, game_fps = NAN, gpu_ms = NAN;
     static int fg = 0;
     static PlatDeviceStats ds;
     uint64_t now = SDL_GetTicksNS();
-    int items = g_settings.overlay_items;
-    frames++;
+    // the frame rate is always shown: its readout is what the overlay is for (the other items are the user's choice)
+    int items = g_settings.overlay_items | OVERLAY_FPS;
     if (now >= next_ns) {
-        uint64_t g = vk_presented_images();
-        if (t0) {
+        uint64_t g = vk_presented_images(), gf = vk_game_frames();
+        if (t0) {  // the raw rate: the game's frames; shown: every window image (generated ones too)
             double dt = (now - t0) / 1e9;
-            game_fps = (float)(frames / dt);
+            game_fps = (float)((gf - game0) / dt);
             shown = (float)((g - shown0) / dt);
         }
-        shown0 = g, frames = 0, t0 = now;
+        shown0 = g, game0 = gf, t0 = now;
         next_ns = now + 500000000ull;
         double gm = vk_frame_gpu_ms();
         gpu_ms = gm > 0 ? (float)gm : NAN;
         plat_device_stats(&ds);
         read_caps();
         fg = vk_fg_state();
+        {   // once a minute: the phone's state for the log (the [vk] lines have the upload and texture counts every 2 s)
+            static uint64_t next_dev;
+            if (now >= next_dev) {
+                next_dev = now + 60000000000ull;
+                char gf[16], sf[16];  // ("--" before the first frame: no NaN in the log)
+                fprintf(stderr, "[device] RAM %u MB (available %u MB), SoC %.1f C, battery %.1f C, thermal %d, headroom %.2f, "
+                        "game %s fps, shown %s fps, frame generation %d, uploaded in all: game %llu MB\n",
+                        ds.rss_mb, ds.avail_mb, ds.soc_temp_c, ds.batt_temp_c, ds.thermal, ds.headroom,
+                        number(gf, game_fps), number(sf, shown), fg,
+                        (unsigned long long)(vk_upload_total_bytes() >> 20));
+            }
+        }
+        static bool said;
+        if (!said) {  // (once: the overlay's items and frame generation's state, for the log)
+            said = true;
+            fprintf(stderr, "[overlay] items %d style %s fg %d\n", items, g_settings.overlay_style == 0 ? "detailed" : "compact", fg);
+        }
         bool gen = fg >= 1;  // (1 generating, 2 waiting, 3 no refresh left)
         float fps = gen ? game_fps : shown;
         if (last_sample && now - last_sample > 2000000000ull) hcount = hnext = 0;  // (hidden a while: a new history)
@@ -218,8 +238,8 @@ void perf_overlay_draw(ImVec2 display, float scale) {
             turnip = sep && strstr(sep, "Turnip");
             char low[96];
             for (int i = 0; i < (int)sizeof low; i++) low[i] = (char)tolower((unsigned char)gpu[i]);
-            brand = strstr(low, "adreno") ? "QUALCOMM" : strstr(low, "mali") || strstr(low, "immortalis") ? "ARM"
-                    : strstr(low, "nvidia") ? "NVIDIA" : strstr(low, "xclipse") ? "SAMSUNG" : "GPU";
+            brand = strstr(low, "adreno") ? "高通" : strstr(low, "mali") || strstr(low, "immortalis") ? "ARM"
+                    : strstr(low, "nvidia") ? "英伟达" : strstr(low, "xclipse") ? "三星" : "GPU";
         }
     }
 
@@ -227,11 +247,19 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     float size = (g_settings.overlay_scale >= 40 && g_settings.overlay_scale <= 150 ? g_settings.overlay_scale : 75) / 100.0f;
     float alpha = (g_settings.overlay_opacity >= 20 && g_settings.overlay_opacity <= 100 ? g_settings.overlay_opacity : 100) / 100.0f;
     char a[16], b[16], s[160], f[48];
-    if (isfinite(presented) && presented > fps + 1) snprintf(f, sizeof f, "%s > %s FPS", number(a, fps), number(b, presented));
+    // with frame generation on: the game's frames > the shown ones (the generated frames included), both always
+    // (the two rates are what it is for); otherwise the one rate
+    if (fg == 2 && isfinite(fps)) snprintf(f, sizeof f, "%s > ... FPS", number(a, fps));  // (on, no generated frame yet)
+    else if (gen && isfinite(presented)) snprintf(f, sizeof f, "%s > %s FPS", number(a, fps), number(b, presented));
+    else if (isfinite(presented) && presented > fps + 1) snprintf(f, sizeof f, "%s > %s FPS", number(a, fps), number(b, presented));
     else snprintf(f, sizeof f, "%s FPS", number(a, fps));
-    char ram[24];
+    // the app's memory in use, the phone's total and what is still free (MemAvailable): all three, in both styles
+    char ram[24], mem[80];
     if (rss < 0) strcpy(ram, "--");
     else snprintf(ram, sizeof ram, "%ld MB", rss);
+    if (rss < 0) strcpy(mem, "--");
+    else if (total <= 0) snprintf(mem, sizeof mem, tr_zh("App uses %ld MB, %ld MB free"), rss, avail);
+    else snprintf(mem, sizeof mem, tr_zh("App uses %ld of %ld MB, %ld MB free"), rss, total, avail);
 
     font = g_overlay_font ? g_overlay_font : ImGui::GetFont();
     // compact: Swap2's items, each as wide as its widest reading (so the panel keeps its size) and a gap apart
@@ -239,12 +267,13 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     char cs[5][48];
     float cw[5], csz[5] = {15, 13, 13, 13, 13};
     static const uint32_t ccol[5] = {0xFF6DE6EF, 0xFFFFFFFF, 0xFFE3EAF5, 0xFFFFD477, 0xFFFFD477};
-    const char *widest[5] = {gen ? "88.8 > 88.8 FPS" : "88.8 FPS", "888.8 ms", "RAM 8888 MB", "SoC 88.8\xc2\xb0", "BAT 88.8\xc2\xb0"};
+    const char *widest[5] = {gen ? "88.8 > 88.8 FPS" : "88.8 FPS", "888.8 ms", "应用占用 8888 / 总 16384 MB · 剩余 8888 MB",
+                             "芯片 88.8\xc2\xb0", "电池 88.8\xc2\xb0"};
     snprintf(cs[0], sizeof cs[0], "%s", f);
     snprintf(cs[1], sizeof cs[1], "%s ms", number(a, ms));
-    snprintf(cs[2], sizeof cs[2], "RAM %s", ram);
-    snprintf(cs[3], sizeof cs[3], "SoC %s\xc2\xb0", number(a, soc));
-    snprintf(cs[4], sizeof cs[4], "BAT %s\xc2\xb0", number(a, bat));
+    snprintf(cs[2], sizeof cs[2], "%s", mem);
+    snprintf(cs[3], sizeof cs[3], tr_zh("SoC %s\xc2\xb0"), number(a, soc));
+    snprintf(cs[4], sizeof cs[4], tr_zh("BAT %s\xc2\xb0"), number(a, bat));
     float cx = 12;
     for (int i = 0; i < 5; i++) {
         cw[i] = fmaxf(text_w(cs[i], csz[i]), text_w(widest[i], csz[i]));
@@ -280,7 +309,7 @@ void perf_overlay_draw(ImVec2 display, float scale) {
             rect(178, 9, 260, 29, 5, 0xFF203A50);
             text(brand, 184, 23, 10, 0xFF6DE6EF);
         }
-        text("TOTK / MONITOR", 12, 23, 10, 0xFF92A5BC);
+        text(tr_zh("TOTK / MONITOR"), 12, 23, 10, 0xFF92A5BC);
         char title[96];
         snprintf(title, sizeof title, "%s", gpu[0] ? gpu : "GPU");
         for (int n = (int)strlen(title); n > 1 && text_w(title, 12) > 245;) title[--n] = 0;
@@ -288,27 +317,27 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         text(f, 12, 72, 19, 0xFF6DE6EF);
         snprintf(s, sizeof s, "%s ms", number(a, ms));
         text(s, 175, 72, 15, 0xFFFFFFFF);
-        chart(0, 82, 0xFF50DBEB, "FPS");
-        chart(1, 123, 0xFFFFCE78, "ms");
-        chart(2, 164, 0xFFA699FF, "RAM MB");
-        snprintf(s, sizeof s, "GPU %s ms  |  RAM %s", number(a, gms), ram);
+        chart(0, 82, 0xFF50DBEB, tr_zh("FPS"));
+        chart(1, 123, 0xFFFFCE78, tr_zh("ms"));
+        chart(2, 164, 0xFFA699FF, tr_zh("RAM MB"));
+        snprintf(s, sizeof s, tr_zh("GPU %s ms  |  App RAM %s"), number(a, gms), ram);
         text(s, 12, 212, 11, 0xFFE3EAF5);
-        if (turnip) snprintf(s, sizeof s, "CPU cap %s  |  %s", cpu, drvname[0] ? drvname : "Turnip (Mesa)");
-        else snprintf(s, sizeof s, "CPU cap %s", cpu);
+        if (turnip) snprintf(s, sizeof s, tr_zh("CPU cap %s  |  %s"), cpu, drvname[0] ? drvname : "Turnip (Mesa)");
+        else snprintf(s, sizeof s, tr_zh("CPU cap %s"), cpu);
         text(s, 12, 229, 10, turnip ? 0xFFFF9F43 : 0xFFE3EAF5);
         char lv[8];
         if (level < 0) strcpy(lv, "--");
         else snprintf(lv, sizeof lv, "%d%%", level);
-        snprintf(s, sizeof s, "SoC %s\xc2\xb0  BAT %s\xc2\xb0  %s", number(a, soc), number(b, bat), lv);
+        snprintf(s, sizeof s, tr_zh("SoC %s\xc2\xb0  BAT %s\xc2\xb0  %s"), number(a, soc), number(b, bat), lv);
         text(s, 12, 246, 11, 0xFFFFD477);
-        char fr[32], th[8];
-        if (total <= 0) strcpy(fr, "--");
-        else snprintf(fr, sizeof fr, "%.1f / %.1f GB", avail / 1024.0f, total / 1024.0f);
-        if (thermal < 0) strcpy(th, "--");
-        else snprintf(th, sizeof th, "%d", thermal);
-        snprintf(s, sizeof s, "Free RAM %s  T:%s", fr, th);
+        char fr[64], th[24];  // the phone's total and what is free (MemAvailable), then the thermal state
+        if (total <= 0) snprintf(fr, sizeof fr, tr_zh("Phone total -- \xc2\xb7 free %.1f GB"), avail / 1024.0f);
+        else snprintf(fr, sizeof fr, tr_zh("Phone total %.1f GB \xc2\xb7 free %.1f GB"), total / 1024.0f, avail / 1024.0f);
+        if (thermal < 0) snprintf(th, sizeof th, "%s", tr_zh("Heat --"));
+        else snprintf(th, sizeof th, tr_zh("Heat %d"), thermal);
+        snprintf(s, sizeof s, "%s  %s", fr, th);
         text(s, 12, 263, 10, 0xFFE3EAF5);
-        text("500 ms samples \xc2\xb7 48 s history", 12, 279, 9, 0xFF92A5BC);
+        text(tr_zh("500 ms samples \xc2\xb7 48 s history"), 12, 279, 9, 0xFF92A5BC);
     }
     ImGui::Dummy(ImVec2(W * u, H * u));
     ImGui::End();

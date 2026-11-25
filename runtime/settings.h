@@ -88,6 +88,7 @@ typedef struct {
     // touch_scheme 1 (0: the classic one everywhere), its controls' places of their own
 #define TOUCH_NCTL2 22
     int touch_scheme;
+    char cheats_on[1024];  // data cheats switched on (runtime/cheats.c: their keys, separated by '|')
     float touch_pos2[TOUCH_NCTL2][2];
     float touch_size[TOUCH_NCTL], touch_size2[TOUCH_NCTL2];  // each control's own size (times touch_scale; 0: 1)
     float touch_aim_sens;  // the icon layout's bow / throw drag: how fast it turns the aim (1: the default)
