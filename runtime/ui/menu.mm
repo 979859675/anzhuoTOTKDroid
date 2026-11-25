@@ -70,7 +70,6 @@ extern "C" const char *vk_fg_status(void);      // nvn/vulkan/framegen.c
 extern "C" bool vk_fg_built(void);
 extern "C" bool vk_fg_lsfg_dll_present(void);  // nvn/vulkan/framegen.c
 extern "C" void touch_controls_draw(ImVec2 display, ImFont *font);
-extern "C" bool plat_guest_file_active(void);  // platform/android.c (Memory saving, the Video tab)
 #endif
 static void set_open(bool open);
 extern "C" void menu_test_open(void) {
@@ -855,17 +854,6 @@ static void tab_display(void) {
         if (want != vk_low_ram() && !getenv("LARECOMP_LOW_RAM") &&
             opt_button("Restart to apply RAM saving", "Closes TOTKDroid and opens it again with the new setting. "
                                                       "Progress since the game's last save is lost."))
-            launcher_restart_app();
-    }
-    {   // Memory saving (platform/android.c plat_guest_file): read as the app starts
-        void launcher_restart_app(void);  // (ui/launcher.mm)
-        opt_toggle("Memory saving", &g_settings.mem_file, false,
-                   "Keeps the game's memory in a file on the phone's storage instead of in RAM, so Android can take back "
-                   "the pages it does not need without compressing them into RAM. Needs free storage for the memory the "
-                   "game uses. Applies when TOTKDroid restarts.");
-        if (g_settings.mem_file != plat_guest_file_active() &&
-            opt_button("Restart to apply memory saving", "Closes TOTKDroid and opens it again with the new setting. "
-                                                         "Progress since the game's last save is lost."))
             launcher_restart_app();
     }
 #endif

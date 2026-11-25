@@ -1591,9 +1591,16 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (tex_discard() && tracked && !b->dynamic && !linear && b->rs_group == RS_NONE && !b->gpu_owned && !b->scalable &&
         b->tp <= 0 && total >= (64u << 10)) {
         uint64_t lo = (t->addr + 0xFFF) & ~0xFFFull, hi = (t->addr + total) & ~0xFFFull;
-        bool zero = tex_discard_mode() == 2;  // (LARECOMP_TEX_DISCARD=2: the pages read as zeros after)
-        extern bool plat_discard_pages(uint64_t addr, uint64_t size, bool zero);  // (platform/android.c)
-        if (hi > lo && plat_discard_pages(lo, hi - lo, zero)) {
+        bool zero = tex_discard_mode() == 2;
+        static int pageout = 1;  // (MADV_PAGEOUT refused once - EINVAL, an older kernel: MADV_COLD from then on)
+        int adv = zero ? MADV_DONTNEED : pageout ? MADV_PAGEOUT : MADV_COLD;
+        int r = hi > lo ? madvise((void *)(uintptr_t)lo, hi - lo, adv) : -1;
+        if (r && !zero && pageout && hi > lo && errno == EINVAL) {
+            pageout = 0;
+            LOG("[vk] textures: MADV_PAGEOUT not supported, MADV_COLD instead\n");
+            r = madvise((void *)(uintptr_t)lo, hi - lo, MADV_COLD);
+        }
+        if (!r) {
             if (!b->discarded) tex_discarded_bytes += hi - lo;
             b->discarded = true;
             if (zero) {
