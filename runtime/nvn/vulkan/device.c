@@ -2127,13 +2127,6 @@ void ui_window_init(void) {
             char buf[sizeof g_settings.driver_env], *save = NULL;
             snprintf(buf, sizeof buf, "%s", g_settings.driver_env);
             snprintf(g_driver_env_at_start, sizeof g_driver_env_at_start, "%s", g_settings.driver_env);
-            // (a comma before another NAME= also separates: TOTKDroid's own notes said "A=1,B=3", which set A to "1,B=3"
-            // - #88; a comma inside a value, as TU_DEBUG's list, stays)
-            for (char *c = buf; (c = strchr(c, ',')); c++) {
-                char *n = c + 1;
-                while (*n == '_' || (*n >= 'A' && *n <= 'Z') || (*n >= '0' && *n <= '9')) n++;
-                if (n > c + 1 && *n == '=' && !(c[1] >= '0' && c[1] <= '9')) *c = ' ';
-            }
             for (char *p = strtok_r(buf, " \t;", &save); p; p = strtok_r(NULL, " \t;", &save)) {
                 char *eq = strchr(p, '=');
                 if (!eq || eq == p) continue;

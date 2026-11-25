@@ -213,13 +213,8 @@ static void *watch_main(void *arg) {
         uint64_t now = plat_now_ns(), frames = vk_wd_frames_done();
         // (an in-place reboot - Restart, back to the start screen - stops the frames on purpose until the new boot draws:
         // two 0.4.6 reports, #488 and #489, came from that, 5 s after "[reboot] requested")
-        // (the request is cleared once the game is torn down - ~0.2 s, between two looks here: a back-to-the-start-screen
-        // reported a stall 5 s later, the POCO X7 Pro's 0.4.0 log - so a request since the last look counts too)
-        static unsigned last_reboots;
-        unsigned reboots = rt_reboot_count();
-        if (rt_reboot_requested() || g_rt_unwind || reboots != last_reboots) rebooting = true;
+        if (rt_reboot_requested() || g_rt_unwind) rebooting = true;
         else if (rebooting && frames != last_frames) rebooting = false;
-        last_reboots = reboots;
         // (nothing to judge before the first frame: the start - shader compiles, the load - is the game's own time;
         // and in the background the game stops at its present on purpose, nvn_background)
         if (!frames || frames != last_frames || nvn_background_paused() || rebooting) {

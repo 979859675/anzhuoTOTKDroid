@@ -22,10 +22,6 @@
 
 #include "shader.h"
 
-// fragment output kinds (ShaderKey rt_kind): 1 / 2 signed / unsigned integer; 5 / 6 unsigned 16 / 8-bit, 7 / 8 signed
-#define RT_SINT(k) ((k) == 1 || (k) == 7 || (k) == 8)
-#define RT_UINT(k) ((k) == 2 || (k) == 5 || (k) == 6)
-
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
 bool maxwell_gmem_map_all;
 bool maxwell_gmem_bda;
@@ -3446,7 +3442,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         for (int rt = 0; rt < 8; rt++) {
             if (!((c->omap_target >> (rt * 4)) & 0xF)) continue;
             int kind = key ? key->rt_kind[rt] : 0;
-            sp(&s, "layout(location = %d) out %s c%d;\n", rt, RT_SINT(kind) ? "ivec4" : RT_UINT(kind) ? "uvec4" : "vec4", rt);
+            sp(&s, "layout(location = %d) out %s c%d;\n", rt, kind == 1 ? "ivec4" : kind == 2 ? "uvec4" : "vec4", rt);
         }
         // a written depth is compared EQUAL against other shaders' positions too - TOTK's light classifier writes a
         // material id as depth, its lighting passes draw quads at that z: precise, as gl_Position, so the driver keeps
@@ -3510,7 +3506,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             uint32_t m = (c->omap_target >> (rt * 4)) & 0xF;
             if (!m) continue;
             int kind = key ? key->rt_kind[rt] : 0;
-            const char *cv = RT_SINT(kind) ? "int" : RT_UINT(kind) ? "uint" : "";
+            const char *cv = kind == 1 ? "int" : kind == 2 ? "uint" : "";
             for (int comp = 0; comp < 4; comp++) {
                 if (!(m & (1u << comp))) continue;
                 if (dbg) {
@@ -3518,12 +3514,6 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                     else sp(&s, "  c%d[%d] = %s(dbgv);\n", rt, comp, cv);
                 } else if (r < 256 && c->reg_used[r]) {
                     if (kind == 0) sp(&s, "  c%d[%d] = as_f(r%d);\n", rt, comp, r);
-                    // (narrow integer targets: the register's low bits, as NVIDIA's hardware stores them; Mali
-                    // saturates wider values - the BC4 blocks drawn through RGBA16_UINT, SavageWindRecomp 9950b9e)
-                    else if (kind == 5) sp(&s, "  c%d[%d] = r%d & 0xFFFFu;\n", rt, comp, r);
-                    else if (kind == 6) sp(&s, "  c%d[%d] = r%d & 0xFFu;\n", rt, comp, r);
-                    else if (kind == 7) sp(&s, "  c%d[%d] = int(r%d << 16) >> 16;\n", rt, comp, r);
-                    else if (kind == 8) sp(&s, "  c%d[%d] = int(r%d << 24) >> 24;\n", rt, comp, r);
                     else sp(&s, "  c%d[%d] = %s(r%d);\n", rt, comp, cv, r);
                 } else {
                     sp(&s, "  c%d[%d] = 0;\n", rt, comp);
@@ -3719,7 +3709,7 @@ ShaderInfo *maxwell_translate_bounded(const uint8_t *blob, size_t max_size, size
         for (int rt = 0; rt < 8; rt++) {
             if (!((c->omap_target >> (rt * 4)) & 0xF)) continue;
             int kind = key ? key->rt_kind[rt] : 0;
-            sp(&s, "  %s4 c%d [[color(%d)]];\n", RT_SINT(kind) ? "int" : RT_UINT(kind) ? "uint" : "float", rt, rt);
+            sp(&s, "  %s4 c%d [[color(%d)]];\n", kind == 1 ? "int" : kind == 2 ? "uint" : "float", rt, rt);
         }
         if (c->omap_depth) { sp(&s, "  float depth [[depth(any)]];\n"); info->writes_depth = true; }
         sp(&s, "};\n");

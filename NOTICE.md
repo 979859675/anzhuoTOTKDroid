@@ -28,9 +28,3 @@
   follows its `games/totk/runtime/swkbd_host.c` (Copyright (c) 2026 MacNativeGames contributors, MIT). The optional
   rendering reductions in `runtime/native.c` (shadow map size, the game's FXAA, the render far plane) use the sites
   its `games/totk/runtime/game_patches_v143.c` found (same copyright, MIT).
-- **From [Savage Wind Recomp](https://github.com/Revivedx/SavageWindRecomp)** (MIT, Copyright (c) 2026 Revivedx and the
-  Savage Wind Recomp contributors; Copyright (c) 2026 Peiikai), its `mali-fixes` branch (StonedEdge): the low bits of
-  16 / 8-bit integer colour targets on Mali (`rt_kind_key` in `runtime/nvn/vulkan/exec.c`, the narrow outputs in
-  `runtime/nvn/maxwell/translate.c`; its 9950b9e, through BOTWRecompAndroid 86ac04d), the pass barriers held to
-  fragment work (`frag_barrier_on`, its 8defa9b), the colour targets a pass doesn't draw into left out of it
-  (`det_tab`, its 087f2c5), and the GPU's load and clock through devfreq in `runtime/ui/perf_overlay.mm` (its 9dadb24).
