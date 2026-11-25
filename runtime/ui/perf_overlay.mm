@@ -15,6 +15,7 @@
 #ifdef __ANDROID__
 #include <SDL3/SDL.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
@@ -27,6 +28,7 @@
 extern "C" {
 #include "platform.h"
 #include "../settings.h"
+const char *vk_driver_rejected(void);  // vulkan/android_driver.c: the chosen driver package the system's stood in for ("" none)
 const char *vk_gpu_desc(void);  // vulkan/device.c: "<device> - <driver>"
 double vk_frame_gpu_ms(void);   // vulkan/exec.c
 uint64_t vk_presented_images(void);    // vulkan/device.c: the window images shown, the game's and the generated ones
@@ -144,11 +146,56 @@ static void chart(int metric, float y, uint32_t color, const char *label) {
     text(label, 17, y + 11, 8, 0xFFAFC0D6);
 }
 
+// The GPU's load (%) and clock (MHz) from sysfs, -1 where unreadable: Adreno through KGSL; Mali (and others) through
+// devfreq - a device named for the GPU, its cur_freq and, where the kernel has it, load ("busy@freq") - or the
+// /sys/kernel/gpu files of Exynos / MediaTek kernels. From SavageWindRecomp's Mali branch (9dadb24, MIT: devfreq).
+static void gpu_load_clock(int *pct, int *mhz) {
+    static int kind = -1;  // 0 none, 1 KGSL, 2 devfreq, 3 /sys/kernel/gpu
+    static char dir[160];
+    if (kind < 0) {
+        kind = 0;
+        if (read_long("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage") >= 0) kind = 1;
+        else if (DIR *d = opendir("/sys/class/devfreq")) {
+            while (struct dirent *e = readdir(d)) {
+                char low[96];
+                int n = 0;
+                for (; e->d_name[n] && n < 95; n++) low[n] = (char)tolower((unsigned char)e->d_name[n]);
+                low[n] = 0;
+                if (!strstr(low, "mali") && !strstr(low, "gpu")) continue;
+                snprintf(dir, sizeof dir, "/sys/class/devfreq/%s", e->d_name);
+                char p[200];
+                snprintf(p, sizeof p, "%s/cur_freq", dir);
+                if (read_long(p) > 0) { kind = 2; break; }
+            }
+            closedir(d);
+        }
+        if (!kind && read_long("/sys/kernel/gpu/gpu_clock") > 0) kind = 3;
+    }
+    *pct = *mhz = -1;
+    char p[200];
+    if (kind == 1) {
+        *pct = (int)read_long("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage");
+        long hz = read_long("/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq");
+        if (hz > 0) *mhz = (int)(hz / 1000000);
+    } else if (kind == 2) {
+        snprintf(p, sizeof p, "%s/cur_freq", dir);
+        long hz = read_long(p);
+        if (hz > 0) *mhz = (int)(hz >= 1000000 ? hz / 1000000 : hz / 1000);  // (Hz, or kHz on some kernels)
+        snprintf(p, sizeof p, "%s/load", dir);
+        *pct = (int)read_long(p);
+    } else if (kind == 3) {
+        *pct = (int)read_long("/sys/kernel/gpu/gpu_busy");
+        long c = read_long("/sys/kernel/gpu/gpu_clock");
+        if (c > 0) *mhz = (int)(c >= 1000000 ? c / 1000 : c);  // (kHz, or MHz)
+    }
+    if (*pct > 100) *pct = -1;
+}
+
 void perf_overlay_draw(ImVec2 display, float scale) {
     // the readings, twice a second (Swap2's samples)
     static uint64_t next_ns, t0, shown0, game0, last_sample;
     static float shown = NAN, game_fps = NAN, gpu_ms = NAN;
-    static int fg = 0;
+    static int fg = 0, gpu_pct = -1, gpu_mhz = -1;
     static PlatDeviceStats ds;
     uint64_t now = SDL_GetTicksNS();
     // the frame rate is always shown: its readout is what the overlay is for (the other items are the user's choice)
@@ -164,6 +211,7 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         next_ns = now + 500000000ull;
         double gm = vk_frame_gpu_ms();
         gpu_ms = gm > 0 ? (float)gm : NAN;
+        if (items & OVERLAY_GPU) gpu_load_clock(&gpu_pct, &gpu_mhz);
         plat_device_stats(&ds);
         read_caps();
         fg = vk_fg_state();
@@ -223,7 +271,13 @@ void perf_overlay_draw(ImVec2 display, float scale) {
     static char gpu[96];
     static const char *brand = "GPU";
     static bool turnip;
+    static char drvname[48];  // the custom driver package (its folder: the zip's name), shown instead of "Turnip (Mesa)"
     if (!gpu[0]) {
+        const char *p = getenv("LARECOMP_VK_DRIVER"), *e = p ? strrchr(p, '/') : NULL, *s0 = e;
+        if (e && !vk_driver_rejected()[0]) {
+            while (s0 > p && s0[-1] != '/') s0--;
+            snprintf(drvname, sizeof drvname, "%.*s", (int)(e - s0), s0);
+        }
         const char *d = vk_gpu_desc();
         const char *sep = strstr(d, " - ");
         if (d[0]) {
@@ -313,9 +367,16 @@ void perf_overlay_draw(ImVec2 display, float scale) {
         chart(0, 82, 0xFF50DBEB, tr_zh("FPS"));
         chart(1, 123, 0xFFFFCE78, tr_zh("ms"));
         chart(2, 164, 0xFFA699FF, tr_zh("RAM MB"));
-        snprintf(s, sizeof s, tr_zh("GPU %s ms  |  App RAM %s"), number(a, gms), ram);
+        if ((items & OVERLAY_GPU) && (gpu_pct >= 0 || gpu_mhz > 0)) {  // (its load and clock where sysfs gives them)
+            char gl[32] = "", gc[32] = "";
+            if (gpu_pct >= 0) snprintf(gl, sizeof gl, " %d%%", gpu_pct);
+            if (gpu_mhz > 0) snprintf(gc, sizeof gc, " %d MHz", gpu_mhz);
+            snprintf(s, sizeof s, tr_zh("GPU %s ms%s%s  |  App RAM %s"), number(a, gms), gl, gc, ram);
+        } else
+            snprintf(s, sizeof s, tr_zh("GPU %s ms  |  App RAM %s"), number(a, gms), ram);
         text(s, 12, 212, 11, 0xFFE3EAF5);
-        snprintf(s, sizeof s, tr_zh("CPU cap %s%s"), cpu, turnip ? "  |  Turnip (Mesa)" : "");
+        if (turnip) snprintf(s, sizeof s, tr_zh("CPU cap %s  |  %s"), cpu, drvname[0] ? drvname : "Turnip (Mesa)");
+        else snprintf(s, sizeof s, tr_zh("CPU cap %s"), cpu);
         text(s, 12, 229, 10, turnip ? 0xFFFF9F43 : 0xFFE3EAF5);
         char lv[8];
         if (level < 0) strcpy(lv, "--");

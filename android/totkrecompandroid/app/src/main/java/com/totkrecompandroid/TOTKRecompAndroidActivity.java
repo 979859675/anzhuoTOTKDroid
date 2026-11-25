@@ -1295,6 +1295,27 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
         }
     }
 
+    // The fastest refresh the screen offers at its current resolution (vulkan/device.c, Frame rate 40 / 45): SDL knows
+    // only the current mode, and HyperOS keeps a game at 60 Hz on a 120 Hz screen until the window asks for more. 0:
+    // unknown. (from BOTWRecomp 8964997)
+    public static float maxRefreshRate() {
+        TOTKRecompAndroidActivity a = self;
+        if (a == null) return 0;
+        try {
+            android.view.Display d = a.getDisplay();
+            if (d == null) return 0;
+            android.view.Display.Mode cur = d.getMode();
+            float best = 0;
+            for (android.view.Display.Mode m : d.getSupportedModes())
+                if (m.getPhysicalWidth() == cur.getPhysicalWidth() && m.getPhysicalHeight() == cur.getPhysicalHeight())
+                    best = Math.max(best, m.getRefreshRate());
+            return best;
+        } catch (Throwable t) {
+            Log.w("TOTKRecompAndroid", "maxRefreshRate: " + t);
+            return 0;
+        }
+    }
+
     // ---- a graphics driver error that stops the app (runtime/platform/android.c plat_fatal_notice): the driver is
     // loaded before the start screen, so the Settings rows that choose it can't be reached when it fails. This dialog
     // installs a driver package, or goes back to the system's driver, and starts the app again; else it closes. Blocks

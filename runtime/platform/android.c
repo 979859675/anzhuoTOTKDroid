@@ -68,6 +68,22 @@ static void log_file_line(const char *line) {
     pthread_mutex_unlock(&g_logf_lock);
 }
 
+// The fastest refresh rate the screen offers at its current resolution (TOTKRecompAndroidActivity.maxRefreshRate;
+// SDL registers only the current mode): 0 unknown. (from BOTWRecomp 8964997)
+float plat_max_refresh_hz(void) {
+    JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
+    jobject act = (jobject)SDL_GetAndroidActivity();
+    if (!env || !act) return 0;
+    float hz = 0;
+    jclass c = (*env)->GetObjectClass(env, act);
+    jmethodID m = (*env)->GetStaticMethodID(env, c, "maxRefreshRate", "()F");
+    if (m) hz = (*env)->CallStaticFloatMethod(env, c, m);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); hz = 0; }
+    (*env)->DeleteLocalRef(env, c);
+    (*env)->DeleteLocalRef(env, act);
+    return hz;
+}
+
 static int picked_folder_log(bool first) {  // TOTKRecompAndroidActivity.openLog: a descriptor, -1 without a usable folder
     JNIEnv *env = (JNIEnv *)SDL_GetAndroidJNIEnv();
     jobject act = (jobject)SDL_GetAndroidActivity();
@@ -273,8 +289,26 @@ static bool gdrop(uint64_t lo, uint64_t hi) {
     }
     return ok;
 }
-// (textures.c, after an upload: the guest copy of a texture is dropped, as plat_discard's pages - but nothing else)
-bool plat_discard_pages(uint64_t addr, uint64_t size) { return gdrop(addr, addr + size); }
+// (textures.c, after an upload: the guest copy of a texture is dropped - but its contents are kept: MADV_PAGEOUT sends
+// them to swap, or back to the file with memory saving, and a texture made over the same memory later reads them. Zero
+// pages (zero: LARECOMP_TEX_DISCARD=2, the test) gave magenta squares: #57. Kernels without MADV_PAGEOUT: MADV_COLD.)
+#ifndef MADV_COLD  // (older NDK headers: Linux 5.4's advice values, as textures.c)
+#define MADV_COLD 20
+#endif
+#ifndef MADV_PAGEOUT
+#define MADV_PAGEOUT 21
+#endif
+bool plat_discard_pages(uint64_t addr, uint64_t size, bool zero) {
+    if (zero) return gdrop(addr, addr + size);
+    static int adv = MADV_PAGEOUT;
+    int r = madvise((void *)(uintptr_t)addr, size, adv);
+    if (r && adv == MADV_PAGEOUT && errno == EINVAL) {
+        adv = MADV_COLD;
+        fprintf(stderr, "[android] MADV_PAGEOUT refused: MADV_COLD instead\n");
+        r = madvise((void *)(uintptr_t)addr, size, adv);
+    }
+    return r == 0;
+}
 
 // Settings > Video > Memory saving, read as the app starts (main.c boot, before the game writes to the window): the window
 // becomes a shared map of a file in the app's internal storage (unlinked at once, so it goes with the process). The file
@@ -346,6 +380,12 @@ void plat_discard(uint64_t addr, uint64_t size) {
 static uint64_t wt_lo, wt_hi;
 static uint8_t *wt_state;  // per 4 KB page: 0 not tracked (counts as written), 1 read-only since asked, 2 written since
                            // (all three: tentative definitions, declared above plat_reset_guest)
+// A write fault reopens the run of still-read-only pages around the faulting one, up to wt_frun pages each way
+// (LARECOMP_WT_FAULT_RUN_KB, default 1024), in one mprotect instead of a page (and the next) per fault: fewer SIGSEGV round
+// trips, and fewer splits of the driver's mapping of the memory (each page made writable alone in a read-only stretch
+// leaves two more maps, which never merge again). From Swap2-Native's fault_run (Banana Native 6624426f, MIT). The pages
+// of the run count as written (state 2), as the faulting one: the textures over them upload again at their next use.
+static uint64_t wt_frun = 256;  // (pages)
 static atomic_flag wt_spin = ATOMIC_FLAG_INIT;  // (taken in the signal handler too: no mutex)
 static bool wt_broken;  // (an mprotect failed - out of memory mappings: no new pages tracked)
 static void wt_lock(void) { while (atomic_flag_test_and_set_explicit(&wt_spin, memory_order_acquire)) {} }
@@ -359,6 +399,11 @@ void plat_write_tracking_enable(uint64_t lo, uint64_t hi) {
     if (!s) return;
     wt_lo = lo; wt_hi = hi;
     wt_state = s;
+    {  // (read here, not in the fault handler: getenv isn't signal-safe)
+        const char *e = getenv("LARECOMP_WT_FAULT_RUN_KB");
+        long kb = e ? atol(e) : 1024;
+        wt_frun = kb < 4 ? 1 : (uint64_t)kb >> 2;  // (at least the next page: a store across a boundary, wt_fault)
+    }
     fprintf(stderr, "[android] page write tracking on %#llx-%#llx\n", (unsigned long long)lo, (unsigned long long)hi);
 }
 
@@ -384,6 +429,10 @@ static bool wt_reopen_all(void) {
     return true;
 }
 
+// (counted for the log: plat_written_pages says them every 10 s - faults taken, pages made read-only, by region)
+static uint64_t wt_n_faults, wt_n_faults_alias, wt_n_protected, wt_n_protected_alias;
+static uint64_t wt_n_runs, wt_n_run_pages;
+#define WT_HEAP_LO HEAP_BASE  // (below it: the physical memory region, tracked since 0.3.1 - exec.c VC_BASE)
 static bool wt_fault(uint64_t a) {
     if (!wt_state || a < wt_lo || a >= wt_hi) return false;
     uint64_t p = (a - wt_lo) >> 12, np = (wt_hi - wt_lo) >> 12;
@@ -393,6 +442,20 @@ static bool wt_fault(uint64_t a) {
     else if (wt_odd_addr == a && ++wt_odd_repeats > 8) { wt_unlock(); return false; }  // (a real fault)
     else if (wt_odd_addr != a) wt_odd_addr = a, wt_odd_repeats = 0;
     if (wt_state[p] != 1) wt_odd++;
+    wt_n_faults++;
+    if (a < WT_HEAP_LO) wt_n_faults_alias++;
+    if (wt_state[p] == 1) {  // (the run around it, one mprotect)
+        uint64_t s = p, e = p + 1;  // (e: one past the run's last page; the faulting page always, the next while read-only)
+        while (s > 0 && p - s < wt_frun && wt_state[s - 1] == 1) s--;
+        while (e < np && e - p <= wt_frun && wt_state[e] == 1) e++;
+        for (uint64_t k = s; k < e; k++) wt_state[k] = 2;  // (state first, then the protection)
+        wt_n_runs++, wt_n_run_pages += e - s;
+        if (mprotect((void *)(uintptr_t)(wt_lo + (s << 12)), (size_t)(e - s) << 12, PROT_READ | PROT_WRITE))
+            ours = wt_reopen_all();  // (out of mappings, above; else it stays a fault)
+        else ours = true;
+        wt_unlock();
+        return ours;
+    }
     // (2: another thread's fault on it got there first - writable already. The next page too: a store across the
     // boundary may report its first byte, in the page before the protected one)
     // (the next page only while still read-only: a real fault on this one must not retry forever)
@@ -524,6 +587,8 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
         if (!wt_broken) {
             // (state first, then the protection: a write in between lands before the caller copies the page)
             for (uint64_t k = p; k < q; k++) wt_state[k] = 1;
+            wt_n_protected += q - p;
+            if (wt_lo + (p << 12) < WT_HEAP_LO) wt_n_protected_alias += q - p;
             if (mprotect((void *)(uintptr_t)(wt_lo + (p << 12)), (q - p) << 12, PROT_READ)) {
                 if (errno == ENOMEM && wt_reopen_all()) { wt_unlock(); return -1; }  // (out of mappings: start over - all
                                                                                     // counts as written, wt_reopen_all)
@@ -536,6 +601,21 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
         p = q;
     }
     wt_unlock();
+    {   // (every 10 s: what the tracking cost)
+        static uint64_t next_ns, f0, fa0, p0, pa0, o0, r0, rp0;
+        uint64_t now = plat_now_ns();
+        if (now >= next_ns) {
+            if (next_ns)
+                fprintf(stderr, "[android] page write tracking, last 10 s: %llu faults (%llu below the heap, %llu odd), "
+                        "%llu pages made read-only (%llu below the heap), %llu fault runs of %llu pages\n", (unsigned long long)(wt_n_faults - f0),
+                        (unsigned long long)(wt_n_faults_alias - fa0), (unsigned long long)(wt_odd - o0),
+                        (unsigned long long)(wt_n_protected - p0), (unsigned long long)(wt_n_protected_alias - pa0),
+                        (unsigned long long)(wt_n_runs - r0), (unsigned long long)(wt_n_run_pages - rp0));
+            next_ns = now + 10000000000ull;
+            f0 = wt_n_faults, fa0 = wt_n_faults_alias, p0 = wt_n_protected, pa0 = wt_n_protected_alias, o0 = wt_odd;
+            r0 = wt_n_runs, rp0 = wt_n_run_pages;
+        }
+    }
     return n > max ? max : n;
 }
 

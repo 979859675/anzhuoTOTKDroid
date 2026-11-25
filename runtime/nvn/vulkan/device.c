@@ -12,6 +12,7 @@
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "vk.h"
+#include "dyn_vi.h"
 #include "replay.h"
 #include "timing_trace.h"
 #include "device_compat.h"
@@ -33,6 +34,34 @@ static const void *rt_memmem(const void *data, size_t size, const void *pattern,
             return bytes + i;
     return NULL;
 }
+
+// ================================================================== the host's FPCR on Vulkan's side (vk_fpenv.h)
+#include "vk_fpenv.h"
+#if defined(__aarch64__)
+static inline uint64_t fp_get(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
+static inline void fp_set(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
+#else
+static inline uint64_t fp_get(void) { return 0; }
+static inline void fp_set(uint64_t v) { (void)v; }
+#endif
+bool vk_fp_guest_kept(void) {
+    static int kept = -1;
+    if (kept < 0) { const char *e = getenv("LARECOMP_VK_GUEST_FPCR"); kept = e && atoi(e) != 0; }
+    return kept;
+}
+uint64_t vk_fp_host(const char *where) {
+    uint64_t v = fp_get();
+    if (!v) return 0;
+    static atomic_int logged;
+    if (!atomic_exchange(&logged, 1))
+        LOG("[vk] %s: started with the game's FPCR 0x%llx, %s\n", where, (unsigned long long)v,
+            vk_fp_guest_kept() ? "kept (LARECOMP_VK_GUEST_FPCR)" : "the host's (0) set");
+    if (vk_fp_guest_kept()) return 0;
+    fp_set(0);
+    return v;
+}
+void vk_fp_put(uint64_t v) { if (v) fp_set(v); }
+void vk_fp_thread(const char *name) { (void)vk_fp_host(name); }
 
 // ================================================================== instance / device
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
@@ -423,13 +452,12 @@ static void pick_device(void) {
 
 static bool g_fault_ext;
 // After VK_ERROR_DEVICE_LOST: what the driver says faulted (VK_EXT_device_fault), into the log.
-void vk_device_fault_report(void) {
-    static int once;
-    if (once++ || !g_fault_ext) return;
+static void fault_dump(void) {
     PFN_vkGetDeviceFaultInfoEXT get = (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(g_vk.dev, "vkGetDeviceFaultInfoEXT");
     if (!get) return;
     VkDeviceFaultCountsEXT c = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
-    if (get(g_vk.dev, &c, NULL) != VK_SUCCESS) { LOG("[vk] device fault: no info\n"); return; }
+    VkResult fr = get(g_vk.dev, &c, NULL);
+    if (fr != VK_SUCCESS) { LOG("[vk] device fault: no info (%d)\n", fr); return; }
     VkDeviceFaultAddressInfoEXT addr[16];
     VkDeviceFaultVendorInfoEXT vend[16];
     if (c.addressInfoCount > 16) c.addressInfoCount = 16;
@@ -446,6 +474,20 @@ void vk_device_fault_report(void) {
         LOG("[vk]   vendor: %s (code %#llx data %#llx)\n", vend[i].description, (unsigned long long)vend[i].vendorFaultCode,
             (unsigned long long)vend[i].vendorFaultData);
 }
+void vk_device_fault_report(void) {
+    static int once;
+    if (once++ || !g_fault_ext) return;
+    fault_dump();
+}
+#ifdef __ANDROID__
+// The same on demand, for the freeze watchdog (watchdog.c) after a long stall: a driver that has lost the device without
+// telling the caller (no VK_ERROR_DEVICE_LOST yet) may still have a fault to report. Its helper thread calls this
+// (from BOTWRecomp 3f9d546).
+void vk_device_fault_probe(void) {
+    if (!g_fault_ext) { LOG("[watchdog] VK_EXT_device_fault is not enabled\n"); return; }
+    fault_dump();
+}
+#endif
 
 static void create_device(void) {
     uint32_t ne = 0;
@@ -464,6 +506,8 @@ static void create_device(void) {
     VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_have = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vids_have = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
     VkPhysicalDeviceFeatures2 optional = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
 #define QUERY_OPTIONAL(name, feature) do { if (has_ext(ep, ne, name)) { \
         feature.pNext = optional.pNext; optional.pNext = &feature; } } while (0)
@@ -472,10 +516,11 @@ static void create_device(void) {
     QUERY_OPTIONAL(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, fault_have);
     QUERY_OPTIONAL(VK_KHR_MAINTENANCE_5_EXTENSION_NAME, maintenance5_have);
     QUERY_OPTIONAL(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, executable_have);
+    QUERY_OPTIONAL(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, vids_have);
 #undef QUERY_OPTIONAL
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &optional);
 #endif
-    const char *ext[32];
+    const char *ext[48];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
 #ifdef __ANDROID__
@@ -589,6 +634,7 @@ static void create_device(void) {
         ext[n_ext++] = VK_KHR_MAP_MEMORY_2_EXTENSION_NAME;
         ext[n_ext++] = VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME;
     }
+    bool have_dyn_vi = has_ext(ep, ne, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);  // (below: dynamic vertex input)
 #endif
     free(ep);
 
@@ -756,7 +802,11 @@ static void create_device(void) {
         f12.storageBuffer8BitAccess = h12.storageBuffer8BitAccess;
         // device addresses: shaders reach the heap placed in GPU memory through a pointer where a storage buffer's
         // range can't cover it (exec.c vk_heap_place; Turnip on Adreno 7xx: 128 MB). Required from Vulkan 1.3 on.
-        g_vk.bda = g_vk.api >= VK_API_VERSION_1_2 && h12.bufferDeviceAddress && g_vk.map_placed;
+        // Also for the heap in blocks of Android hardware buffers (exec.c heap_ahb_blocks, LARECOMP_VK_MEMFD_AHB=3), on
+        // drivers without placed maps (Mali): its shaders reach every block by pointer.
+        const char *ahb_mode = getenv("LARECOMP_VK_MEMFD_AHB");
+        g_vk.bda = g_vk.api >= VK_API_VERSION_1_2 && h12.bufferDeviceAddress &&
+                   (g_vk.map_placed || (ahb_mode && atoi(ahb_mode) == 3));
         f12.bufferDeviceAddress = g_vk.bda;
         // nor 16-bit storage: no translated or built-in shader declares it, and the Adreno 610 under Turnip lacks it
         // (LAS Recomp's issue #4). LARECOMP_VK_NO_STORAGE16=1 (test): as if it lacked it.
@@ -885,16 +935,51 @@ static void create_device(void) {
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pex = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, .pipelineExecutableInfo = VK_TRUE};
     if (g_vk.exec_stats) { pex.pNext = f.pNext; f.pNext = &pex; }
+    // Vertex attribute / binding layout out of PipeKey into vkCmdSetVertexInputEXT: fewer pipeline permutations (from
+    // BOTWRecomp 8146cfa). On by default on Turnip and ARM Mali r49+ (LARECOMP_DYN_VI=1/0 forces it, LARECOMP_NO_DYN_VI=1: off).
+    const char *dvi = getenv("LARECOMP_DYN_VI");
+    bool no_dvi = env_on("LARECOMP_NO_DYN_VI");
+    bool want_dvi = vk_dyn_vi_want((uint32_t)driver.driverID, driver.driverInfo, driver_props, dvi, no_dvi);
+    g_vk.dyn_vi = want_dvi && g_vk.eds && have_dyn_vi && vids_have.vertexInputDynamicState &&
+                  g_vk.props.limits.maxVertexInputBindings > 16;  // ZERO_BINDING = 16
+    const char *dvi_why = no_dvi ? "LARECOMP_NO_DYN_VI"
+        : (dvi && *dvi && !want_dvi) ? "LARECOMP_DYN_VI=0"
+        : !want_dvi ? (driver_props ? "driver excluded by default" : "no driver properties")
+        : !g_vk.eds ? "no extendedDynamicState"
+        : !have_dyn_vi ? "missing extension"
+        : !vids_have.vertexInputDynamicState ? "feature disabled"
+        : g_vk.props.limits.maxVertexInputBindings <= 16 ? "maxVertexInputBindings <= 16"
+        : (dvi && *dvi) ? "LARECOMP_DYN_VI" : "driver default";
+    LOG("[vk-cap] dynamic vertex input: %s (%s)\n", g_vk.dyn_vi ? "on" : "off", dvi_why);
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vids = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT,
+        .vertexInputDynamicState = VK_TRUE};
+    if (g_vk.dyn_vi) {
+        ext[n_ext++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
+        vids.pNext = f.pNext;
+        f.pNext = &vids;
+    }
 #endif
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
                                   .queueCount = 1, .pQueuePriorities = &prio};
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
-    VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+    uint64_t fpcr = vk_fp_host("vkCreateDevice");  // (the driver's threads made here inherit the FPCR: vk_fpenv.h)
 #ifdef __ANDROID__
+    extern void vk_gpu_floor_before(bool turnip), vk_gpu_floor_after(void);  // (gpu_floor.c: the KGSL clock floor)
+    vk_gpu_floor_before(driver.driverID == VK_DRIVER_ID_MESA_TURNIP);
+#endif
+    VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+    vk_fp_put(fpcr);
+#ifdef __ANDROID__
+    vk_gpu_floor_after();
     volkLoadDevice(g_vk.dev);
     compat_aliases();
+    if (g_vk.dyn_vi && !vkCmdSetVertexInputEXT) {
+        g_vk.dyn_vi = false;
+        LOG("[vk-cap] dynamic vertex input disabled: vkCmdSetVertexInputEXT missing from driver\n");
+    }
     vk_rp_install();  // (LARECOMP_VK_REPLAY: the draws' recording on a thread of its own - replay.h)
     LOG("[vk] Vulkan %u.%u device, %u extensions\n", VK_API_VERSION_MAJOR(g_vk.api), VK_API_VERSION_MINOR(g_vk.api), n_ext);
 #endif
@@ -1094,8 +1179,14 @@ static void create_swapchain(void) {
 }
 
 static void recreate_swapchain(void) {
+#ifdef __ANDROID__
+    WdMark wd_mark = vk_wd_enter(WD_R_SWAPCHAIN, 0);  // (freeze watchdog: vkDeviceWaitIdle waits for all the GPU's work)
+#endif
     vkDeviceWaitIdle(g_vk.dev);
     create_swapchain();
+#ifdef __ANDROID__
+    vk_wd_leave(wd_mark);
+#endif
 }
 
 #ifdef __ANDROID__
@@ -1125,15 +1216,18 @@ static void android_create_surface(struct ANativeWindow *aw) {
 #include <android/native_window.h>
 #include <dlfcn.h>
 int vk_between_fps(void);
+int vk_between_target(void);
+int vk_unlocked_fps(void);
 static void android_frame_rate(struct ANativeWindow *aw) {
     static struct ANativeWindow *asked_aw;
     static float asked = -1;
     int mode = g_settings.fps_mode;
-    float want = mode == 4 && vk_between_fps() != 30 ? (float)vk_between_fps() : 0.0f;
+    float want = mode == 4 && vk_between_target() != 30 ? (float)vk_between_target()
+               : mode == 5 && vk_unlocked_fps() > 60 ? (float)vk_unlocked_fps() : 0.0f;
     bool fg = false;
     extern int vk_fg_state(void);
     if (vk_fg_state() > 0) {  // (1 generating, 2 waiting, 3 no refresh left)
-        int base = mode == 1 ? 30 : mode == 3 ? 20 : mode == 4 ? vk_between_fps() : 60;
+        int base = mode == 1 ? 30 : mode == 3 ? 20 : mode == 4 ? vk_between_fps() : mode == 5 ? vk_unlocked_fps() : 60;
         int mult = g_settings.fg_mult < 2 ? 2 : g_settings.fg_mult > 4 ? 4 : g_settings.fg_mult;
         want = (float)(base * mult), fg = true;
     }
@@ -1160,6 +1254,7 @@ static bool android_surface_ready(void) {  // false: no window to draw into now
     if (!aw) { surface_lost = true; return false; }
     android_frame_rate(aw);
     if (aw == surface_aw && !surface_lost) return true;
+    WdMark wd_mark = vk_wd_enter(WD_R_SWAPCHAIN, 1);  // (freeze watchdog)
     vkDeviceWaitIdle(g_vk.dev);
     for (uint32_t i = 0; i < g_vk.sc_count; i++) vk_rp_forget_view(g_vk.sc_views[i]), vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
     g_vk.sc_count = 0;
@@ -1170,6 +1265,7 @@ static bool android_surface_ready(void) {  // false: no window to draw into now
     surface_lost = false;
     LOG("[vk] window surface made again (the app came back from the background)\n");
     create_swapchain();
+    vk_wd_leave(wd_mark);
     return g_vk.swapchain != VK_NULL_HANDLE;
 }
 #endif
@@ -1233,7 +1329,13 @@ bool vk_frame_begin(const float clear[4]) {
     // until the app went to the background (the surface's loss ends the wait) - TOTK froze until another window came
     // in front and back (2026-10-25). Then the swapchain is made again, as that trip does; still none: no frame now.
     const uint64_t acquire_ns = 1000000000ull;
+#ifdef __ANDROID__
+    WdMark wd_mark = vk_wd_enter(WD_R_ACQUIRE, 0);  // (freeze watchdog)
+#endif
     VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, acquire_ns, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+#ifdef __ANDROID__
+    vk_wd_leave(wd_mark);
+#endif
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {
         static int nstuck;
         if (nstuck++ < 20) LOG("[vk] no window image within 1 s (%d): the swapchain made again\n", r);
@@ -1242,7 +1344,13 @@ bool vk_frame_begin(const float clear[4]) {
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
         if (!g_vk.swapchain) return false;
+#ifdef __ANDROID__
+        wd_mark = vk_wd_enter(WD_R_ACQUIRE, 1);
+#endif
         r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, acquire_ns, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+#ifdef __ANDROID__
+        vk_wd_leave(wd_mark);
+#endif
         if (r == VK_TIMEOUT || r == VK_NOT_READY) { LOG("[vk] still no window image: frame skipped\n"); return false; }
     }
 #ifdef __ANDROID__
@@ -1327,7 +1435,13 @@ void vk_frame_end(const char *shot_path) {
 #ifdef __ANDROID__
     uint64_t trace_start = vk_timing_trace_on() ? SDL_GetTicksNS() : 0;
 #endif
+#ifdef __ANDROID__
+    WdMark wd_mark = vk_wd_enter(WD_R_QUEUE_PRESENT, seq);  // (freeze watchdog)
+#endif
     VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
+#ifdef __ANDROID__
+    vk_wd_leave(wd_mark);
+#endif
     if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) g_presented_images++;
 #ifdef __ANDROID__
     if (trace_start) vk_timing_trace_wait(VK_TIMING_PRESENT, SDL_GetTicksNS() - trace_start);
@@ -1381,6 +1495,12 @@ uint64_t renderer_present_count(void) { return vk_async_on() && !vk_async_is_ren
 #else
 uint64_t renderer_present_count(void) { return total_frames; }
 #endif
+#ifdef __ANDROID__
+// For the freeze watchdog (watchdog.c): the render thread's and the game's counts of presents, plain reads
+// (from BOTWRecomp 3f9d546)
+uint64_t vk_wd_frames_done(void) { return __atomic_load_n(&total_frames, __ATOMIC_RELAXED); }
+uint64_t vk_wd_frames_asked(void) { return __atomic_load_n(&g_game_frames, __ATOMIC_RELAXED); }
+#endif
 uint64_t vk_frame_counter(void) { return g_frame_counter; }
 // The game's own frames presented (generated ones not counted): the overlay's raw frame rate
 uint64_t vk_game_frames(void) { return total_frames; }
@@ -1412,6 +1532,9 @@ static void present_game_half(void) {
     fnprof_frame(renderer_present_count());
     extern void reboot_test_frame(uint64_t frame);  // runtime/main.c (LARECOMP_REBOOT_AT)
     reboot_test_frame(renderer_present_count());
+    extern void vk_gpu_floor_frame(uint64_t frame), vk_gpu_floor_clock_log(void);  // (gpu_floor.c)
+    vk_gpu_floor_frame(renderer_present_count());
+    vk_gpu_floor_clock_log();
 }
 
 void vk_present_now(NvnTexture *t);
@@ -1920,7 +2043,13 @@ bool vk_adreno_7xx_8xx(const char *name) {
     int n = atoi(a);
     return n >= 700 && n < 900;
 }
-bool vk_inplace_reads_on(int setting) { return setting < 0 ? vk_adreno_7xx_8xx(g_vk.props.deviceName) : setting != 0; }
+// Mali too since 2026-11-20: in TOTK's shrines a draw reads the target it draws on ~4,000 times a frame, and the copies took a
+// Mali-G720 (Dimensity 9300+) to 3 fps; read in place (LARECOMP_FEEDBACK_INPLACE=1 through Driver variables, #73) the
+// copies went from 13,000 to 57 every 2 s (p90) and the slowest windows from 3 to 10.6 fps, with nothing reported wrong
+// (#65 #73 #27). In place is a feedback loop Vulkan leaves undefined: checked on Turnip frame by frame, on Mali by players.
+bool vk_inplace_auto(void) { return vk_adreno_7xx_8xx(g_vk.props.deviceName) || g_vk.props.vendorID == 0x13B5; }
+static int between_for(float hz) { return hz > 110 ? 40 : hz > 80 ? 45 : hz > 50 ? 30 : 45; }
+
 int vk_between_fps(void) {
     static int fps = 45;
     static uint64_t next;
@@ -1929,9 +2058,38 @@ int vk_between_fps(void) {
         next = now + 1000000000ull;
         const SDL_DisplayMode *m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window));
         float hz = m ? m->refresh_rate : 0;
-        int f = hz > 110 ? 40 : hz > 80 ? 45 : hz > 50 ? 30 : 45;
+        int f = between_for(hz);
         if (f != fps) LOG("[vk] Frame rate 40 / 45: %d fps on a %.0f Hz screen\n", f, hz);
         fps = f;
+    }
+    return fps;
+}
+
+// ... and the one the window asks for (android_frame_rate): from the fastest rate the screen offers, not the current
+// one - HyperOS keeps a game at 60 Hz on a 120 Hz screen until it asks for more, so from the current rate 40 / 45 fell
+// to 30 and never asked. The frame rate itself still follows the screen's rate (vk_between_fps): 30 until the system
+// switches, and on a system that won't. (from BOTWRecomp 8964997)
+int vk_between_target(void) {
+    static int fps;
+    if (!fps) {
+        extern float plat_max_refresh_hz(void);
+        float hz = plat_max_refresh_hz();
+        fps = hz > 0 ? between_for(hz) : -1;
+        LOG("[vk] Frame rate 40 / 45: the screen offers up to %.0f Hz\n", hz);
+    }
+    return fps > 0 ? fps : vk_between_fps();
+}
+
+// Frame rate Unlocked (5): the fastest refresh the screen offers, at most 120 and at least 60 (60 when unknown);
+// LARECOMP_UNLOCKED_FPS=<30-240> over it. The window asks for that rate (android_frame_rate) so HyperOS leaves 60 Hz.
+int vk_unlocked_fps(void) {
+    static int fps;
+    if (!fps) {
+        const char *e = getenv("LARECOMP_UNLOCKED_FPS");
+        extern float plat_max_refresh_hz(void);
+        float hz = e ? (float)atof(e) : plat_max_refresh_hz();
+        fps = e ? (hz < 30 ? 30 : hz > 240 ? 240 : (int)(hz + 0.5f)) : hz > 119 ? 120 : hz > 60 ? (int)(hz + 0.5f) : 60;
+        LOG("[vk] Frame rate Unlocked: up to %d fps (the screen offers up to %.0f Hz)\n", fps, hz);
     }
     return fps;
 }
@@ -1975,6 +2133,13 @@ void ui_window_init(void) {
             char buf[sizeof g_settings.driver_env], *save = NULL;
             snprintf(buf, sizeof buf, "%s", g_settings.driver_env);
             snprintf(g_driver_env_at_start, sizeof g_driver_env_at_start, "%s", g_settings.driver_env);
+            // (a comma before another NAME= also separates: TOTKDroid's own notes said "A=1,B=3", which set A to "1,B=3"
+            // - #88; a comma inside a value, as TU_DEBUG's list, stays)
+            for (char *c = buf; (c = strchr(c, ',')); c++) {
+                char *n = c + 1;
+                while (*n == '_' || (*n >= 'A' && *n <= 'Z') || (*n >= '0' && *n <= '9')) n++;
+                if (n > c + 1 && *n == '=' && !(c[1] >= '0' && c[1] <= '9')) *c = ' ';
+            }
             for (char *p = strtok_r(buf, " \t;", &save); p; p = strtok_r(NULL, " \t;", &save)) {
                 char *eq = strchr(p, '=');
                 if (!eq || eq == p) continue;
@@ -2090,6 +2255,9 @@ void ui_window_init(void) {
     create_swapchain();
     vk_exec_init();
     vk_shaders_init();
+#ifdef __ANDROID__
+    vk_watchdog_start();  // (watchdog.c: says where the game stops, if it does - from BOTWRecomp 3f9d546)
+#endif
 }
 
 SDL_Window *ui_window(void) { return window; }

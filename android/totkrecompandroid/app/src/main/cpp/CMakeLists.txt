@@ -18,6 +18,10 @@ include(${R}/android/gamelib_id.cmake)  # (GAMELIB_ID: the same as totkgame.so's
 message(STATUS "GAMELIB_ID ${GAMELIB_ID}")
 
 add_subdirectory(${R}/third_party/libadrenotools ${CMAKE_BINARY_DIR}/adrenotools)
+# Qualcomm's custom drivers on Android 15: an API 36 Binder symbol they import, defined in the driver's namespace
+# (android/adreno_binder_compat.c; -z global so the driver's libraries find it)
+target_sources(hook_impl PRIVATE ${R}/android/adreno_binder_compat.c)
+target_link_options(hook_impl PRIVATE -z global)
 
 add_library(SDL3 SHARED IMPORTED)
 set_target_properties(SDL3 PROPERTIES IMPORTED_LOCATION ${DEPS}/lib/libSDL3.so)
@@ -87,3 +91,9 @@ target_compile_options(main PRIVATE -O2 -g -fno-strict-aliasing -Wall -Wno-unuse
 target_link_libraries(main PRIVATE SDL3 shaderc_shared adrenotools android nativewindow log dl m)
 # (runtime/hle.h, ipc.h, main.c: tables in named sections found through __start_ / __stop_ symbols)
 target_link_options(main PRIVATE -Wl,-z,nostart-stop-gc)
+# MW_TRANSLATOR_ID (the translator's sources hashed; runtime/nvn/vulkan/exec.c keys its .smeta files with it), asked on every
+# build (mw_translator_id.cmake; from BOTWRecomp b4e80e7)
+add_custom_target(mw_translator_id BYPRODUCTS ${CMAKE_BINARY_DIR}/mw/mw_translator_id.h
+    COMMAND ${CMAKE_COMMAND} -DR=${R} -DOUT=${CMAKE_BINARY_DIR}/mw/mw_translator_id.h -P ${CMAKE_CURRENT_LIST_DIR}/mw_translator_id.cmake VERBATIM)
+add_dependencies(main mw_translator_id)
+target_include_directories(main PRIVATE ${CMAKE_BINARY_DIR}/mw)

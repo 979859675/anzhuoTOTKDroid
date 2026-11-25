@@ -377,6 +377,88 @@ static int fix_far_clamp(Cpu *c) {  // ldr s0, [x19, #0x138]
     vset(c, 0, far);
     return 3;
 }
+// Frame controller hysteresis (totk-android's patch_fps60_hysteresis, MIT, MacNativeGames' controller analysis; its
+// TOTK_FPS60_HYSTERESIS): the game's frame-interval controller (main+0x2db174) counts the over-budget frames in a row in
+// [x20 + 0x48] and raises the interval (60 -> 30) once the count reaches its limit [x20 + 0x10] (2 in the game: the third
+// late frame in a row); then a cooldown [x20 + 0x14] (6) must pass before it tries to lower it again. Three loads of
+// those words become constants: the limit 6 (the interval goes up on the seventh late frame in a row) at +0x2db2b8, and the
+// cooldown 2 at +0x2db354 / +0x2db3f0. None of these sites is one of the 60 fps fixes' (+0x2db204 / 22c / 238 / 340 / 34c): the
+// lowest interval (w8 = 1) and the pick are theirs and aren't read here, so both go together. Where the game's pick matters:
+// whenever the 60 fps fixes are on (rt_fps60: Frame rate Auto, 60, 40 / 45). Video > "Hold 60 fps through short dips", off
+// by default (LARECOMP_FPS60_HYSTERESIS=0 / 1 overrides it): totk-android found it neutral to better on an 8 Elite but
+// worse on another chip (p95 +4-5 ms).
+static int hysteresis_on(void) {
+    static int env = -2;
+    if (env == -2) {
+        const char *e = getenv("LARECOMP_FPS60_HYSTERESIS");
+        env = e && *e ? atoi(e) != 0 : -1;
+        if (env >= 0) LOG("[totk] LARECOMP_FPS60_HYSTERESIS=%d\n", env);
+    }
+    return (env >= 0 ? env > 0 : g_settings.fps60_hysteresis) && rt_fps60();  // (read each time: the menu's switch applies at once)
+}
+static int fix_hyst_limit(Cpu *c) {  // ldr w12, [x20, #0x10]
+    if (!hysteresis_on()) return 0;
+    c->x[12] = 6;
+    return 3;
+}
+static int fix_hyst_cooldown12(Cpu *c) {  // ldr w12, [x20, #0x14]
+    if (!hysteresis_on()) return 0;
+    c->x[12] = 2;
+    return 3;
+}
+static int fix_hyst_cooldown9(Cpu *c) {  // ldr w9, [x20, #0x14]
+    if (!hysteresis_on()) return 0;
+    c->x[9] = 2;
+    return 3;
+}
+// Shadow caps, opt-in (totk-android's patch_shadow_cascades / patch_point_shadows, MIT, MacNativeGames; its
+// TOTK_SHADOW_CASCADES / TOTK_POINT_SHADOWS): each directional cascade and each shadowed point light is a set of caster
+// passes the drawing thread records, so fewer take CPU off it, at a cost in shadow coverage / pop.
+//  - cascades: the game's shadow update has the configured count in w15 and the active one in w16 when every path has
+//    joined at main+0x6834fc; main+0x683500 (mov w6, #0xbb0, run after the hook) is where both go down to N (1..3), before they
+//    are published (+0x683504 .., the descriptor count at +0x68362c, the split loop). w16 is the stub's (x16 / x17 come back
+//    from its frame, [guest sp - 48]), so its new value goes there as well. Read every time (applies at once);
+//    LARECOMP_SHADOW_CASCADES=<0..3> over the Video tab's choice.
+//  - point shadows: the light system sizes its pool of point shadows with the setting's budget (main+0xb866b4, ldr w1, [x0]:
+//    the accessor's result, the game's own count): min(budget, N) there, never more than the game's. Read when the pool is made
+//    (the game's lights set up): a change comes with the next one. LARECOMP_POINT_SHADOWS=<0..64>: N (0: the game's).
+static int shadow_cap_env(const char *name, int *cache) {
+    if (*cache == -2) {
+        const char *e = getenv(name);
+        *cache = e && *e ? atoi(e) : -1;
+    }
+    return *cache;
+}
+static int fix_shadow_cascades(Cpu *c) {  // mov w6, #0xbb0
+    static int env = -2;
+    int e = shadow_cap_env("LARECOMP_SHADOW_CASCADES", &env);
+    int n = e >= 0 ? e : g_settings.shadow_cascades;
+    if (n < 1 || n > 3) return 0;
+    int32_t w15 = (int32_t)c->x[15], w16 = (int32_t)c->x[16];
+    if (w15 <= n && w16 <= n) return 0;
+    static int logged;
+    if (logged < 4) logged++, LOG("[totk] shadow cascades %d / %d capped at %d\n", (int)w15, (int)w16, n);
+    if (w15 > n) c->x[15] = (uint32_t)n;
+    if (w16 > n) {
+        uint64_t v = (uint32_t)n;
+        c->x[16] = v;
+        memcpy((void *)(uintptr_t)(c->sp - 48), &v, 8);  // (the stub gives x16 back from its frame)
+    }
+    return 0;
+}
+static int fix_point_shadows(Cpu *c) {  // ldr w1, [x0]
+    static int env = -2;
+    int e = shadow_cap_env("LARECOMP_POINT_SHADOWS", &env);
+    int n = e >= 0 ? e : g_settings.point_shadows;
+    if (n < 1 || n > 64) return 0;
+    int32_t budget;
+    memcpy(&budget, (const void *)(uintptr_t)c->x[0], 4);
+    if (budget <= n) return 0;
+    static int logged;
+    if (logged < 4) logged++, LOG("[totk] point light shadows %d capped at %d\n", (int)budget, n);
+    c->x[1] = (uint32_t)n;
+    return 3;
+}
 static int fix_fade_w8(Cpu *c) { return fade_step(c, 8); }
 static int fix_fade_w10(Cpu *c) { return fade_step(c, 10); }
 typedef struct { int version; uint64_t addr, alt; uint32_t word; int (*fn)(Cpu *); const char *what; } Fix;
@@ -418,6 +500,20 @@ static const Fix fixes[] = {  // (canonical addresses, 0x7000000000 + the offset
     {143, 0x70006835a4, 0x7000683604, 0x1e38024b, fix_shadow_size, "shadow map size"},
     {143, 0x7000586944, 0, 0x39063009, fix_game_fxaa, "the game's FXAA"},
     {143, 0x7000628c30, 0, 0xbd413a60, fix_far_clamp, "render far plane"},
+    {143, 0x70002db2b8, 0, 0xb940128c, fix_hyst_limit, "frame controller over-budget limit"},
+    {143, 0x70002db354, 0, 0xb940168c, fix_hyst_cooldown12, "frame controller cooldown"},
+    {143, 0x70002db3f0, 0, 0xb9401689, fix_hyst_cooldown9, "frame controller cooldown"},
+    {143, 0x7000683500, 0, 0x52817606, fix_shadow_cascades, "shadow cascade count"},
+    {143, 0x7000b866b4, 0, 0xb9400001, fix_point_shadows, "point light shadow budget"},
+};
+// The words around the shadow cap hooks, only checked (a different build stops the start, as a changed fix word does):
+// the cascade update's loads and stores of w15 / w16, and the point shadow pool's call.
+typedef struct { uint64_t addr; uint32_t word; } Guard;
+static const Guard guards[] = {
+    {0x7000683418, 0xb940fc0f}, {0x70006834f8, 0x2a0f03f0}, {0x70006834fc, 0xaa0903f1}, {0x7000683504, 0x3800ce30},
+    {0x7000683518, 0x6b01009f}, {0x700068351c, 0x1a9f8024}, {0x700068362c, 0xb904da0f},
+    {0x7000b866b0, 0x940003a8}, {0x7000b866b8, 0xaa1703e0}, {0x7000b866bc, 0xaa1403e2}, {0x7000b866c0, 0xaa1303e3},
+    {0x7000b866c4, 0x94000c6d}, {0x7000b87574, 0x91013260},
 };
 int native_patch_c(Cpu *c, uint32_t i) { return fixes[i].fn(c); }
 
@@ -481,6 +577,11 @@ static void prepare_module(Module *m) {
         at += len;
     }
     unsigned nfixed = 0;
+    for (uint32_t f = 0; is_main && g_game_version == 143 && f < sizeof guards / sizeof *guards; f++) {
+        uint32_t gw = *(const uint32_t *)(uintptr_t)(MAIN_BASE + (guards[f].addr - 0x7000000000ull));
+        if (gw != guards[f].word) FATAL("[native] main+%llx: %08x, not %08x\n",
+                                        (unsigned long long)(guards[f].addr - 0x7000000000ull), gw, guards[f].word);
+    }
     for (uint32_t f = 0; is_main && f < nfix; f++) {
         if (fixes[f].version != g_game_version) continue;
         uint64_t site = MAIN_BASE + (fixes[f].addr - 0x7000000000ull);

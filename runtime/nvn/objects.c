@@ -10,6 +10,7 @@
 #include "../cheats.h"
 #include "../platform.h"
 #include "nvn.h"
+#include "vulkan/watchdog.h"
 #include "vulkan/writeback_policy.h"
 
 void renderer_sync(void);
@@ -295,6 +296,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
         KThread *kt = kernel_current_thread();
         if (kt) g_sync_tid = kt->id;
     }
+    WdMark wd_mark = vk_wd_enter(WD_G_SYNCWAIT, sync_of(A(0))->lseq);  // (freeze watchdog: the waits inside show on top of it; from BOTWRecomp 3f9d546)
     kernel_blocking_begin();  // (a long wait: core 0 to the game's other threads, kernel.c)
     if (vk_async_on()) {  // the render thread's translation of the fence first (vulkan/async.c)
         if (flush || whole) vk_async_drain();
@@ -329,7 +331,8 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     // Only once the world has been on screen for a while (LAG_SETTLE frames, the pause menu and map counting): with the
     // lag on from the start, some ponds stayed white for the whole session, and turned on later in play they were right
     // (2026-10-28, POCO F7 Ultra; issue #43 on an Adreno 740) - the water's colour taken once, while loading, from a GPU
-    // result the lag made a frame old. So each load (the save, a fast travel) runs its first seconds without it.
+    // result the lag made a frame old. So each load (the save, a fast travel) runs its first 30 frames without it (300 until
+    // BOTWRecomp eefafaf: ~12 s at 17-20 fps after every load on a slower GPU, #465; its pond check holds with 30).
     // Away from the world for 15 s in a row before that, not at once: TOTK's menus can't be told from a load
     // (framepace_in_menu is BOTW 1.8.2's; the inventory, the map and a loading screen all leave the 3D scene undrawn),
     // so every menu counted as leaving the world and cost the next 300 frames their lag - after closing the inventory
@@ -338,7 +341,8 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     // (45 frames there: its menus are known). The first load of a session settles as before; a load shorter than that
     // keeps the lag. LARECOMP_LAG_AWAY_S=<s> (0: as before).
     if (lag > 0 && env_lag < 0) {
-        enum { LAG_SETTLE = 300 };
+        static int LAG_SETTLE = -1;  // (LARECOMP_LAG_SETTLE=<frames>; 300 until 0.3.5, from BOTWRecomp eefafaf)
+        if (LAG_SETTLE < 0) LAG_SETTLE = getenv("LARECOMP_LAG_SETTLE") ? atoi(getenv("LARECOMP_LAG_SETTLE")) : 30;
         static int away_s = -1;
         if (away_s < 0) away_s = getenv("LARECOMP_LAG_AWAY_S") ? atoi(getenv("LARECOMP_LAG_AWAY_S")) : 15;
         extern uint64_t vk_scene_frame(void), renderer_present_count(void);
@@ -356,7 +360,11 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
             away_since_ns = 0;
             if (!world_since) world_since = now;
         }
-        if (!world_since || !world || now - world_since < LAG_SETTLE) lag = 0;
+        if (!world_since || !world || now - world_since < (uint64_t)LAG_SETTLE) lag = 0;
+        static bool was_on;
+        if ((lag > 0) != was_on && (was_on = lag > 0))
+            LOG("[synclag] on at frame %llu (the world back since frame %llu)\n", (unsigned long long)now,
+                (unsigned long long)world_since);
     }
     extern int vk_ab(const char *what);
     int ab = vk_ab("synclag");
@@ -437,6 +445,7 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     else renderer_wait_seq(sync_of(A(0))->seq);  // only the submission that holds this fence
 #ifdef __ANDROID__
     kernel_blocking_end();
+    vk_wd_leave(wd_mark);
     vk_tl("game: SyncWait end", sync_of(A(0))->lseq, sync_of(A(0))->seq);
     // LARECOMP_LOG_SYNC: waits over a millisecond in the world (frame 1500 on, 40 of them) - how old the fence was,
     // the waits for its translation and its GPU work
@@ -1132,7 +1141,12 @@ static void texels_region(Cpu *c, bool to_linear, bool strided) {
     uint64_t row = strided && A(4) ? A(4) : (uint64_t)wb * fi->bpb, img = strided && A(5) ? A(5) : row * hb;
     uint8_t *lin = AP(3), *base = (uint8_t *)(uintptr_t)t->addr;
     bool layers = t->layout.depth <= 1;  // (array / cube: one level slice per layer)
-    for (uint32_t k = 0; k < (layers ? d : 1); k++) {
+    // A read of a texture the GPU drew in comes from its image (vulkan/textures.c; from totk-android's read_texels, MIT): the
+    // memory holds only what the CPU wrote there. LARECOMP_READTEXELS_GPU=0: memory, as before.
+    extern bool vk_texture_read_texels(NvnTexture *t, uint32_t level, uint32_t first_layer, uint32_t nlayers, uint32_t x0,
+                                       uint32_t y0, uint32_t wb, uint32_t hb, uint8_t *dst, uint64_t row, uint64_t img);
+    bool from_gpu = to_linear && layers && vk_texture_read_texels(t, level, layer0 + (uint32_t)r[2], d, x0, y0, wb, hb, lin, row, img);
+    for (uint32_t k = 0; k < (layers ? d : 1) && !from_gpu; k++) {
         uint64_t at = layers ? (uint64_t)(layer0 + (uint32_t)r[2] + k) * tegra_layer_size(&t->layout) : 0;
         if (layers && layer0 + (uint32_t)r[2] + k >= (t->layout.layers ? t->layout.layers : 1)) break;
         tegra_copy_region(base + at + l.offset, lin + k * img, row, img, &l, fi->bpb, x0, y0, layers ? 0 : (uint32_t)r[2],
@@ -1153,7 +1167,7 @@ static void texels_region(Cpu *c, bool to_linear, bool strided) {
     if (nlog++ < 8 || (level && nlog_lv++ < 40))
         LOG("[nvn] %s %ux%u fmt %#x level %u region %d,%d,%d %dx%dx%d, first bytes %02x %02x %02x %02x%s\n",
             to_linear ? "ReadTexels" : "WriteTexels", t->width, t->height, t->format, level, r[0], r[1], r[2], r[3], r[4],
-            r[5], lin[0], lin[1], lin[2], lin[3], renderer_is_gpu_owned(t) ? " (drawn by the GPU)" : "");
+            r[5], lin[0], lin[1], lin[2], lin[3], from_gpu ? " (read back from the GPU image)" : renderer_is_gpu_owned(t) ? " (drawn by the GPU, memory read)" : "");
 }
 NVN(nvnTextureWriteTexels) { texels_region(c, false, false); }
 NVN(nvnTextureWriteTexelsStrided) { texels_region(c, false, true); }
@@ -1839,7 +1853,7 @@ static void totk_auto_present(uint64_t now) {
 
 int64_t rt_frame_ticks(int64_t ticks) {
     if (!g_settings.fps_mode) return ticks;
-    if (g_settings.fps_mode == 4) {
+    if (g_settings.fps_mode == 4 || g_settings.fps_mode == 5) {
         const int64_t cap = 19200000ll * 90 / 100 / 60;
         return ticks > cap ? cap : ticks;
     }
@@ -2008,7 +2022,7 @@ NVN(nvnWindowSetPresentInterval) {
     // TOTK at Frame rate 60: always 1. Its controller (rt_fps60) went back to 2 within a second each time it tried 1
     // in the cave (2026-10-29: 6 tries in 200 s, 30.8 fps on average); held at 1 the same walk ran 35 fps there (GPU
     // and the ~18 ms render thread: 42 at a 960x540 scene) - Auto leaves the choice to the game.
-    if (g_game_version == GAME_V_143 && (g_settings.fps_mode == 2 || g_settings.fps_mode == 4 || rt_totk_auto60()) && rt_fps60() && force <= 0 &&
+    if (g_game_version == GAME_V_143 && (g_settings.fps_mode == 2 || g_settings.fps_mode == 4 || g_settings.fps_mode == 5 || rt_totk_auto60()) && rt_fps60() && force <= 0 &&
         !rt_cutscene())
         c->x[1] = 1;
     if (g_game_version == GAME_V_143 && g_settings.fps_mode == 3 && force <= 0) c->x[1] = 3;
@@ -2048,6 +2062,8 @@ bool fs_save_pending(void);
 static pthread_mutex_t bg_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t bg_cv = PTHREAD_COND_INITIALIZER;
 static bool bg_paused;  // (bg_m)
+// (vulkan/watchdog.c: a game stopped in the background is not a freeze; no lock, the waiting thread holds bg_m)
+bool nvn_background_paused(void) { return __atomic_load_n(&bg_paused, __ATOMIC_RELAXED); }
 void nvn_background(bool on) {
     static int enabled = -1;
     if (enabled < 0) enabled = !getenv("LARECOMP_BG_PAUSE") || atoi(getenv("LARECOMP_BG_PAUSE"));
@@ -2117,11 +2133,11 @@ NVN(nvnQueuePresentTexture) {
         if (on < 0) on = !getenv("LARECOMP_PRESENT_WAIT") || atoi(getenv("LARECOMP_PRESENT_WAIT"));
         extern volatile uint64_t g_vsync_count;
         extern __thread uint64_t g_blocked_ns;  // (kernel.c: the pacer counts this as idle, not frame work)
-        int cap = g_settings.fps_mode == 2 || (!g_settings.fps_mode && rt_fps60()) ? 1 : 2;
+        int cap = g_settings.fps_mode == 2 || g_settings.fps_mode == 5 || (!g_settings.fps_mode && rt_fps60()) ? 1 : 2;
         int n = w->interval > cap ? w->interval : cap;
         // (TOTK at Frame rate 60: 1 whatever the window kept - the controller calls it only on a change, and a
         // cutscene's 2 stayed there after it; a cutscene at 30, as on the Switch)
-        if (g_game_version == GAME_V_143 && (g_settings.fps_mode == 2 || g_settings.fps_mode == 4) && rt_fps60()) n = 1;
+        if (g_game_version == GAME_V_143 && (g_settings.fps_mode == 2 || g_settings.fps_mode == 4 || g_settings.fps_mode == 5) && rt_fps60()) n = 1;
         if (g_game_version == GAME_V_143 && g_settings.fps_mode == 3) n = 3;
         if (rt_totk_auto()) {  // (Auto: rt_totk_auto60's pick)
             totk_auto_present(plat_now_ns());
@@ -2142,7 +2158,7 @@ NVN(nvnQueuePresentTexture) {
             g_blocked_ns += t1 - t0;
             last = last && t1 < target + period ? target : t1;
             framepace_presented(last, last == target);
-        } else if (on) {
+        } else if (on && !(g_game_version == GAME_V_143 && g_settings.fps_mode == 5 && n == 1)) {  // (Unlocked: below)
             uint64_t want = last_vs + (uint64_t)n, t0 = plat_now_ns();
 #ifdef __ANDROID__
             extern void vk_tl(const char *what, uint64_t a, uint64_t b);
@@ -2162,10 +2178,13 @@ NVN(nvnQueuePresentTexture) {
         static uint64_t previous;
         static int mode = -1;
         if (mode != g_settings.fps_mode) previous = 0, mode = g_settings.fps_mode;
-        if (mode == 4) {
-            extern int vk_between_fps(void);
+        // Unlocked (5, from peanuts-native's fps_limit_max): the 60 path paced by time at the screen's fastest refresh,
+        // at most 120 (vk_unlocked_fps), not by the 60 Hz vsync; the world already steps by the measured time (down to
+        // 1/120 s, frame_step_update). A cutscene stays at 30 through the vsync wait above.
+        if (mode == 4 || (mode == 5 && !rt_cutscene())) {
+            extern int vk_between_fps(void), vk_unlocked_fps(void);
             extern __thread uint64_t g_blocked_ns;
-            uint64_t now = plat_now_ns(), period = 1000000000ull / (rt_cutscene() ? 30 : vk_between_fps());
+            uint64_t now = plat_now_ns(), period = 1000000000ull / (mode == 5 ? vk_unlocked_fps() : rt_cutscene() ? 30 : vk_between_fps());
             if (previous && now < previous + period) {
                 plat_sleep_until_ns(previous + period);
                 g_blocked_ns += plat_now_ns() - now;

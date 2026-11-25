@@ -43,6 +43,7 @@ static void dyn_update(double now, double gpu_ms) {
 #ifdef __ANDROID__
     if (g_settings.fps_mode == 3) want = 50.0;
     else if (g_settings.fps_mode == 4) { extern int vk_between_fps(void); want = 1000.0 / vk_between_fps(); }
+    else if (g_settings.fps_mode == 5) { extern int vk_unlocked_fps(void); want = 1000.0 / vk_unlocked_fps(); }
 #endif
     g_dyn_dt_sum += dt;
     g_dyn_n++;
@@ -135,7 +136,8 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
     double scap = fmin(MAX_TEX / (1920.0 * o->scene_sx), MAX_TEX / (1080.0 * o->scene_sy));
     if (scap < 1.0) { o->scene_sx *= scap; o->scene_sy *= scap; }
     // where the image goes in the window: fills it when reshaped, else a fitted 16:9 box
-    if (reshape) { o->vw = dw; o->vh = dh; }
+    // (Stretched, #59: the 16:9 image over the whole window - on a 4:3 screen, no bars above and below)
+    if (reshape || g_settings.aspect == ASPECT_STRETCH) { o->vw = dw; o->vh = dh; }
     else { o->vw = 1920.0 * fit; o->vh = 1080.0 * fit; }
     o->vx = ox + (dw - o->vw) / 2; o->vy = oy + (dh - o->vh) / 2;
 }

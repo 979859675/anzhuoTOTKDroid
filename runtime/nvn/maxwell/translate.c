@@ -22,9 +22,14 @@
 
 #include "shader.h"
 
+// fragment output kinds (ShaderKey rt_kind): 1 / 2 signed / unsigned integer; 5 / 6 unsigned 16 / 8-bit, 7 / 8 signed
+#define RT_SINT(k) ((k) == 1 || (k) == 7 || (k) == 8)
+#define RT_UINT(k) ((k) == 2 || (k) == 5 || (k) == 6)
+
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
 bool maxwell_gmem_map_all;
 bool maxwell_gmem_bda;
+int maxwell_gmem_chunk_shift;
 bool maxwell_no_int64;
 unsigned maxwell_subgroup_stages = ~0u;
 bool maxwell_gmem_miss_log;
@@ -3278,6 +3283,28 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (maxwell_cb_window && (stage == STAGE_VERTEX || stage == STAGE_FRAGMENT))
         info->cbwin_mask = info->cbuf_dynamic & info->cbuf_mask & 0x1FFF8u;  // (the game's: 3..16)
     glsl_rewrite(c, &body, c->body.buf ? c->body.buf : "");
+    if (info->uses_gmem && maxwell_gmem_bda && maxwell_gmem_chunk_shift && body.buf) {
+        // (the heap in blocks: maxwell_gmem_chunk_shift) every gmem_.w[i] the emitters wrote becomes gmem_w(i), the
+        // block's pointer picked by i - here, after the fact, so the one-block text stays as it was (and the shader
+        // caches made from it with it)
+        Str nb = {0};
+        const char *p = body.buf, *q;
+        while ((q = strstr(p, "gmem_.w["))) {
+            sp(&nb, "%.*sgmem_w(", (int)(q - p), p);
+            const char *e = q + 8;
+            int depth = 1;
+            for (; *e && depth; e++) {
+                if (*e == '[') depth++;
+                else if (*e == ']' && !--depth) break;
+            }
+            if (!*e) { fail(c, "unbalanced gmem_.w["); break; }
+            sp(&nb, "%.*s)", (int)(e - (q + 8)), q + 8);
+            p = e + 1;
+        }
+        sp(&nb, "%s", p);
+        free(body.buf);
+        body = nb;
+    }
     if (info->uses_gmem && (info->cbuf_mask & (1u << GMEM_BUFFER_INDEX))) fail(c, "cbuf %d clashes with gmem", GMEM_BUFFER_INDEX);
     if (info->cbuf_mask >> 18) fail(c, "cbuf index out of range");
     for (int i = 0; i < info->ntex; i++)
@@ -3329,9 +3356,15 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         info->gmem_bda = true;
         sp(&s, "layout(buffer_reference, std430, buffer_reference_align = 4) %sbuffer GHeap { uint w[]; };\n",
            c->uses_gmem_store ? "" : "readonly ");
-        sp(&s, "layout(std430, set = %d, binding = %d) readonly buffer GHeapAddr { uvec2 a; } gheap_;\n", set,
-           GMEM_BUFFER_INDEX);
-        sp(&s, "#define gmem_ GHeap(gheap_.a)\n");
+        if (maxwell_gmem_chunk_shift) {  // (the heap in blocks, each block's address less its start: maxwell_gmem_chunk_shift)
+            sp(&s, "layout(std430, set = %d, binding = %d) readonly buffer GHeapAddr { uvec2 a[16]; } gheap_;\n", set,
+               GMEM_BUFFER_INDEX);
+            sp(&s, "#define gmem_w(i) GHeap(gheap_.a[min((i) >> %du, 15u)]).w[i]\n", maxwell_gmem_chunk_shift);
+        } else {
+            sp(&s, "layout(std430, set = %d, binding = %d) readonly buffer GHeapAddr { uvec2 a; } gheap_;\n", set,
+               GMEM_BUFFER_INDEX);
+            sp(&s, "#define gmem_ GHeap(gheap_.a)\n");
+        }
     } else if (info->uses_gmem)
         sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMem { uint w[]; } gmem_;\n", set, GMEM_BUFFER_INDEX,
            c->uses_gmem_store ? "" : "readonly ");
@@ -3413,7 +3446,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         for (int rt = 0; rt < 8; rt++) {
             if (!((c->omap_target >> (rt * 4)) & 0xF)) continue;
             int kind = key ? key->rt_kind[rt] : 0;
-            sp(&s, "layout(location = %d) out %s c%d;\n", rt, kind == 1 ? "ivec4" : kind == 2 ? "uvec4" : "vec4", rt);
+            sp(&s, "layout(location = %d) out %s c%d;\n", rt, RT_SINT(kind) ? "ivec4" : RT_UINT(kind) ? "uvec4" : "vec4", rt);
         }
         // a written depth is compared EQUAL against other shaders' positions too - TOTK's light classifier writes a
         // material id as depth, its lighting passes draw quads at that z: precise, as gl_Position, so the driver keeps
@@ -3477,7 +3510,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
             uint32_t m = (c->omap_target >> (rt * 4)) & 0xF;
             if (!m) continue;
             int kind = key ? key->rt_kind[rt] : 0;
-            const char *cv = kind == 1 ? "int" : kind == 2 ? "uint" : "";
+            const char *cv = RT_SINT(kind) ? "int" : RT_UINT(kind) ? "uint" : "";
             for (int comp = 0; comp < 4; comp++) {
                 if (!(m & (1u << comp))) continue;
                 if (dbg) {
@@ -3485,6 +3518,12 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
                     else sp(&s, "  c%d[%d] = %s(dbgv);\n", rt, comp, cv);
                 } else if (r < 256 && c->reg_used[r]) {
                     if (kind == 0) sp(&s, "  c%d[%d] = as_f(r%d);\n", rt, comp, r);
+                    // (narrow integer targets: the register's low bits, as NVIDIA's hardware stores them; Mali
+                    // saturates wider values - the BC4 blocks drawn through RGBA16_UINT, SavageWindRecomp 9950b9e)
+                    else if (kind == 5) sp(&s, "  c%d[%d] = r%d & 0xFFFFu;\n", rt, comp, r);
+                    else if (kind == 6) sp(&s, "  c%d[%d] = r%d & 0xFFu;\n", rt, comp, r);
+                    else if (kind == 7) sp(&s, "  c%d[%d] = int(r%d << 16) >> 16;\n", rt, comp, r);
+                    else if (kind == 8) sp(&s, "  c%d[%d] = int(r%d << 24) >> 24;\n", rt, comp, r);
                     else sp(&s, "  c%d[%d] = %s(r%d);\n", rt, comp, cv, r);
                 } else {
                     sp(&s, "  c%d[%d] = 0;\n", rt, comp);
@@ -3680,7 +3719,7 @@ ShaderInfo *maxwell_translate_bounded(const uint8_t *blob, size_t max_size, size
         for (int rt = 0; rt < 8; rt++) {
             if (!((c->omap_target >> (rt * 4)) & 0xF)) continue;
             int kind = key ? key->rt_kind[rt] : 0;
-            sp(&s, "  %s4 c%d [[color(%d)]];\n", kind == 1 ? "int" : kind == 2 ? "uint" : "float", rt, rt);
+            sp(&s, "  %s4 c%d [[color(%d)]];\n", RT_SINT(kind) ? "int" : RT_UINT(kind) ? "uint" : "float", rt, rt);
         }
         if (c->omap_depth) { sp(&s, "  float depth [[depth(any)]];\n"); info->writes_depth = true; }
         sp(&s, "};\n");

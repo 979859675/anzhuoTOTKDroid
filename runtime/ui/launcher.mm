@@ -615,6 +615,7 @@ extern "C" const char *vk_driver_env_at_start(void);
 extern "C" bool vk_lrz_at_start(void);
 extern "C" bool vk_heap_file_possible(void);
 extern "C" const char *vk_gpu_name(void);
+extern "C" bool vk_inplace_auto(void);  // (in-place reads' Automatic: Adreno 7xx / 8xx and Mali - device.c)
 extern "C" const char *vk_driver_rejected(void);  // (runtime/nvn/vulkan/android_driver.c)
 extern "C" const char *vk_driver_desc(void);      // (its own name and version: runtime/nvn/vulkan/device.c)
 extern "C" bool vk_driver_is_turnip(void);
@@ -1592,7 +1593,7 @@ static ImGuiKey launcher_pad_key(Uint8 b) {
 static void launcher_pad_open_all(void) {
     int n = 0;
     SDL_JoystickID *ids = SDL_GetGamepads(&n);
-    for (int i = 0; ids && i < n; i++) SDL_OpenGamepad(ids[i]);
+    for (int i = 0; ids && i < n; i++) if (input_pad_usable(ids[i])) SDL_OpenGamepad(ids[i]);
     SDL_free(ids);
 }
 
@@ -1601,6 +1602,7 @@ static bool launcher_pad_event(const SDL_Event &e) {
     ImGuiIO &io = ImGui::GetIO();
     switch (e.type) {
     case SDL_EVENT_GAMEPAD_ADDED:
+        if (!input_pad_usable(e.gdevice.which)) return true;  // (a fingerprint sensor, #477; from BOTWRecomp 0ea51bb)
         SDL_OpenGamepad(e.gdevice.which);
         io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
         return true;
@@ -1796,7 +1798,7 @@ static void prelaunch_tab(float sc) {
         // LASRecompAndroid's, with BOTW's in-place reads of draw targets)
         bool changed = false;
         const bool a8 = vk_adreno_8xx(vk_gpu_name());  // (Automatic: on for Adreno 8xx only)
-        const bool a78 = vk_adreno_7xx_8xx(vk_gpu_name());  // (in-place reads: 7xx too, #48)
+        const bool a78 = vk_inplace_auto();  // (in-place reads: 7xx too, #48; Mali, #73)
         auto tri = [&](const char *id, int *v, bool auto_on) {  // Automatic / On / Off: -1 / 1 / 0
             bool ch = false;
             ImGui::PushID(id);
@@ -1833,11 +1835,11 @@ static void prelaunch_tab(float sc) {
         if (!vk_heap_file_possible())
             ImGui::TextDisabled("%s", tr("This driver can't export its memory: the option does nothing here."));
         ImGui::Spacing();
-        ImGui::Text("%s", tr("Draw-target reads in place (Turnip)"));
+        ImGui::Text("%s", tr("Draw-target reads in place"));
         changed |= tri("inplace", &g_settings.inplace_reads, a78);
         ImGui::TextDisabled("%s", tr("On: decals and effects read the image they draw on as it is, the fastest way. Off: a copy "
                                   "of it each time, slower (fewer fps) but by the Vulkan rules. Automatic: on for Adreno 7xx "
-                                  "and 8xx GPUs, off for the others. Applies when the game starts."));
+                                  "and 8xx and Mali GPUs, off for the others. Applies when the game starts."));
         ImGui::Spacing();
         ImGui::Text("%s", tr("Turnip low-resolution Z (LRZ)"));
         changed |= tri("lrz", &g_settings.turnip_lrz, a8);
@@ -2232,7 +2234,7 @@ extern "C" void launcher_run(const char *root) {
             // the backend (manual mode, no gamepads of its own) clears HasGamepad every frame, and ImGui then drops the
             // controller presses launcher_pad_event fed in and turns gamepad navigation off: set it again while a
             // controller is connected
-            if (SDL_HasGamepad()) io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+            if (input_pad_present()) io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
             ImGui::NewFrame();
 
             ImVec2 ds = io.DisplaySize;

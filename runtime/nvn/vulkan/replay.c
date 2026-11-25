@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "replay.h"
+#include "vk_fpenv.h"
 #include "../../platform.h"
 #include "../../rt.h"
 
@@ -57,10 +58,12 @@ void rp_wait_space(uint64_t end) {
     uint64_t t0 = plat_now_ns();
     atomic_store_explicit(&rp_wpub, rp_w, memory_order_seq_cst);  // (all of it published, and the thread awake)
     rp_wake();
+    WdMark wm = vk_wd_enter(WD_RP_WAIT_SPACE, end);  // (freeze watchdog: a producer spinning on a stuck replay thread)
     for (unsigned i = 0; end - atomic_load_explicit(&rp_rpos, memory_order_acquire) > RP_WORDS; i++) {
         cpu_relax();
         if (i > 4096) sched_yield();
     }
+    vk_wd_leave(wm);
     st_space++, st_space_ns += plat_now_ns() - t0;
 }
 // The rest of the ring after idx is too short for the next packet: a WRAP word there, and the packet at the start
@@ -80,12 +83,14 @@ void vk_rp_drain_at(void *ra) {
     uint64_t t0 = plat_now_ns();
     st_backlog += w - atomic_load_explicit(&rp_rpos, memory_order_relaxed);
     // (up to w, not exactly w: a caller other than the producer may hold an older w while the ring moves on)
+    WdMark wm = vk_wd_enter(WD_RP_DRAIN, w);  // (freeze watchdog)
     for (unsigned i = 0; (int64_t)(atomic_load_explicit(&rp_rpos, memory_order_acquire) - w) < 0; i++) {
         cpu_relax();
         // (no sched_yield: the scheduler then ran a game thread on the render thread's core for a whole slice - the
         // render thread was off its core ~40% of the time, 2026-11-15)
         if (i > 2000000) sched_yield();
     }
+    vk_wd_leave(wm);
     uint64_t ns = plat_now_ns() - t0;
     st_drains++, st_drain_ns += ns;
     if (log_on) {
@@ -191,6 +196,14 @@ static inline void run(uint64_t *p, uint64_t h) {
         rp_real.vkCmdCopyImageToBuffer(cb, (VkImage)(uintptr_t)p[2], (VkImageLayout)v, (VkBuffer)(uintptr_t)p[3], 1, &c);
         break;
     }
+    case RP_VI: {  // (read in place: the producer's copy stays in the ring until this packet is done)
+        uint32_t nb = aux & 0xFF, na = aux >> 8;
+        const VkVertexInputBindingDescription2EXT *vb = (const VkVertexInputBindingDescription2EXT *)&p[2];
+        const VkVertexInputAttributeDescription2EXT *va =
+            (const VkVertexInputAttributeDescription2EXT *)&p[2 + nb * RP_VI_W(VkVertexInputBindingDescription2EXT)];
+        rp_real.vkCmdSetVertexInputEXT(cb, nb, nb ? vb : NULL, na, na ? va : NULL);
+        break;
+    }
     case RP_MEM_BARRIER: {
         VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = p[2], .srcAccessMask = p[3],
                                .dstStageMask = p[4], .dstAccessMask = p[5]};
@@ -206,6 +219,7 @@ static _Atomic int rp_tid;
 int vk_rp_tid(void) { return atomic_load_explicit(&rp_tid, memory_order_relaxed); }
 static void *rp_main(void *arg) {
     (void)arg;
+    vk_fp_thread("vk-replay");  // (made from a game thread: its FPCR - vk_fpenv.h)
     on_replay_thread = true;
     // as the render thread: its priority, and (exec.c) in the ADPF session - else the governor kept its core's clock low
     // and the render thread waited for it (~200 words queued, ~180 us a wait)
@@ -244,12 +258,14 @@ static void *rp_main(void *arg) {
                 atomic_store_explicit(&rp_sleeping, 1, memory_order_seq_cst);
                 w = atomic_load_explicit(&rp_wpub, memory_order_seq_cst);
                 if (w != r) { atomic_store_explicit(&rp_sleeping, 0, memory_order_relaxed); break; }
+                vk_wd_set(WD_RP_SLEEP, r);  // (freeze watchdog: idle, nothing published; the replay thread's own slot)
                 futex_wait(&rp_sleeping, 1);
                 atomic_fetch_add_explicit(&st_sleeps_atomic, 1, memory_order_relaxed);
                 t0 = 0;
             }
         }
         uint64_t tb = log_on ? plat_now_ns() : 0;
+        vk_wd_set(WD_RP_RUN, r);  // (once per batch, not per packet)
         for (unsigned k = 0; r != w;) {
             uint32_t idx = (uint32_t)r & (RP_WORDS - 1);
             uint64_t *p = &rp_ring[idx];
@@ -272,6 +288,7 @@ static void *rp_main(void *arg) {
             }
         }
         atomic_store_explicit(&rp_rpos, r, memory_order_release);
+        vk_wd_set(WD_NONE, 0);  // (the batch is done: spinning for the next is not a marked call)
         if (tb) atomic_fetch_add_explicit(&st_busy_atomic, plat_now_ns() - tb, memory_order_relaxed);
     }
     return NULL;
@@ -308,10 +325,10 @@ void vk_rp_frame(void) {
         {   // the replay thread's time by packet type
             static const char *nm[] = {"wrap", "u32", "face", "stencil op", "depth bias", "blend", "viewport", "scissor", "pipe",
                                        "sets", "ib", "vb", "draw", "draw idx", "push", "begin", "end", "barrier",
-                                       "dispatch", "copy i2b", "mem barrier"};
+                                       "dispatch", "copy i2b", "mem barrier", "vi"};
             char b[1024];
             int n = 0;
-            for (int k = 1; k < 21 && n < 900; k++)
+            for (int k = 1; k < 22 && n < 900; k++)
                 if (st_op_n[k]) n += snprintf(b + n, sizeof b - n, " %s %.0f/%.3fms/max%.0fus", nm[k], (double)st_op_n[k] / frames,
                                               st_op_ns[k] / 1e6 / frames, st_op_max[k] / 1e3);
             LOG("[replay]   per frame:%s\n", b);
@@ -372,6 +389,8 @@ SHIM(vkCmdSetStencilOp, (VkCommandBuffer cb, VkStencilFaceFlags a, VkStencilOp b
      (cb, a, b, c, d, e))
 SHIM(vkCmdSetPrimitiveRestartEnable, (VkCommandBuffer cb, VkBool32 a), (cb, a))
 SHIM(vkCmdSetDepthBiasEnable, (VkCommandBuffer cb, VkBool32 a), (cb, a))
+SHIM(vkCmdSetVertexInputEXT, (VkCommandBuffer cb, uint32_t a, const VkVertexInputBindingDescription2EXT *b, uint32_t c,
+                              const VkVertexInputAttributeDescription2EXT *d), (cb, a, b, c, d))
 SHIM(vkCmdClearAttachments, (VkCommandBuffer cb, uint32_t a, const VkClearAttachment *b, uint32_t c, const VkClearRect *d),
      (cb, a, b, c, d))
 SHIM(vkCmdBeginRendering, (VkCommandBuffer cb, const VkRenderingInfo *a), (cb, a))

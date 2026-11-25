@@ -1,13 +1,21 @@
 // Vulkan textures: NVN formats, images, change-detected uploads from guest memory, views and samplers
 // (counterpart of the texture half of metal.m and the view helpers of renderer.m).
 #include <SDL3/SDL_timer.h>
+#include <errno.h>
 #include <float.h>
 #include <math.h>
 #include <pthread.h>
+#include "vk_fpenv.h"
 #include <stdlib.h>
 #include <string.h>
 #ifdef __ANDROID__
 #include <sys/mman.h>
+#ifndef MADV_COLD  // (older NDK headers: Linux 5.4's advice values)
+#define MADV_COLD 20
+#endif
+#ifndef MADV_PAGEOUT
+#define MADV_PAGEOUT 21
+#endif
 #endif
 
 #include "vk.h"
@@ -221,7 +229,71 @@ static VkFormat bc_target(VkFormat bc, uint32_t *bpp) {
 static bool is_bc(VkFormat f) { return f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK; }
 
 // wb x hb blocks (bsize bytes each, rows of blocks) -> texels, rows of wb * 4 texels of bpp bytes
-static void bc_decode(VkFormat bc, const uint8_t *blocks, uint32_t wb, uint32_t hb, uint32_t bsize, uint8_t *out, uint32_t bpp) {
+static void bc_decode_rows(VkFormat bc, const uint8_t *blocks, uint32_t wb, uint32_t hb, uint32_t bsize, uint8_t *out, uint32_t bpp);
+// ---- BC decode in four parts at once (GPUs without BC: Mali, and the tests' LARECOMP_NO_BC): rows of blocks split
+// between three helper threads and the caller (the render thread), each writing its own rows of the output. The decode
+// ran on the render thread alone - on the Great Sky Island in the Mali simulation ~490 ms of its every 2 s went to the
+// texture uploads, most of it this (2026-11-21). Under BC_PAR_MIN blocks: in one piece. LARECOMP_BC_THREADS=0: one
+// piece always.
+#include <semaphore.h>
+enum { BC_PARTS = 4, BC_PAR_MIN = 1024 };
+static struct {
+    pthread_t th;
+    sem_t go;
+    VkFormat bc;
+    const uint8_t *blocks;
+    uint32_t wb, hb, bsize, bpp;
+    uint8_t *out;
+} bc_job[BC_PARTS - 1];
+static sem_t bc_done;
+static int bc_par = -1;
+static void *bc_worker(void *arg) {
+    int i = (int)(intptr_t)arg;
+    vk_fp_thread("vk-bcdec");
+    for (;;) {
+        sem_wait(&bc_job[i].go);
+        if (bc_job[i].bpp) bc_decode_rows(bc_job[i].bc, bc_job[i].blocks, bc_job[i].wb, bc_job[i].hb, bc_job[i].bsize, bc_job[i].out, bc_job[i].bpp);
+        else bc1_to_astc(bc_job[i].blocks, bc_job[i].out, (uint64_t)bc_job[i].wb * bc_job[i].hb);
+        sem_post(&bc_done);
+    }
+    return NULL;
+}
+// wb x hb blocks -> the decoded output (bpp bytes a texel; 0: BC1 -> ASTC 4x4 blocks, 16 bytes each), split by rows
+static void bc_decode_par(VkFormat bc, const uint8_t *blocks, uint32_t wb, uint32_t hb, uint32_t bsize, uint8_t *out, uint32_t bpp) {
+    if (bc_par < 0) {
+        const char *e = getenv("LARECOMP_BC_THREADS");
+        bc_par = !e || atoi(e) != 0;
+        if (bc_par) {
+            sem_init(&bc_done, 0, 0);
+            for (int i = 0; i < BC_PARTS - 1 && bc_par; i++) {
+                sem_init(&bc_job[i].go, 0, 0);
+                if (pthread_create(&bc_job[i].th, NULL, bc_worker, (void *)(intptr_t)i)) bc_par = 0;
+                else pthread_setname_np(bc_job[i].th, "bc decode");
+            }
+        }
+    }
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;  // (the helpers serve one caller at a time; another: alone)
+    uint64_t row_out = bpp ? (uint64_t)wb * 4 * bpp * 4 : (uint64_t)wb * 16;  // (one row of blocks, decoded)
+    if (!bc_par || (uint64_t)wb * hb < BC_PAR_MIN || hb < BC_PARTS || pthread_mutex_trylock(&mu)) {
+        if (bpp) bc_decode_rows(bc, blocks, wb, hb, bsize, out, bpp);
+        else bc1_to_astc(blocks, out, (uint64_t)wb * hb);
+        return;
+    }
+    uint32_t part = hb / BC_PARTS;
+    for (int i = 0; i < BC_PARTS - 1; i++) {
+        uint32_t y0 = part * (uint32_t)(i + 1), n = i == BC_PARTS - 2 ? hb - y0 : part;
+        bc_job[i].bc = bc, bc_job[i].wb = wb, bc_job[i].hb = n, bc_job[i].bsize = bsize, bc_job[i].bpp = bpp;
+        bc_job[i].blocks = blocks + (uint64_t)y0 * wb * bsize;
+        bc_job[i].out = out + (uint64_t)y0 * row_out;
+        sem_post(&bc_job[i].go);
+    }
+    if (bpp) bc_decode_rows(bc, blocks, wb, part, bsize, out, bpp);
+    else bc1_to_astc(blocks, out, (uint64_t)wb * part);
+    for (int i = 0; i < BC_PARTS - 1; i++) sem_wait(&bc_done);
+    pthread_mutex_unlock(&mu);
+}
+
+static void bc_decode_rows(VkFormat bc, const uint8_t *blocks, uint32_t wb, uint32_t hb, uint32_t bsize, uint8_t *out, uint32_t bpp) {
     int pitch = (int)(wb * 4 * bpp);
     for (uint32_t y = 0; y < hb; y++)
         for (uint32_t x = 0; x < wb; x++) {
@@ -684,8 +756,7 @@ static uint64_t bc_upload_blocks(VkCommandBuffer cb, TexBackend *b, const uint8_
     uint64_t out_size = bpp ? (uint64_t)wb * 4 * hb * 4 * bpp : (uint64_t)wb * hb * 16;
     VkSpan s = vk_transient(out_size, 16);
     uint64_t decode_start = decode_ns ? SDL_GetTicksNS() : 0;
-    if (bpp) bc_decode(b->bc_vf, blocks, wb, hb, bsize, s.ptr, bpp);
-    else bc1_to_astc(blocks, s.ptr, (uint64_t)wb * hb);
+    bc_decode_par(b->bc_vf, blocks, wb, hb, bsize, s.ptr, bpp);  // (bpp 0: BC1 -> ASTC 4x4)
     if (decode_ns) *decode_ns = SDL_GetTicksNS() - decode_start;
     uint32_t iw = level_w(b, lv), ih = level_h(b, lv);
     VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = wb * 4, .bufferImageHeight = hb * 4,
@@ -843,27 +914,29 @@ static bool tex_periodic(void) {
     return on;
 }
 
-// Low RAM (exec.c vk_low_ram; LARECOMP_TEX_DISCARD=1 / 0): a sampled texture's guest bytes go back to the OS once
-// uploaded (MADV_DONTNEED: zero pages there from then on) - the guest copy of every texture otherwise sat in RAM or
-// swap next to its image. On a Galaxy Tab A9+ (3.4 GB) ~190 MB, and the game's memory stopped being read back from
-// swap ~5000 times a second: ~14.5 fps after 9 minutes instead of ~10 (2026-11-13). Only where the page write
-// tracking watches it, so a CPU write (new contents) is still seen; a texture first uploaded over such bytes is
-// logged ("[discard]": it would read zeros).
-static bool tex_discard(void) {
+// Low RAM (exec.c vk_low_ram: the automatic 4 GB mode, or Video > "RAM saving" On; LARECOMP_TEX_DISCARD=1 / 0 / 2): a
+// sampled texture's guest bytes go back to the OS once uploaded - the guest copy of every texture otherwise sat in RAM
+// next to its image. On a Galaxy Tab A9+ (3.4 GB) ~190 MB, and ~14.5 fps after 9 minutes instead of ~10 (2026-11-13).
+// Only where the page write tracking watches it, so a CPU write (new contents) is still seen.
+// Given back with MADV_PAGEOUT (from BOTWRecomp dec8130): the pages go to swap (zram) with their contents kept.
+// MADV_DONTNEED (LARECOMP_TEX_DISCARD=2: as before) left zero pages, and TOTK makes new textures over the memory of
+// others it still has - mip views, streamed pools - uploaded from those zeros, ASTC's error colour: magenta squares over
+// the Sky Islands with RAM saving on (#57, Mali-G615 MC2; "[discard] ... first uploaded over the discarded" ~100 times
+// a run, also in #50 #54). That is why it was off from 0.3.1 until the contents were kept. Kernels without
+// MADV_PAGEOUT (before Linux 5.4): MADV_COLD, the same contents kept, reclaimed first under pressure.
+static int tex_discard_mode(void) {  // 0 off, 1 contents kept (pageout / cold), 2 zero pages (DONTNEED)
     static int on = -1;
     if (on < 0) {
         extern bool vk_low_ram(void);
-        // Off unless asked since 0.3.1 (BOTW's, on with low RAM): TOTK makes new textures over the memory of others it
-        // still has - mip views, streamed pools - and those were first uploaded from the zeros left there, ASTC's error
-        // colour: magenta squares over the Sky Islands with RAM saving on (#57, Mali-G615 MC2; "[discard] ... first
-        // uploaded over the discarded" ~100 times a run, also in #50 #54).
         const char *e = getenv("LARECOMP_TEX_DISCARD");
-        on = e ? atoi(e) != 0 : false;
-        (void)vk_low_ram;
-        if (on) LOG("[vk] textures: guest bytes given back after upload (low RAM)\n");
+        on = e ? atoi(e) : vk_low_ram() ? 1 : 0;
+        if (on < 0 || on > 2) on = 1;
+        LOG("[vk] textures: guest bytes %s\n", on == 2 ? "given back after upload (zero pages, LARECOMP_TEX_DISCARD=2)"
+                                               : on ? "given back after upload (to swap, contents kept)" : "kept (no discard)");
     }
     return on;
 }
+static bool tex_discard(void) { return tex_discard_mode() != 0; }
 static uint64_t tex_discarded_bytes;
 static int tex_alias_logs;
 
@@ -1053,6 +1126,7 @@ static sem_t hash_done;
 static int hash_par = -1;
 static void *hash_worker(void *arg) {
     int i = (int)(intptr_t)arg;
+    vk_fp_thread("vk-hash");
     for (;;) {
         sem_wait(&hash_job[i].go);
         hash_job[i].h = tex_hash_full(hash_job[i].p, hash_job[i].n);
@@ -1113,6 +1187,7 @@ static int tcheck_started;
 uint64_t prof_tex_helper_jobs, prof_tex_helper_hits;  // (LARECOMP_VK_PROF-style counters: queued, found differing)
 static void *tcheck_main(void *arg) {
     (void)arg;
+    vk_fp_thread("vk-tcheck");
     pthread_mutex_lock(&tcheck_lock);
     for (;;) {
         while (tcheck_head == tcheck_tail) pthread_cond_wait(&tcheck_more, &tcheck_lock);
@@ -1240,7 +1315,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
         if (ch >= 0) {
             tracked = true;
             b->wgen = now;
-            if (ch && b->discarded) {  // (written after its bytes were given back: the rest of it reads zeros now)
+            if (ch && b->discarded && tex_discard_mode() == 2) {  // (written after its bytes were zeroed: the rest of it reads zeros now)
                 static int n;
                 if (n++ < 60)
                     LOG("[discard] frame %llu: written after discard: %ux%ux%u fmt %#x levels %u layers %u flags %#x target %u at %llx+%llx\n",
@@ -1324,7 +1399,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     }
     if (b->discarded && h == b->disc_hash && !restyle) return;  // (its zero pages, as discarded: nothing new)
     if (b->uploaded && h == b->data_hash && !restyle) { prof_tex_same_bytes += total; return; }
-    if (!b->uploaded && tex_discard() && tex_alias_logs < 40) {  // (a new texture over discarded bytes: it reads zeros)
+    if (!b->uploaded && tex_discard_mode() == 2 && tex_alias_logs < 40) {  // (a new texture over discarded bytes: it reads zeros)
         for (int i = 0; i < g_nlive; i++) {
             NvnTexture *e = g_live[i];
             TexBackend *eb = e ? e->backend : NULL;
@@ -1359,10 +1434,12 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     {   // LARECOMP_LOG_STALE_UPLOAD=1 (diagnosis): an upload from guest memory that a render target the GPU drew into
         // covers - its object's own image, where the drawing never reaches memory: the texture reads what was there
         // before (MacNativeGames PR #511: BOTW's terrain height map, drawn through one object and sampled through
-        // another, kept zeros - Link's feet under the ground). Each pair once, 60 at most.
-        static int on = -1, n;
-        if (on < 0) on = getenv("LARECOMP_LOG_STALE_UPLOAD") != NULL;
-        for (int i = 0; on && n < 60 && i < g_nlive; i++) {
+        // another, kept zeros - Link's feet under the ground). Each pair once, 60 at most. =<frame> (above 1): from that
+        // frame on (the weapon wheel's icons, #76, come long after the terrain's height maps fill the 60)
+        static long on = -1;
+        static int n;
+        if (on < 0) on = getenv("LARECOMP_LOG_STALE_UPLOAD") ? atol(getenv("LARECOMP_LOG_STALE_UPLOAD")) : 0;
+        for (int i = 0; on && (long)frame >= on && n < 60 && i < g_nlive; i++) {
             NvnTexture *e = g_live[i];
             if (e == t || !e->addr || !e->backend || !((TexBackend *)e->backend)->gpu_owned) continue;
             uint64_t ee = e->addr + tegra_total_size(&e->layout);
@@ -1514,12 +1591,16 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (tex_discard() && tracked && !b->dynamic && !linear && b->rs_group == RS_NONE && !b->gpu_owned && !b->scalable &&
         b->tp <= 0 && total >= (64u << 10)) {
         uint64_t lo = (t->addr + 0xFFF) & ~0xFFFull, hi = (t->addr + total) & ~0xFFFull;
-        extern bool plat_discard_pages(uint64_t addr, uint64_t size);  // (platform/android.c: zero pages, or a hole)
-        if (hi > lo && plat_discard_pages(lo, hi - lo)) {
+        bool zero = tex_discard_mode() == 2;  // (LARECOMP_TEX_DISCARD=2: the pages read as zeros after)
+        extern bool plat_discard_pages(uint64_t addr, uint64_t size, bool zero);  // (platform/android.c)
+        if (hi > lo && plat_discard_pages(lo, hi - lo, zero)) {
             if (!b->discarded) tex_discarded_bytes += hi - lo;
             b->discarded = true;
-            b->disc_hash = hash_full(mem, total);
-            b->sample_hash = fnv_sample(mem, total);
+            if (zero) {
+                b->disc_hash = hash_full(mem, total);
+                b->sample_hash = fnv_sample(mem, total);
+            } else
+                b->disc_hash = h;  // (the contents stay: reading them now would only bring the pages straight back)
         }
     }
 #endif
@@ -1638,6 +1719,102 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
 
 void renderer_mark_gpu_owned(NvnTexture *t) { tex_backend(t)->gpu_owned = true; }
 bool renderer_is_gpu_owned(NvnTexture *t) { return tex_backend(t)->gpu_owned; }
+
+// ReadTexels of a texture the GPU drew in (from totk-android's read_texels, MIT; the code is ours): its contents live in
+// the Vulkan image, and the guest's memory holds only what the CPU put there (or the small targets' write-backs) - so
+// objects.c texels_region read stale texels. Here the region is copied image -> readback buffer and waited for, the
+// texels in the layout the guest expects (the inverse of upload_texels_written's "plain" case: the image format is
+// NVN's own, 1x1 blocks, one level / layer slice at a time). "": not a GPU-drawn texture (the caller reads memory, as
+// before); another string: why this one can't be read back (logged once each, memory is read then).
+// LARECOMP_READTEXELS_GPU=0: off.
+static const char *readtex_gpu_check(NvnTexture *t, TexBackend *b, uint32_t level, uint32_t first, uint32_t n, uint32_t x0,
+                                     uint32_t y0, uint32_t wb, uint32_t hb, uint64_t row) {
+    if (!b || !b->image || !b->gpu_owned) return "";
+    const FormatInfo *fi = t->layout.fmt;
+    if (!fi || !fi->bpb || fi->bw != 1 || fi->bh != 1 || fi->bpb == 3) return "format with blocks or 3-byte texels";
+    if (b->pending_rgba || b->cw) return "CPU texels waiting to go up (memory is newer)";
+    if (b->astc_bw || b->format != fmt_of(t->format).vf) return "image decoded / in another format than NVN's";
+#ifdef __ANDROID__
+    if (b->bc_vf) return "BC decoded on the GPU";
+#endif
+    if ((t->flags & 0x50) || b->depth != 1 || t->depth > 1) return "linear or 3D texture";
+    if (b->samples > 1 || b->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return "multisampled, depth or stencil";
+    if (b->width != t->width || b->height != t->height) return "scaled image";
+    if (level < b->skip || level - b->skip >= b->levels) return "level not in the image";
+    uint32_t il = level - b->skip;
+    if (first + n > (b->layers ? b->layers : 1)) return "layer past the image's";
+    if (x0 + wb > level_w(b, il) || y0 + hb > level_h(b, il)) return "region past the level";
+    if (row < (uint64_t)wb * fi->bpb) return "row stride below the row's bytes";
+    if ((uint64_t)wb * hb * fi->bpb * n > (32u << 20)) return "region over 32 MB";
+    return NULL;
+}
+
+bool vk_texture_read_texels(NvnTexture *t, uint32_t level, uint32_t first_layer, uint32_t nlayers, uint32_t x0, uint32_t y0,
+                            uint32_t wb, uint32_t hb, uint8_t *dst, uint64_t row, uint64_t img) {
+    static int on = -1;
+    if (on < 0) on = !getenv("LARECOMP_READTEXELS_GPU") || atoi(getenv("LARECOMP_READTEXELS_GPU"));
+    if (!on || !t || !t->layout.fmt) return false;
+#ifdef __ANDROID__
+    extern bool vk_async_on(void);
+    extern void vk_async_drain(void);
+    extern void kernel_blocking_begin(void), kernel_blocking_end(void);
+#endif
+    const char *why = readtex_gpu_check(t, t->backend, level, first_layer, nlayers, x0, y0, wb, hb, row);
+    if (why && !*why) return false;
+    if (!why) {
+#ifdef __ANDROID__
+        // (the render thread idle, as every other use of the renderer from a game thread - vulkan/async.c: its draws
+        // translated and submitted, nothing recording while this runs)
+        if (vk_async_on()) vk_async_drain();
+#endif
+        why = readtex_gpu_check(t, t->backend, level, first_layer, nlayers, x0, y0, wb, hb, row);
+        if (why && !*why) return false;
+    }
+    if (why) {
+        static const char *reasons[32];
+        uint32_t i = 0;
+        while (i < 32 && reasons[i] && reasons[i] != why) i++;
+        if (i < 32 && !reasons[i]) {
+            reasons[i] = why;
+            LOG("[tex] ReadTexels of a GPU-drawn %ux%u fmt %#x from memory: %s\n", t->width, t->height, t->format, why);
+        }
+        return false;
+    }
+    TexBackend *b = t->backend;
+    uint32_t bpb = t->layout.fmt->bpb, il = level - b->skip;
+    uint64_t one = (uint64_t)wb * hb * bpb, total = one * nlayers;
+    vk_end_pass();
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkSpan out = vk_readback(total);
+    for (uint32_t k = 0; k < nlayers; k++) {
+        VkBufferImageCopy c = {.bufferOffset = out.off + one * k, .bufferRowLength = wb, .bufferImageHeight = hb,
+                               .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, il, first_layer + k, 1},
+                               .imageOffset = {(int32_t)x0, (int32_t)y0, 0}, .imageExtent = {wb, hb, 1}};
+        vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
+    }
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                           .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                           .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+#ifdef __ANDROID__
+    kernel_blocking_begin();  // (a wait for the GPU: core 0 to the game's other threads, kernel.c)
+#endif
+    renderer_flush();  // (what is recorded goes up, and the copy is waited for)
+#ifdef __ANDROID__
+    kernel_blocking_end();
+#endif
+    vk_readback_ready(total);
+    for (uint32_t k = 0; k < nlayers; k++)
+        for (uint32_t y = 0; y < hb; y++)
+            memcpy(dst + k * img + (uint64_t)y * row, (const uint8_t *)out.ptr + one * k + (uint64_t)y * wb * bpb, (uint64_t)wb * bpb);
+    static int nlog;
+    if (nlog++ < 8)
+        LOG("[tex] ReadTexels of a GPU-drawn %ux%u fmt %#x level %u: %ux%u x %u read back from the image\n", t->width, t->height,
+            t->format, level, wb, hb, nlayers);
+    return true;
+}
 
 bool renderer_texture_scalable(NvnTexture *t) { return tex_backend(t)->scalable; }
 uint8_t vk_texture_scale_group(NvnTexture *t) { return tex_backend(t)->rs_group; }

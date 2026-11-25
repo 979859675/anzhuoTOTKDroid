@@ -6,7 +6,7 @@ enum { OVERLAY_FPS = 1, OVERLAY_THROTTLE = 2, OVERLAY_GPU = 4, OVERLAY_CPU = 8, 
 #include <stdbool.h>
 
 enum { FG_OFF = 0, FG_WINFG = 1, FG_LSFG = 2 };  // (Settings.fg_engine: Win-FG is built in, LSFG needs Lossless.dll)
-enum { ASPECT_UNLOCKED = 0, ASPECT_ORIGINAL = 1 };
+enum { ASPECT_UNLOCKED = 0, ASPECT_ORIGINAL = 1, ASPECT_STRETCH = 2 };
 enum { RES_MATCH = 0, /* 1..8 = 1x..8x */ RES_DYNAMIC = 9, RES_Q75 = 10, RES_Q25 = 11, RES_Q50 = 12 };
 // (11 was 67% of the display: larecomp.ini "67%" now loads as RES_Q75)
 enum { OUT_AUTO = -1 };  // (Settings.out_lines)
@@ -26,7 +26,8 @@ extern const char *const g_language_codes[N_LANGUAGES];  // what the game is tol
 extern const char *const g_language_names[N_LANGUAGES];  // for the menu ("Auto", "Japanese", ..., "Spanish")
 
 typedef struct {
-    int aspect;          // ASPECT_*: unlocked = fill the window (wider/taller views), original = 16:9 with bars
+    int aspect;          // ASPECT_*: unlocked = fill the window (wider/taller views), original = 16:9 with bars,
+                         // stretch = the 16:9 image stretched to the window (#59: 4:3 screens)
     bool fullscreen;
     int res_mode;        // RES_MATCH, 1..4 (N x the Switch's 1080p), RES_DYNAMIC, RES_Q75/50/25 (share of the display)
     int upscaler;        // UPSCALE_*: how a lower internal resolution reaches the window (MetalFX: macOS, FSR 1: Windows)
@@ -47,7 +48,11 @@ typedef struct {
     int shadow_scale;     // the sun's shadow maps made this many times larger on each side, 1..4 (0: 1); 960 at 1x, 3840 at 4x
                           // (vulkan/textures.c shadow_map_scale)
     bool game_fxaa;       // the game's own FXAA pass (native.c fix_game_fxaa)
+    bool shadows;         // the game's shadows drawn (off: the depth-only passes outside the 3D scene's targets skipped -
+                          // a flatter picture, a little less GPU work; vulkan/exec.c)
     int far_clip;         // the render far plane capped at this many metres, 0: the game's (native.c fix_far_clamp)
+    int shadow_cascades;  // the sun's shadow cascades capped at 1..3, 0: the game's (4; native.c fix_shadow_cascades)
+    int point_shadows;    // the point light shadows' pool capped at this many (1..64), 0: the game's (native.c fix_point_shadows)
     int motion_source;    // whose: 0 automatic (a controller's once its gyroscope is alive), 1 the phone's, 2 a controller's
     bool motion_flat;     // the phone's sensors as the Switch's screen in handheld mode, not a flat controller (hle/motion.c)
 #ifdef __ANDROID__
@@ -56,7 +61,9 @@ typedef struct {
     int overlay_scale, overlay_opacity;  // its size and opacity, % (40..150, 20..100): Swap2-Native's
     int overlay_items;    // OVERLAY_* bits: what it shows (all by default)
     float overlay_pos[2]; // its top left, a share of the screen, dragged there with a finger (negative: the corner)
-    int fps_mode;         // 0 Auto, 1 30 fps, 2 60 fps, 3 20 fps, 4 40/45 fps (display dependent)
+    int fps_mode;         // 0 Auto, 1 30 fps, 2 60 fps, 3 20 fps, 4 40/45 fps (display dependent), 5 unlocked (TOTK on
+                          // Android: up to the screen's fastest refresh, at most 120 - nvn/objects.c, vulkan/device.c)
+    bool fps60_hysteresis;  // the game's frame controller drops to 30 after 7 late frames, not 3 (native.c fix_hyst_*): off
     bool shader_int32;    // shader address math in 32-bit words even where the driver offers 64-bit (vulkan/exec.c)
     bool files_in_place;  // Android: a setup reads the picked romfs/ where it is, no copy (services/fs.c); off by default
     bool native_code;     // Android: the game's own code on the CPU, no build of it (runtime/native.c); off by default
@@ -72,8 +79,8 @@ typedef struct {
     int gpu_heap;         // Turnip: the game's memory mapped as GPU memory (vulkan/exec.c vk_heap_place); off: CPU copies
     bool heap_file;       // the game's memory as GPU memory through an exported file mapped at its address, where the driver
                           // can't place it (Mali, Xclipse; experimental): vulkan/exec.c vk_heap_place, at the game's start
-    int inplace_reads;    // Turnip: draws sample targets they write as they are (vulkan/exec.c resolve_feedback); off: copies
-                          // (Automatic: Adreno 7xx too - vulkan/device.c vk_inplace_reads_on, #48)
+    int inplace_reads;    // Turnip, Mali: draws sample targets they write as they are (vulkan/exec.c resolve_feedback); off: copies
+                          // (Automatic: Adreno 7xx too, #48, and Mali, #73 - vulkan/device.c vk_inplace_auto)
     int turnip_lrz;       // Turnip's low-resolution Z; off: TU_DEBUG=nolrz before the driver loads (vulkan/device.c)
     bool log_file;        // the log in a file as well (platform/android.c), to send with a report
     char gpu_model[64];   // the GPU of the last start ("Adreno (TM) 830v1"): turnip_lrz's Automatic, before the driver

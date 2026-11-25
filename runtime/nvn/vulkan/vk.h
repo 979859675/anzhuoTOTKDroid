@@ -24,6 +24,7 @@
 #include "../maxwell/shader.h"
 
 void vk_device_fault_report(void);
+#include "watchdog.h"
 #ifdef __ANDROID__
 void vk_android_load(void);  // android_driver.c: the Vulkan driver (adrenotools / system) into volk
 const char *vk_driver_rejected(void);  // (the chosen driver package the system's stood in for; "" none)
@@ -59,6 +60,8 @@ typedef struct {
                                   // 2's) baked into pipelines (exec.c PipeKey.fx)
     bool eds2;                    // extended dynamic state 2 in use; without it, depth bias and primitive restart are
                                   // pipeline state (exec.c PipeKey.prim_restart)
+    bool dyn_vi;                  // VK_EXT_vertex_input_dynamic_state in use: vertex attributes / bindings set per draw, not in
+                                  // the pipeline (dyn_vi.h; from BOTWRecomp 8146cfa)
 #ifdef __ANDROID__
     bool mem_dmabuf;              // external memory may be exported as DMA-BUF instead of OPAQUE_FD
     bool mem_ahb;                 // Android hardware buffers may be imported (the heap from gralloc: exec.c heap_ahb_place)

@@ -295,7 +295,7 @@ void menu_apply_window_requests(void *win) {
 #ifdef __ANDROID__
     // With a controller, the in-app keyboard only: Android's own keyboard would open over it, and while it is up it
     // takes the controller's stick and d-pad (after naming Link the stick no longer moved him; buttons still worked)
-    if (want_text && SDL_HasGamepad()) want_text = false;
+    if (want_text && input_pad_present()) want_text = false;
     // ... and otherwise only while a text field is being typed in, without the in-app keyboard (the name entry has
     // it): with the menu merely open, Android's keyboard came up over it every time
     extern bool osk_is_open(void);
@@ -543,10 +543,11 @@ static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
     opt_begin("##video", scale);
     opt_section("Display");
-    const char *aspects[] = {"Unlocked", "Original 16:9"};
-    opt_choice("Aspect ratio", &g_settings.aspect, aspects, 2, ASPECT_UNLOCKED,
-               "Unlocked: the view will fill wider screens once the game's cameras are widened - not done yet for this "
-               "game, so it stays 16:9 with bars for now. Original 16:9: the game's own framing, with bars.");
+    const char *aspects[] = {"Unlocked", "Original 16:9", "Stretched"};
+    opt_choice("Aspect ratio", &g_settings.aspect, aspects, 3, ASPECT_UNLOCKED,
+               "Unlocked: on screens wider than 16:9 the view widens to fill them. Original 16:9: the game's own "
+               "framing, with bars. Stretched: the 16:9 image stretched to fill the screen, for 4:3 and other narrower "
+               "screens. Applies when the game starts again.");
 #ifndef __ANDROID__  // (Android: always the whole screen)
     bool fs = g_settings.fullscreen;
     if (opt_toggle("Fullscreen", &fs, false, "Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.")) {
@@ -600,18 +601,28 @@ static void tab_display(void) {
         int version = g_game_version ? g_game_version : 143;
         bool sixty = version == 182 || version == 143;
         if (!sixty && g_settings.fps_mode > 1) g_settings.fps_mode = 1;
+        if (version != 143 && g_settings.fps_mode == 5) g_settings.fps_mode = 2;  // (Unlocked: TOTK only)
         static const char *fr[] = {"Auto (20 / 30)", "30 fps"};
-        static const char *fr60[] = {"Auto (30 / 60)", "30 fps", "60 fps", "20 fps", "40 / 45 fps"};
-        opt_choice("Frame rate", &g_settings.fps_mode, sixty ? fr60 : fr, sixty ? 5 : 2, 1,
+        static const char *fr60[] = {"Auto (30 / 60)", "30 fps", "60 fps", "20 fps", "40 / 45 fps", "Unlocked (up to 120 fps)"};
+        opt_choice("Frame rate", &g_settings.fps_mode, sixty ? fr60 : fr, sixty ? (version == 143 ? 6 : 5) : 2, 1,
                    sixty ? "Auto: 60 fps where your device keeps up, 30 where it doesn't (the game's clock stays right "
                            "either way). 30 fps: steady and cooler - the phone heats less. 60 fps: always aims for 60."
                          : "Auto: the game's own pacing, as on the Switch. 30 fps: never more than 30 frames a "
                            "second.");
+        // (the game's own 60 / 30 pick, where it decides - Auto, 60, 40 / 45: native.c fix_hyst_*, totk-android's)
+        if (sixty && g_settings.fps_mode != 1 && g_settings.fps_mode != 3)
+            opt_toggle("Hold 60 fps through short dips", &g_settings.fps60_hysteresis, false,
+                       "The game drops from 60 to 30 fps after 3 late frames in a row. On: only after 7 in a row, and it "
+                       "tries 60 again sooner, so short dips stay at 60. It measured worse on some devices: try it and keep "
+                       "it if the game feels smoother.");
     }
 #endif
 
 #ifdef __ANDROID__
     if (g_settings.fps_mode == 4) ImGui::TextWrapped("%s", tr("40 fps on a 120 Hz display, 45 on 90 Hz, 30 on 60 Hz."));
+    if (g_settings.fps_mode == 5)
+        ImGui::TextWrapped("%s", tr("As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock "
+                                    "stays right. Cutscenes stay at 30. The phone works harder and heats more."));
     {   // Frame generation (nvn/vulkan/framegen.c): Win-FG (built in) or LSFG (the player's own Lossless.dll). The row
         // opens the list of the three: a tap on the row no longer steps through them (a quick second tap picked LSFG
         // and turned the generation off)
@@ -681,9 +692,9 @@ static void tab_display(void) {
     // display order -> RES_* (the ini / enum order predates the menu order)
     // (up to 4x: 7680 x 4320, 8K - more only ran out of GPU memory, and sat next to 75% in the list)
     // (Match display in the middle: left from it 75% / 50% / 25%, right Dynamic then 1x-4x; user 2026-10-11)
-#ifdef __ANDROID__  // (up to 8x: 5x-8x need a lot of GPU memory, most phones will run out)
-    static const char *res[] = {"25%", "50%", "75%", "Match display", "Dynamic", "1x", "2x", "3x", "4x", "5x", "6x", "7x", "8x"};
-    static const int res_mode[] = {RES_Q25, RES_Q50, RES_Q75, RES_MATCH, RES_DYNAMIC, 1, 2, 3, 4, 5, 6, 7, 8};
+#ifdef __ANDROID__  // (3x / 4x: 4K / 8K, beyond a phone)
+    static const char *res[] = {"25%", "50%", "75%", "Match display", "Dynamic", "1x", "2x"};
+    static const int res_mode[] = {RES_Q25, RES_Q50, RES_Q75, RES_MATCH, RES_DYNAMIC, 1, 2};
 #else
     static const char *res[] = {"25%", "50%", "75%", "Match display", "Dynamic", "1x", "2x", "3x", "4x"};
     static const int res_mode[] = {RES_Q25, RES_Q50, RES_Q75, RES_MATCH, RES_DYNAMIC, 1, 2, 3, 4};
@@ -767,23 +778,24 @@ static void tab_display(void) {
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. FXAA: a single, cheaper pass that also softens the image "
                "a little. Most useful at a lower internal resolution.");
-    {   // The sun's shadow maps made larger (vulkan/textures.c shadow_scale): 960 px at 1x, 3840 at 4x. Applies at the next start.
-        static const char *sizes[] = {"1x (960)", "2x (1920)", "3x (2880)", "4x (3840)"};
-        int ss = g_settings.shadow_scale < 1 ? 0 : g_settings.shadow_scale > 4 ? 3 : g_settings.shadow_scale - 1;
-        if (opt_choice("Shadow map size", &ss, sizes, 4, 0,
-                       "The sun's shadow maps drawn larger, for sharper shadows. Each step adds GPU memory: 4x takes a few "
-                       "hundred MB more. Experimental: at 2x and up the shadow edges may show extra copies, which "
-                       "are not fixed yet. Applies the next time the game starts.", false))
-            g_settings.shadow_scale = ss + 1;
+    {   // The sun's shadow maps: smaller (the game's own size, or the Lower steps: native.c fix_shadow_size) or larger
+        // (vulkan/textures.c shadow_scale: 960 px at 1x, 3840 at 4x). One control for both. Applies at the next start.
+        static const char *sizes[] = {"Lowest (256 px)", "Lower (288 px)", "1x (960 px)", "2x (1920 px)", "3x (2880 px)", "4x (3840 px)"};
+        int sc = g_settings.shadow_scale < 1 ? 1 : g_settings.shadow_scale > 4 ? 4 : g_settings.shadow_scale;
+        int ss = g_settings.shadow_res == 256 ? 0 : g_settings.shadow_res == 288 ? 1 : sc + 1;
+        if (opt_choice("Shadow map size", &ss, sizes, 6, 2,
+                       "The sun's shadow maps: smaller for a weaker GPU (softer, blockier shadows), or larger for sharper "
+                       "shadows. Each step up adds GPU memory: 4x takes a few hundred MB more. Experimental: at 2x and up the "
+                       "shadow edges may show extra copies, which are not fixed yet. Applies the next time the game starts.", false)) {
+            g_settings.shadow_res = ss == 0 ? 256 : ss == 1 ? 288 : 0;
+            g_settings.shadow_scale = ss >= 2 ? ss - 1 : 1;
+        }
     }
     {   // The game's own rendering costs (runtime/native.c: shadow map size, its FXAA, the far plane). They apply at once.
-        static const char *shadows[] = {"Game", "Lower", "Lowest"};
-        static const int shadow_px[] = {0, 288, 256};
-        int si = g_settings.shadow_res == 288 ? 1 : g_settings.shadow_res == 256 ? 2 : 0;
-        if (opt_choice("Shadow quality", &si, shadows, 3, 0,
-                       "The size of the sun's shadow maps. Lower ones cost the GPU less, with softer, blockier shadows. "
-                       "It may help a weaker GPU; on a Snapdragon 8 Elite it made no difference.", false))
-            g_settings.shadow_res = shadow_px[si];
+        opt_toggle("Shadows", &g_settings.shadows, true,
+                   "The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is "
+                   "flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. "
+                   "Applies at once.");
         opt_toggle("Game's anti-aliasing", &g_settings.game_fxaa, true,
                    "The game's own FXAA pass, apart from the Anti-aliasing above. Off saves a little GPU time; edges and "
                    "grass shimmer more.");
@@ -794,6 +806,24 @@ static void tab_display(void) {
                        "How far the camera draws; the game's goes to 25 km. Shorter can cut the farthest scenery from view. "
                        "The world, its objects and their behavior are not changed, only what is drawn.", false))
             g_settings.far_clip = dist_m[di];
+        // The shadow passes the drawing thread records (native.c fix_shadow_cascades / fix_point_shadows): off by default, no
+        // measurement of their cost in looks or in frames yet (totk-android's patches)
+        static const char *casc[] = {"Game", "3", "2", "1"};
+        static const int casc_n[] = {0, 3, 2, 1};
+        int ci = g_settings.shadow_cascades == 3 ? 1 : g_settings.shadow_cascades == 2 ? 2 : g_settings.shadow_cascades == 1 ? 3 : 0;
+        if (opt_choice("Sun shadow cascades", &ci, casc, 4, 0,
+                       "The sun's shadow is drawn in 4 cascades, each a ring of the world around you at its own sharpness. Fewer "
+                       "cascades are fewer shadow draws for the CPU, but the shadow reaches less far and the farther ground "
+                       "goes unshadowed. It can help where the CPU is the limit.", false))
+            g_settings.shadow_cascades = casc_n[ci];
+        static const char *pts[] = {"Game", "4", "2", "1"};
+        static const int pts_n[] = {0, 4, 2, 1};
+        int pi = g_settings.point_shadows == 4 ? 1 : g_settings.point_shadows == 2 ? 2 : g_settings.point_shadows == 1 ? 3 : 0;
+        if (opt_choice("Point light shadows", &pi, pts, 4, 0,
+                       "How many torches, lamps and fires at once cast a shadow; the game's own number is the limit, this only "
+                       "lowers it. Fewer are fewer shadow draws for the CPU, and lights past the limit cast none. Applies the "
+                       "next time the game sets up its lights: restart TOTKDroid.", false))
+            g_settings.point_shadows = pts_n[pi];
     }
 #ifdef __ANDROID__
     opt_toggle("Sync lag", &g_settings.sync_lag, true,

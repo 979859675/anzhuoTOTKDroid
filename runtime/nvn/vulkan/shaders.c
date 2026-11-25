@@ -7,6 +7,7 @@
 
 #include "shaders.h"
 #include "shader_cache.h"
+#include "vk_fpenv.h"
 
 void vk_shaders_init(void) {  // (compilers are per thread: check shaderc works at all)
     shaderc_compiler_t c = shaderc_compiler_initialize();
@@ -49,6 +50,12 @@ static uint32_t *cache_load(uint64_t h, size_t *nwords) {
 
 static pthread_once_t cache_dirs_once = PTHREAD_ONCE_INIT;
 static void cache_dirs_init(void) { mkdir("cache", 0755); mkdir("cache/spirv", 0755); }
+void vk_shader_cache_ensure_dirs(void) { pthread_once(&cache_dirs_once, cache_dirs_init); }  // (from BOTWRecomp b4e80e7: .smeta files)
+// (from BOTWRecomp b4e80e7) a cached module by its hash (what a .smeta file names), NULL if there is none or it is malformed
+uint32_t *vk_spirv_load_cached(uint64_t h, size_t *nwords) {
+    if (getenv("LARECOMP_VK_NO_SPIRV_CACHE") != NULL) return NULL;
+    return cache_load(h, nwords);
+}
 static void cache_store(uint64_t h, const uint32_t *spv, size_t nwords) {
     pthread_once(&cache_dirs_once, cache_dirs_init);
     char path[64], tmp[80];
@@ -135,7 +142,8 @@ static void strip_names(uint32_t *spv, size_t *nwords) {
     *nwords = o;
 }
 
-uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
+// out_hash (optional): the cache key the module has (or would have) on disk (from BOTWRecomp b4e80e7)
+uint32_t *vk_glsl_to_spirv_ex(const char *src, int stage, const char *name, size_t *nwords, uint64_t *out_hash) {
     bool optimized = getenv("LARECOMP_VK_OPT") != NULL;
 #ifdef __ANDROID__
     uint64_t h = vk_shader_source_hash(src, stage, optimized);
@@ -144,6 +152,7 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
 #else
     uint64_t h = src_hash(src, stage);
 #endif
+    if (out_hash) *out_hash = h;
     bool nocache = getenv("LARECOMP_VK_NO_SPIRV_CACHE") != NULL;
     uint32_t *out = nocache ? NULL : cache_load(h, nwords);
     if (out) return out;
@@ -160,7 +169,9 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
 #endif
     shaderc_compile_options_set_optimization_level(o, optimized ? shaderc_optimization_level_performance
                                                                                   : shaderc_optimization_level_zero);
+    uint64_t fp = vk_fp_host("shaderc");  // (its optimizer folds constants in the host's FP mode: vk_fpenv.h)
     shaderc_compilation_result_t r = shaderc_compile_into_spv(comp, src, strlen(src), kind_of(stage), name, "main", o);
+    vk_fp_put(fp);
     shaderc_compile_options_release(o);
     if (shaderc_result_get_compilation_status(r) != shaderc_compilation_status_success) {
         static int nlog;
@@ -178,10 +189,16 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
     return out;
 }
 
+uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
+    return vk_glsl_to_spirv_ex(src, stage, name, nwords, NULL);
+}
+
 VkShaderModule vk_module(const uint32_t *spv, size_t nwords) {
     VkShaderModuleCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nwords * 4, .pCode = spv};
     VkShaderModule m;
+    uint64_t fp = vk_fp_host("a shader module");
     VkResult result = vkCreateShaderModule(g_vk.dev, &ci, NULL, &m);
+    vk_fp_put(fp);
     if (result != VK_SUCCESS) LOG("[shader] vkCreateShaderModule failed: %d (%zu words)\n", result, nwords);
     return result == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }

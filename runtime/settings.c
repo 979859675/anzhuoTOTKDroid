@@ -34,6 +34,7 @@ Settings g_settings = {
     .fg_perf = 1,
     .rumble = 100,
     .game_fxaa = 1,
+    .shadows = true,
     .lsfg_flow = 75,
 #ifdef __ANDROID__
     .show_fps = true,  // (the performance overlay, ui/perf_overlay.mm: on until turned off in the menu)
@@ -226,7 +227,10 @@ void settings_reset_defaults(void) {
     g_settings.shadow_res = d->shadow_res;
     g_settings.shadow_scale = d->shadow_scale;
     g_settings.game_fxaa = d->game_fxaa;
+    g_settings.shadows = d->shadows;
     g_settings.far_clip = d->far_clip;
+    g_settings.shadow_cascades = d->shadow_cascades;
+    g_settings.point_shadows = d->point_shadows;
     g_settings.motion_source = d->motion_source;
     g_settings.motion_flat = d->motion_flat;
 #ifdef __ANDROID__
@@ -236,6 +240,7 @@ void settings_reset_defaults(void) {
     g_settings.overlay_opacity = d->overlay_opacity;
     g_settings.overlay_items = d->overlay_items;
     g_settings.fps_mode = d->fps_mode;
+    g_settings.fps60_hysteresis = d->fps60_hysteresis;
     g_settings.shader_int32 = d->shader_int32;
     g_settings.sync_lag = d->sync_lag;
     g_settings.low_ram = d->low_ram;
@@ -258,7 +263,8 @@ void settings_load(void) {
         char key[64];
         char val[1100] = "";  // (a key with nothing after "=": mods_off when every mod is on)
         if (sscanf(line, " %63[^= ] = %1099[^\r\n]", key, val) < 1) continue; val[strcspn(val, "\r\n")] = 0;
-        if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : ASPECT_UNLOCKED;
+        if (!strcmp(key, "aspect"))
+            g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : !strcmp(val, "stretch") ? ASPECT_STRETCH : ASPECT_UNLOCKED;
         else if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
@@ -276,7 +282,10 @@ void settings_load(void) {
         else if (!strcmp(key, "shadow_res")) g_settings.shadow_res = atoi(val) == 288 || atoi(val) == 256 ? atoi(val) : 0;
         else if (!strcmp(key, "shadow_scale")) g_settings.shadow_scale = atoi(val) >= 1 && atoi(val) <= 4 ? atoi(val) : 1;
         else if (!strcmp(key, "game_fxaa")) g_settings.game_fxaa = atoi(val) != 0;
+        else if (!strcmp(key, "shadows")) g_settings.shadows = atoi(val) != 0;
         else if (!strcmp(key, "far_clip")) g_settings.far_clip = atoi(val) >= 1000 && atoi(val) <= 100000 ? atoi(val) : 0;
+        else if (!strcmp(key, "shadow_cascades")) g_settings.shadow_cascades = atoi(val) >= 1 && atoi(val) <= 3 ? atoi(val) : 0;
+        else if (!strcmp(key, "point_shadows")) g_settings.point_shadows = atoi(val) >= 1 && atoi(val) <= 64 ? atoi(val) : 0;
         else if (!strcmp(key, "motion_source")) g_settings.motion_source = atoi(val) >= 0 && atoi(val) <= 2 ? atoi(val) : 0;
         else if (!strcmp(key, "motion_flat")) g_settings.motion_flat = atoi(val) != 0;
 #ifdef __ANDROID__
@@ -288,7 +297,8 @@ void settings_load(void) {
 #endif
 #ifdef __ANDROID__
         else if (!strcmp(key, "touch_controls")) g_settings.touch_controls = atoi(val) != 0;
-        else if (!strcmp(key, "frame_rate")) g_settings.fps_mode = !strcmp(val, "30") ? 1 : !strcmp(val, "60") ? 2 : !strcmp(val, "20") ? 3 : (!strcmp(val, "40") || !strcmp(val, "45")) ? 4 : 0;
+        else if (!strcmp(key, "fps60_hysteresis")) g_settings.fps60_hysteresis = atoi(val) != 0;
+        else if (!strcmp(key, "frame_rate")) g_settings.fps_mode = !strcmp(val, "30") ? 1 : !strcmp(val, "60") ? 2 : !strcmp(val, "20") ? 3 : (!strcmp(val, "40") || !strcmp(val, "45")) ? 4 : !strcmp(val, "unlocked") ? 5 : 0;
         else if (!strcmp(key, "shader_int32")) g_settings.shader_int32 = atoi(val) != 0;
         else if (!strcmp(key, "sync_lag")) g_settings.sync_lag = atoi(val) != 0;
         else if (!strcmp(key, "files_in_place")) g_settings.files_in_place = atoi(val) != 0;
@@ -380,6 +390,9 @@ void settings_load(void) {
     // Frame generation starts off (Win-FG and LSFG both). A file from before this default: off once; the player's
     // choice after that is kept (settings_save writes settings_version).
     if (!fg_key) g_settings.fg_engine = FG_OFF;
+#ifdef __ANDROID__  // (the phone's resolution list ends at 2x, menu.mm: 3x-8x from an older settings file go to 2x)
+    if (g_settings.res_mode >= 3 && g_settings.res_mode <= 8) g_settings.res_mode = 2;
+#endif
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
@@ -390,7 +403,8 @@ void settings_save(void) {
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
     fprintf(f, "# TOTKDroid settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
     fprintf(f, "settings_version = 1\n");  // (frame generation off by default: settings_load)
-    fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original" : "unlocked");
+    fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original"
+                                    : g_settings.aspect == ASPECT_STRETCH ? "stretch" : "unlocked");
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "reverb = %d\n", g_settings.reverb);
@@ -402,7 +416,10 @@ void settings_save(void) {
     fprintf(f, "shadow_res = %d\n", g_settings.shadow_res);
     fprintf(f, "shadow_scale = %d\n", g_settings.shadow_scale < 1 ? 1 : g_settings.shadow_scale);
     fprintf(f, "game_fxaa = %d\n", g_settings.game_fxaa);
+    fprintf(f, "shadows = %d\n", g_settings.shadows ? 1 : 0);
     fprintf(f, "far_clip = %d\n", g_settings.far_clip);
+    fprintf(f, "shadow_cascades = %d\n", g_settings.shadow_cascades);
+    fprintf(f, "point_shadows = %d\n", g_settings.point_shadows);
     fprintf(f, "motion = %d\nmotion_source = %d\nmotion_flat = %d\n", g_settings.motion, g_settings.motion_source,
             g_settings.motion_flat);
 #ifdef __ANDROID__
@@ -413,7 +430,8 @@ void settings_save(void) {
 #endif
 #ifdef __ANDROID__
     fprintf(f, "touch_controls = %d\n", g_settings.touch_controls);
-    fprintf(f, "frame_rate = %s\n", g_settings.fps_mode == 1 ? "30" : g_settings.fps_mode == 2 ? "60" : g_settings.fps_mode == 3 ? "20" : g_settings.fps_mode == 4 ? "45" : "auto");
+    fprintf(f, "fps60_hysteresis = %d\n", g_settings.fps60_hysteresis);
+    fprintf(f, "frame_rate = %s\n", g_settings.fps_mode == 1 ? "30" : g_settings.fps_mode == 2 ? "60" : g_settings.fps_mode == 3 ? "20" : g_settings.fps_mode == 4 ? "45" : g_settings.fps_mode == 5 ? "unlocked" : "auto");
     fprintf(f, "shader_int32 = %d\nsync_lag = %d\nfiles_in_place = %d\nnative_code = %d\n", g_settings.shader_int32,
             g_settings.sync_lag, g_settings.files_in_place, g_settings.native_code);
     static const char *const tri[] = {"auto", "0", "1"};  // (-1 / 0 / 1)

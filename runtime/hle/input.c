@@ -6,6 +6,7 @@
 #include <SDL3/SDL.h>
 #include <ctype.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -168,9 +169,46 @@ int input_pad_family(void) {
     return env >= 0 ? env : pad_family;
 }
 
+// A gamepad with no axis at all isn't a controller to play with: a phone's fingerprint sensor can register one (the
+// OnePlus 7 Pro's "gf_input": navigation keys and a BTN_EAST, so Android and SDL call it a gamepad, and the touch
+// controls never showed, #477). Such a device is left out wherever the app asks whether a controller is connected.
+// LARECOMP_PAD_ANY=1: every gamepad counts, as before. The answer is kept per id (SDL gives a reconnected device a
+// new one). (from BOTWRecomp 0ea51bb)
+bool input_pad_usable(uint32_t id) {
+    static int any = -1;
+    if (any < 0) any = getenv("LARECOMP_PAD_ANY") && atoi(getenv("LARECOMP_PAD_ANY"));
+    if (any) return true;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static struct { uint32_t id; bool usable; } seen[16];
+    static unsigned nseen;
+    pthread_mutex_lock(&lock);
+    for (unsigned i = 0; i < nseen && i < 16; i++)
+        if (seen[i].id == id) { bool u = seen[i].usable; pthread_mutex_unlock(&lock); return u; }
+    pthread_mutex_unlock(&lock);
+    SDL_Gamepad *g = SDL_OpenGamepad((SDL_JoystickID)id);  // (counted: closing it leaves another opener's open)
+    int axes = g ? SDL_GetNumJoystickAxes(SDL_GetGamepadJoystick(g)) : -1;
+    bool usable = axes != 0;  // (one that can't be opened: as before)
+    if (!usable) LOG("[input] gamepad %u: %s has no axes - not a controller, left out (LARECOMP_PAD_ANY=1: counted)\n",
+                     (unsigned)id, SDL_GetGamepadName(g) ? SDL_GetGamepadName(g) : "(unnamed)");
+    if (g) SDL_CloseGamepad(g);
+    pthread_mutex_lock(&lock);
+    seen[nseen++ % 16].id = id, seen[(nseen - 1) % 16].usable = usable;
+    pthread_mutex_unlock(&lock);
+    return usable;
+}
+uint32_t input_pad_first(void) {
+    int n = 0;
+    SDL_JoystickID *ids = SDL_GetGamepads(&n);
+    uint32_t first = 0;
+    for (int i = 0; ids && i < n && !first; i++) if (input_pad_usable(ids[i])) first = ids[i];
+    SDL_free(ids);
+    return first;
+}
+bool input_pad_present(void) { return input_pad_first() != 0; }
+
 static void pad_open(SDL_JoystickID id) {
     for (int p = 0; p < npads; p++) if (SDL_GetGamepadID(pads[p]) == id) return;
-    if (npads == MAX_PADS) return;
+    if (npads == MAX_PADS || !input_pad_usable(id)) return;
     SDL_Gamepad *g = SDL_OpenGamepad(id);
     if (!g) { LOG("[input] gamepad %u: %s\n", (unsigned)id, SDL_GetError()); return; }
     pads[npads++] = g;
@@ -359,6 +397,7 @@ static void host_test_frame(uint64_t frame) {
     }
 }
 
+static void input_latch_frame(void);  // (below fill_state's TOUCH_* definitions)
 static uint64_t g_pad_obj;
 volatile int g_inject_plus;  // frames to hold Plus for the game (movie.c: A/B skip a skippable movie)
 RT_ON_RESET(input_reboot_reset) { g_pad_obj = 0; g_inject_plus = 0; }  // (reboot: the controller object was guest memory)
@@ -379,6 +418,7 @@ void input_frame(uint64_t frame) {
     extern void watch_arm(void);
     watch_arm();
     host_test_frame(frame);
+    input_latch_frame();
     const char *spec = getenv("LARECOMP_INPUT");
     if (!spec) return;
     static const char *const names[] = {"A", "B", "X", "Y", "LSTICK", "RSTICK", "L", "R", "ZL", "ZR", "PLUS",
@@ -437,6 +477,24 @@ static int32_t clamp_axis(int32_t v) { return v > 32767 ? 32767 : v < -32767 ? -
 
 // NpadFullKeyState / NpadHandheldState / NpadJoy*State share this layout (0x28 bytes):
 // {int64 sampling, u64 buttons, AnalogStick L {x,y}, AnalogStick R {x,y}, u32 attributes}
+// The host's input (keys, controllers, the on-screen controls) as the game's polls see it: read once a presented frame
+// (input_frame), so every poll of a frame - TOTK polls several times a frame - sees the same buttons, as the scripted
+// input always was. Read live, a touch landing mid-frame was "no menu" to the part of the frame that draws the world and
+// "menu" to the part that captures it for the menu's blurred background: the weapon wheel opened over black (#76, only
+// with a player's touch, never with LARECOMP_INPUT) - or so it seemed: latched, 3 of 11 openings were still black
+// (2026-11-23), so it is off by default. LARECOMP_INPUT_LATCH=1: latched.
+static _Atomic uint64_t latch_b;
+static _Atomic int32_t latch_lx, latch_ly, latch_rx, latch_ry;
+static void input_latch_frame(void) {  // (input_frame: once a presented frame, on the game's thread)
+    latch_b = key_buttons | pad_buttons | TOUCH_BUTTONS;
+    latch_lx = key_lx + pad_lx + TOUCH_LX, latch_ly = key_ly + pad_ly + TOUCH_LY;
+    latch_rx = key_rx + pad_rx + TOUCH_RX, latch_ry = key_ry + pad_ry + TOUCH_RY;
+}
+static bool input_latch_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("LARECOMP_INPUT_LATCH") && atoi(getenv("LARECOMP_INPUT_LATCH")) != 0;
+    return on;
+}
 static void fill_state(Cpu *c) {
     uint8_t *s = (uint8_t *)(uintptr_t)c->x[0];
     uint32_t id = *(uint32_t *)(uintptr_t)c->x[1];
@@ -455,15 +513,18 @@ static void fill_state(Cpu *c) {
         LOG("[input] watching controller object %llx\n", c->x[1] - 8);
     }
     bool menu = menu_input_captured();  // the overlay menu / name entry has the controls (typing there isn't for the game)
-    uint64_t b = menu ? script_buttons : key_buttons | pad_buttons | TOUCH_BUTTONS | script_buttons;
+    bool latch = input_latch_on();
+    uint64_t b = menu ? script_buttons : (latch ? latch_b : key_buttons | pad_buttons | TOUCH_BUTTONS) | script_buttons;
     {   // injected Plus: held for ~10 presented frames (the game polls several times per frame)
         extern uint64_t renderer_present_count(void);
         static uint64_t until;
         if (g_inject_plus > 0) { until = renderer_present_count() + 10; g_inject_plus = 0; }
         if (renderer_present_count() < until) b |= 1ull << BTN_PLUS;
     }
-    int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx + TOUCH_LX) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly + TOUCH_LY) + script_ly);
-    int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx + TOUCH_RX) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry + TOUCH_RY) + script_ry);
+    int32_t lx = clamp_axis((menu ? 0 : latch ? latch_lx : key_lx + pad_lx + TOUCH_LX) + script_lx);
+    int32_t ly = clamp_axis((menu ? 0 : latch ? latch_ly : key_ly + pad_ly + TOUCH_LY) + script_ly);
+    int32_t rx = clamp_axis((menu ? 0 : latch ? latch_rx : key_rx + pad_rx + TOUCH_RX) + script_rx);
+    int32_t ry = clamp_axis((menu ? 0 : latch ? latch_ry : key_ry + pad_ry + TOUCH_RY) + script_ry);
     // stick directions also appear as buttons (bits 16-23)
     if (lx < -16000) b |= 1ull << 16;
     if (ly > 16000) b |= 1ull << 17;
