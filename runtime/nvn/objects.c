@@ -7,7 +7,6 @@
 #include "../kernel.h"
 #include "../settings.h"
 #include "../framepace.h"
-#include "../cheats.h"
 #include "../platform.h"
 #include "nvn.h"
 #include "vulkan/watchdog.h"
@@ -2115,7 +2114,6 @@ NVN(nvnQueuePresentTexture) {
 #ifdef __ANDROID__
     bg_wait();
 #endif
-    cheats_frame();   // the data cheats that are on (cheats.c; nothing before the game runs)
     {   // (which guest thread presents: LARECOMP_PROF_SVC_TID, kernel.c)
         static uint64_t last_id = ~0ull;
         KThread *kt = kernel_current_thread();

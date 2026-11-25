@@ -13,18 +13,10 @@
   offer its complete source: this repository at the commit of the release.
   - `./gradlew assembleRelease -PtotkLsfg=false` builds an APK without the folder, MIT as a whole. In that APK the setting
     says "not in this build".
-- **Ported from PC TotK Recomp (MIT):** the Atmosphère cheat VM and cheat-file parser, `runtime/cheat_vm.c` and
-  `runtime/cheat_vm.h`, are ported from [valentderah/totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp)
-  (`runtime/cheats.c` there, MIT). Its MIT License notice: Copyright (c) 2026 Valiantsin Dzerakh (the full text is in that repository's LICENSE). `runtime/cheats.c`
-  and `runtime/cheats.h` here are TOTKDroid's glue to the phone's memory, and are MIT as well. See [docs/CHEATS.md](docs/CHEATS.md).
-- **Ported from PC TotK Recomp (MIT):** the game's resource size table (RESTBL), `runtime/services/restbl.c` and
-  `runtime/services/restbl.h`, with its host test `tests/restbl/`, are ported from
-  [valentderah/totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp) (`runtime/restbl.c` and `runtime/restbl.h`
-  there, MIT). Same MIT License notice as above. The table's merge into `runtime/services/fs.c` is TOTKDroid's own.
-- **Ported from PC TotK Recomp (MIT):** the ExeFS patch formats (IPS, IPS32 and .pchtxt of the mods' exefs folders, and
-  the build id rule), `runtime/exefs_patch.c` and `runtime/exefs_patch.h`, with its host test `tests/exefs/`, are ported
-  from [valentderah/totk-pc-recomp](https://github.com/valentderah/totk-pc-recomp) (`tools/exefs_patches.py` there, MIT).
-  Same MIT License notice as above. Their use in `runtime/cheats.c` (the writes into the game's code at boot) is TOTKDroid's own.
+- **Lossless Scaling's shaders are never included.** The app reads them at run time from the player's own copy of
+  `Lossless.dll` (Lossless Scaling, proprietary, sold on Steam). The DLL is not part of this repository or of any APK.
+  The app looks for it in `LSFG/`, `Download/`, `Documents/Emulation/bios/`, `Switch2/` and the root of the phone's
+  storage, and in the app's data folder.
 - **Third-party code** keeps its own license, listed in [README.md](README.md#credits).
 - **Ideas and layouts from [totk-android](https://github.com/AurelioB/totk-android)** (AurelioB, MIT): the HD rumble
   mixing in `runtime/hle/input.c` (two bands to one strength, the silence threshold, the 250 ms stale value) follows its

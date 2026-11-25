@@ -253,7 +253,7 @@ void settings_load(void) {
     FILE *f = fopen(SETTINGS_FILE, "r");
     if (!f) return;
 #ifdef __ANDROID__
-    char line[1200];  // (touch_layout: 24 numbers; cheats_on: up to 1024)
+    char line[640];  // (touch_layout: 24 numbers)
 #else
     char line[256];
 #endif
@@ -261,8 +261,8 @@ void settings_load(void) {
     while (fgets(line, sizeof line, f)) {
         char key[64];
 #ifdef __ANDROID__
-        char val[1100] = "";  // (a key with nothing after "=": mods_off when every mod is on)
-        if (sscanf(line, " %63[^= ] = %1099[^\r\n]", key, val) < 1) continue; val[strcspn(val, "\r\n")] = 0;
+        char val[512] = "";  // (a key with nothing after "=": mods_off when every mod is on)
+        if (sscanf(line, " %63[^= ] = %511[^\r\n]", key, val) < 1) continue; val[strcspn(val, "\r\n")] = 0;
 #else
         char val[128] = "";
         if (sscanf(line, " %63[^= ] = %127[^\r\n]", key, val) < 1) continue; val[strcspn(val, "\r\n")] = 0;
@@ -291,7 +291,6 @@ void settings_load(void) {
         else if (!strcmp(key, "overlay")) g_settings.overlay_style = !strcmp(val, "compact");
         else if (!strcmp(key, "overlay_scale")) g_settings.overlay_scale = atoi(val);
         else if (!strcmp(key, "overlay_opacity")) g_settings.overlay_opacity = atoi(val);
-        else if (!strcmp(key, "cheats_on")) snprintf(g_settings.cheats_on, sizeof g_settings.cheats_on, "%s", val);
         else if (!strcmp(key, "overlay_items")) g_settings.overlay_items = atoi(val);
         else if (!strcmp(key, "overlay_pos")) sscanf(val, "%f,%f", &g_settings.overlay_pos[0], &g_settings.overlay_pos[1]);
 #endif
@@ -438,7 +437,6 @@ void settings_save(void) {
     fprintf(f, "touch_scale = %.2f\ntouch_opacity = %.2f\ntouch_layout = ", g_settings.touch_scale, g_settings.touch_opacity);
     for (int i = 0; i < TOUCH_NCTL; i++)
         fprintf(f, "%s%.4f,%.4f", i ? "," : "", g_settings.touch_pos[i][0], g_settings.touch_pos[i][1]);
-    fprintf(f, "cheats_on = %s\n", g_settings.cheats_on);
     fprintf(f, "\ntouch_scheme = %d\ntouch_aim_sens = %.2f\ntouch_talk = %d\ntouch_icons_layout = ", g_settings.touch_scheme,
             g_settings.touch_aim_sens, g_settings.touch_talk ? 1 : 0);
     for (int i = 0; i < TOUCH_NCTL2; i++)

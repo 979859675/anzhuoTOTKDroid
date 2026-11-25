@@ -1617,8 +1617,6 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
             deleteTree(stage);
             Doc romfsDoc = named(children(tree, mod.id), "romfs");
             copyDocs(tree, romfsDoc, new File(stage, "romfs"));
-            Doc cheatsDoc = named(children(tree, mod.id), "cheats");  // (its cheat files: runtime/cheats.c)
-            if (cheatsDoc != null && cheatsDoc.dir) copyDocs(tree, cheatsDoc, new File(stage, "cheats"));
             for (Doc k : children(tree, mod.id))  // (its notes: the menu shows one as its description)
                 if (!k.dir && k.name != null && k.name.toLowerCase().endsWith(".txt")) copyDoc(tree, k, new File(stage, k.name));
             File dst = new File(mods, name);

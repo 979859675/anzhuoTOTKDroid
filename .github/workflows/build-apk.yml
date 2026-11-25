@@ -85,7 +85,7 @@ jobs:
         run: |
           LOG="$RUNNER_TEMP/gradle.log"
           set +e
-          ./gradlew assembleDebug --no-daemon > "$LOG" 2>&1
+          bash ./gradlew assembleDebug --no-daemon > "$LOG" 2>&1
           status=$?
           set -e
           tail -n 60 "$LOG"
