@@ -35,7 +35,6 @@ uint64_t vk_presented_images(void);    // vulkan/device.c: the window images sho
 uint64_t vk_game_frames(void);         // vulkan/device.c: the game's own frames presented (not the generated ones)
 int vk_fg_state(void);                  // vulkan/framegen.c: 1 generating, 2 on and waiting, 0 off, -1 unavailable
 uint64_t vk_upload_total_bytes(void);  // vulkan/exec.c: the bytes uploaded since the start (the [device] line)
-uint64_t vk_fg_upload_bytes(void);     // vulkan/framegen.c: the same for the frame generation's uniform blocks
 }
 
 extern ImFont *g_overlay_font;  // ui/menu.mm: Android's Roboto (Swap2-Native's draws with Android's sans-serif)
@@ -221,10 +220,10 @@ void perf_overlay_draw(ImVec2 display, float scale) {
                 next_dev = now + 60000000000ull;
                 char gf[16], sf[16];  // ("--" before the first frame: no NaN in the log)
                 fprintf(stderr, "[device] RAM %u MB (available %u MB), SoC %.1f C, battery %.1f C, thermal %d, headroom %.2f, "
-                        "game %s fps, shown %s fps, frame generation %d, uploaded in all: game %llu MB, generated frames %llu MB\n",
+                        "game %s fps, shown %s fps, frame generation %d, uploaded in all: game %llu MB\n",
                         ds.rss_mb, ds.avail_mb, ds.soc_temp_c, ds.batt_temp_c, ds.thermal, ds.headroom,
                         number(gf, game_fps), number(sf, shown), fg,
-                        (unsigned long long)(vk_upload_total_bytes() >> 20), (unsigned long long)(vk_fg_upload_bytes() >> 20));
+                        (unsigned long long)(vk_upload_total_bytes() >> 20));
             }
         }
         static bool said;

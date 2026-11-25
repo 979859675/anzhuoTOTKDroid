@@ -5,7 +5,6 @@ enum { OVERLAY_FPS = 1, OVERLAY_THROTTLE = 2, OVERLAY_GPU = 4, OVERLAY_CPU = 8, 
        OVERLAY_ALL = 63 };
 #include <stdbool.h>
 
-enum { FG_OFF = 0, FG_WINFG = 1, FG_LSFG = 2 };  // (Settings.fg_engine: Win-FG is built in, LSFG needs Lossless.dll)
 enum { ASPECT_UNLOCKED = 0, ASPECT_ORIGINAL = 1, ASPECT_STRETCH = 2 };
 enum { RES_MATCH = 0, /* 1..8 = 1x..8x */ RES_DYNAMIC = 9, RES_Q75 = 10, RES_Q25 = 11, RES_Q50 = 12 };
 // (11 was 67% of the display: larecomp.ini "67%" now loads as RES_Q75)
@@ -39,9 +38,10 @@ typedef struct {
     bool reverb;         // room reverb effect
     bool movie_audio;
     bool show_fps;
-    // Frame generation (nvn/vulkan/framegen.c): the engine (FG_*), images per game frame (2-4), Win-FG's quality (0
-    // quality, 1 balanced, 2 performance), LSFG's motion estimation resolution (0 the game's own, or 25-100 %)
-    int fg_engine, fg_mult, fg_perf, lsfg_flow;
+    // Frame generation (Lossless Scaling's LSFG, the player's own Lossless.dll: nvn/vulkan/framegen.c): on, images per
+    // game frame (2-4), the motion estimation's resolution (0 the game's own, or 25-100 %)
+    bool lsfg;
+    int lsfg_mult, lsfg_flow;
     bool motion;          // the phone's (or a controller's) gyroscope as the controller's motion sensor (hle/motion.c)
     int rumble;           // the game's vibration, % strength (0 off) on the controller, or the phone without one (hle/input.c)
     int shadow_res;       // the game's shadow map size: 0 its own, 288, 256 (native.c fix_shadow_size)
@@ -84,10 +84,11 @@ typedef struct {
                           // #227): set when the app starts, before the driver loads (vulkan/device.c)
 #define TOUCH_NCTL 19  // (ui/touch_controls.mm: LAS's 12, then the right stick, L3 / R3 and the d-pad)
     float touch_pos[TOUCH_NCTL][2];  // each on-screen control's place, a share of the screen (negative: default)
-    // The icon layout (ui/touch_controls.mm) is no longer used: touch_scheme is always 0 (the classic layout
-    // everywhere, as the Switch's buttons). Its code stays for now; touch_scheme 1 is never set (settings.c).
+    // The icon layout (ui/touch_controls.mm), in the world only - the classic one above stays in the game's menus:
+    // touch_scheme 1 (0: the classic one everywhere), its controls' places of their own
 #define TOUCH_NCTL2 22
     int touch_scheme;
+    char cheats_on[1024];  // data cheats switched on (runtime/cheats.c: their keys, separated by '|')
     float touch_pos2[TOUCH_NCTL2][2];
     float touch_size[TOUCH_NCTL], touch_size2[TOUCH_NCTL2];  // each control's own size (times touch_scale; 0: 1)
     float touch_aim_sens;  // the icon layout's bow / throw drag: how fast it turns the aim (1: the default)
@@ -108,7 +109,6 @@ typedef struct {
     bool autoplay;       // the start screen plays by itself after a short countdown once the game is set up (a touch or
                          // a key during it stays on the start screen; ui/launcher.mm)
     char mods_off[512];  // game mods turned off (runtime/mods.c: their folder names, separated by '|')
-    char cheats_on[1024];  // data cheats switched on (runtime/cheats.c: their keys, separated by '|')
 } Settings;
 
 extern Settings g_settings;

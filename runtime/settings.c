@@ -29,12 +29,10 @@ Settings g_settings = {
     .movie_audio = true,
     .autoplay = true,
     .motion = true,
-    .fg_engine = FG_OFF,
-    .fg_mult = 2,
-    .fg_perf = 1,
     .rumble = 100,
     .game_fxaa = 1,
     .shadows = true,
+    .lsfg_mult = 2,
     .lsfg_flow = 75,
 #ifdef __ANDROID__
     .show_fps = true,  // (the performance overlay, ui/perf_overlay.mm: on until turned off in the menu)
@@ -45,7 +43,7 @@ Settings g_settings = {
     .overlay_items = OVERLAY_ALL,
     .touch_pos = {{-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1},
                   {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}},
-    .touch_scheme = 0,   // (the classic layout: the one control layout, see touch_scheme below)
+    .touch_scheme = 0,   // (the classic layout everywhere: the action-icon one is not used)
     .touch_pos2 = {{-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1},
                    {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1},
                    {-1, -1}},
@@ -218,9 +216,8 @@ void settings_reset_defaults(void) {
     g_settings.reverb = d->reverb;
     g_settings.movie_audio = d->movie_audio;
     g_settings.show_fps = d->show_fps;
-    g_settings.fg_engine = d->fg_engine;
-    g_settings.fg_mult = d->fg_mult;
-    g_settings.fg_perf = d->fg_perf;
+    g_settings.lsfg = d->lsfg;
+    g_settings.lsfg_mult = d->lsfg_mult;
     g_settings.lsfg_flow = d->lsfg_flow;
     g_settings.motion = d->motion;
     g_settings.rumble = d->rumble;
@@ -255,12 +252,21 @@ void settings_load(void) {
     loaded = true;
     FILE *f = fopen(SETTINGS_FILE, "r");
     if (!f) return;
+#ifdef __ANDROID__
     char line[1200];  // (touch_layout: 24 numbers; cheats_on: up to 1024)
-    bool tip_key = false, aspect_key = false, output_key = false, fg_key = false;
+#else
+    char line[256];
+#endif
+    bool tip_key = false, aspect_key = false, output_key = false;
     while (fgets(line, sizeof line, f)) {
         char key[64];
+#ifdef __ANDROID__
         char val[1100] = "";  // (a key with nothing after "=": mods_off when every mod is on)
         if (sscanf(line, " %63[^= ] = %1099[^\r\n]", key, val) < 1) continue; val[strcspn(val, "\r\n")] = 0;
+#else
+        char val[128] = "";
+        if (sscanf(line, " %63[^= ] = %127[^\r\n]", key, val) < 1) continue; val[strcspn(val, "\r\n")] = 0;
+#endif
         if (!strcmp(key, "aspect"))
             g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : !strcmp(val, "stretch") ? ASPECT_STRETCH : ASPECT_UNLOCKED;
         else if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
@@ -268,12 +274,8 @@ void settings_load(void) {
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
         else if (!strcmp(key, "movie_audio")) g_settings.movie_audio = atoi(val) != 0;
         else if (!strcmp(key, "show_fps")) g_settings.show_fps = atoi(val) != 0;
-        else if (!strcmp(key, "fg_engine")) g_settings.fg_engine = atoi(val) < 0 ? 0 : atoi(val) > 2 ? 2 : atoi(val);
-        else if (!strcmp(key, "fg_mult")) g_settings.fg_mult = atoi(val) < 2 ? 2 : atoi(val) > 4 ? 4 : atoi(val);
-        else if (!strcmp(key, "fg_perf")) g_settings.fg_perf = atoi(val) < 0 ? 0 : atoi(val) > 2 ? 2 : atoi(val);
-        // (the keys before Win-FG: lsfg = 1 was LSFG on, lsfg_mult the images per game frame)
-        else if (!strcmp(key, "lsfg")) g_settings.fg_engine = atoi(val) != 0 ? FG_LSFG : FG_OFF;
-        else if (!strcmp(key, "lsfg_mult")) g_settings.fg_mult = atoi(val) < 2 ? 2 : atoi(val) > 4 ? 4 : atoi(val);
+        else if (!strcmp(key, "lsfg")) g_settings.lsfg = atoi(val) != 0;
+        else if (!strcmp(key, "lsfg_mult")) g_settings.lsfg_mult = atoi(val) < 2 ? 2 : atoi(val) > 4 ? 4 : atoi(val);
         else if (!strcmp(key, "lsfg_flow")) g_settings.lsfg_flow = atoi(val) <= 0 ? 0 : atoi(val) < 25 ? 25 : atoi(val) > 100 ? 100 : atoi(val);
         else if (!strcmp(key, "motion")) g_settings.motion = atoi(val) != 0;
         else if (!strcmp(key, "rumble")) g_settings.rumble = atoi(val) >= 0 && atoi(val) <= 300 ? atoi(val) : 100;
@@ -289,6 +291,7 @@ void settings_load(void) {
         else if (!strcmp(key, "overlay")) g_settings.overlay_style = !strcmp(val, "compact");
         else if (!strcmp(key, "overlay_scale")) g_settings.overlay_scale = atoi(val);
         else if (!strcmp(key, "overlay_opacity")) g_settings.overlay_opacity = atoi(val);
+        else if (!strcmp(key, "cheats_on")) snprintf(g_settings.cheats_on, sizeof g_settings.cheats_on, "%s", val);
         else if (!strcmp(key, "overlay_items")) g_settings.overlay_items = atoi(val) | OVERLAY_FPS;  // (the frame rate is always shown)
         else if (!strcmp(key, "overlay_pos")) sscanf(val, "%f,%f", &g_settings.overlay_pos[0], &g_settings.overlay_pos[1]);
 #endif
@@ -322,7 +325,7 @@ void settings_load(void) {
                 while (*q == ',' || *q == ' ') q++;
             }
         }
-        else if (!strcmp(key, "touch_scheme")) g_settings.touch_scheme = 0;   // (the action-icon layout is no longer used: the classic one everywhere; old files say 1)
+        else if (!strcmp(key, "touch_scheme")) g_settings.touch_scheme = 0;   // (the action-icon layout is no longer used)
         else if (!strcmp(key, "touch_aim_sens")) g_settings.touch_aim_sens = (float)atof(val);
         else if (!strcmp(key, "touch_talk")) g_settings.touch_talk = atoi(val) != 0;
         else if (!strcmp(key, "touch_minimap_top")) g_settings.touch_minimap_top = atoi(val) != 0;
@@ -348,7 +351,7 @@ void settings_load(void) {
             int n = atoi(val);
             g_settings.res_mode = !strcmp(val, "dynamic") ? RES_DYNAMIC : (!strcmp(val, "75%") || !strcmp(val, "67%")) ? RES_Q75 :
                                   !strcmp(val, "50%") ? RES_Q50 : !strcmp(val, "25%") ? RES_Q25 :
-                                  (n >= 1 && n <= 8) ? n : n > 8 ? 8 : RES_MATCH;  // (1x-8x; 5x-8x are the GPU-memory heavy ones)
+                                  (n >= 1 && n <= 4) ? n : n > 4 ? 4 : RES_MATCH;  // (5x-8x were removed)
         }
         else if (!strcmp(key, "upscaler"))  // (metalfx / fsr1: this OS's sharp one)
             g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR
@@ -375,20 +378,12 @@ void settings_load(void) {
         else if (!strcmp(key, "autoplay")) g_settings.autoplay = atoi(val) != 0;
         else if (!strcmp(key, "menu_tip_seen")) g_settings.menu_tip_seen = atoi(val) != 0, tip_key = true;
         else if (!strcmp(key, "mods_off")) snprintf(g_settings.mods_off, sizeof g_settings.mods_off, "%s", val);
-        else if (!strcmp(key, "cheats_on")) snprintf(g_settings.cheats_on, sizeof g_settings.cheats_on, "%s", val);
         else if (!strcmp(key, "aspect_asked")) g_settings.aspect_asked = atoi(val) != 0, aspect_key = true;
-        else if (!strcmp(key, "settings_version")) fg_key = atoi(val) >= 1;  // (frame generation starts off, see below)
         else bind_settings_load(key, val);  // bind_pad_* / bind_key_*: runtime/hle/bindings.c
     }
     fclose(f);
     if (!tip_key) g_settings.menu_tip_seen = true;  // (a settings file from before the note: not a first launch)
     if (!aspect_key) g_settings.aspect_asked = true;  // (likewise: the aspect ratio was chosen already)
-    // Frame generation starts off (Win-FG and LSFG both). A file from before this default: off once; the player's
-    // choice after that is kept (settings_save writes settings_version).
-    if (!fg_key) g_settings.fg_engine = FG_OFF;
-#ifdef __ANDROID__  // (the phone's resolution list ends at 2x, menu.mm: 3x-8x from an older settings file go to 2x)
-    if (g_settings.res_mode >= 3 && g_settings.res_mode <= 8) g_settings.res_mode = 2;
-#endif
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
@@ -398,7 +393,6 @@ void settings_save(void) {
     FILE *f = fopen(SETTINGS_FILE, "w");
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
     fprintf(f, "# TOTKDroid settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
-    fprintf(f, "settings_version = 1\n");  // (frame generation off by default: settings_load)
     fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original"
                                     : g_settings.aspect == ASPECT_STRETCH ? "stretch" : "unlocked");
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
@@ -406,8 +400,7 @@ void settings_save(void) {
     fprintf(f, "reverb = %d\n", g_settings.reverb);
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
     fprintf(f, "show_fps = %d\n", g_settings.show_fps);
-    fprintf(f, "fg_engine = %d\nfg_mult = %d\nfg_perf = %d\nlsfg_flow = %d\n", g_settings.fg_engine, g_settings.fg_mult,
-            g_settings.fg_perf, g_settings.lsfg_flow);
+    fprintf(f, "lsfg = %d\nlsfg_mult = %d\nlsfg_flow = %d\n", g_settings.lsfg, g_settings.lsfg_mult, g_settings.lsfg_flow);
     fprintf(f, "rumble = %d\n", g_settings.rumble);
     fprintf(f, "shadow_res = %d\n", g_settings.shadow_res);
     fprintf(f, "game_fxaa = %d\n", g_settings.game_fxaa);
@@ -445,6 +438,7 @@ void settings_save(void) {
     fprintf(f, "touch_scale = %.2f\ntouch_opacity = %.2f\ntouch_layout = ", g_settings.touch_scale, g_settings.touch_opacity);
     for (int i = 0; i < TOUCH_NCTL; i++)
         fprintf(f, "%s%.4f,%.4f", i ? "," : "", g_settings.touch_pos[i][0], g_settings.touch_pos[i][1]);
+    fprintf(f, "cheats_on = %s\n", g_settings.cheats_on);
     fprintf(f, "\ntouch_scheme = %d\ntouch_aim_sens = %.2f\ntouch_talk = %d\ntouch_icons_layout = ", g_settings.touch_scheme,
             g_settings.touch_aim_sens, g_settings.touch_talk ? 1 : 0);
     for (int i = 0; i < TOUCH_NCTL2; i++)
@@ -472,7 +466,6 @@ void settings_save(void) {
     fprintf(f, "menu_tip_seen = %d\n", g_settings.menu_tip_seen);
     fprintf(f, "autoplay = %d\n", g_settings.autoplay);
     fprintf(f, "mods_off = %s\n", g_settings.mods_off);
-    fprintf(f, "cheats_on = %s\n", g_settings.cheats_on);
     bind_settings_save(f);
     fclose(f);
 }

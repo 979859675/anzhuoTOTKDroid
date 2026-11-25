@@ -44,12 +44,10 @@ Android only (arm64, Vulkan). Windows, Linux or macOS may be used as development
 - Frame rate: Video > Frame rate has 30, Auto (prefers 60, cutscenes held at 30) and 60. The game's own dynamic
   resolution is off; the scene is 1600x896, scaled to the output (FSR 1, GSR, SMAA / FXAA).
 - Video > Aspect ratio > Unlocked: the world and the menus fill a wide screen (the HUD stays in the middle 16:9).
-- Video > Frame generation, experimental: frames made between the game's own (2x, 3x, 4x). Two engines:
-  - Win-FG: built in, from [win-fg](https://github.com/The412Banner/win-fg) (MIT), a clean-room optical-flow chain for
-    Vulkan. Quality: Quality / Balanced / Performance. Needs a spare GPU.
-  - LSFG: Lossless Scaling's, ported from Eden through Swap2-Native. It needs your own `Lossless.dll` from Lossless
-    Scaling in the `LSFG` or `Download` folder of the phone's storage. The DLL is never included. This code is
-    GPL-3.0-or-later, so the APK built with it is too ([NOTICE.md](NOTICE.md)).
+- Video > Frame generation (LSFG), experimental: frames made between the game's own (2x, 3x, 4x). It is Lossless Scaling's,
+  ported from Eden through Swap2-Native, and needs your own `Lossless.dll` from Lossless Scaling in the `LSFG` or
+  `Download` folder of the phone's storage. The DLL is never included. This code is GPL-3.0-or-later, so the APK built
+  with it is too ([NOTICE.md](NOTICE.md)).
 - Not done yet: most of the map, sustained 60 fps on a hot phone, the HUD at the screen's edges in wide mode.
 
 > [!IMPORTANT]
@@ -105,8 +103,7 @@ Current goal: buy a **POCO X7 Pro ($455)**, a test device equipped with a MediaT
   recompilation of Tears of the Kingdom 1.4.3: its attachment-less render pass sizing and scissor handling (interior
   ambient light on cave rocks), 16-bit packed NVN format component ordering (`RGBA4`/`RGB5`/`RGB5A1`/`RGB565` and
   `BGR565`/`BGR5`/`BGR5A1`/`A1BGR5`/`BGRX8`/`BGRA8` for terrain normal and blend maps), `MapPhysicalMemory` preservation
-  of already-mapped pages, its Atmosphère cheat VM and file parser for data cheats (`runtime/cheat_vm.c`, see
-  [docs/CHEATS.md](docs/CHEATS.md)), and its documented 1.4.3 findings.
+  of already-mapped pages, and its documented 1.4.3 findings.
 - [LASRecompAndroid](https://github.com/mamcjr/LASRecompAndroid), its Android port, and
   [BOTWRecompAndroid](https://github.com/mamcjr/BOTWRecompAndroid) (its README in [docs/botw/](docs/botw/)): the app,
   the phone-side game code build, touch controls, mods, driver compatibility, the Portuguese menus, the Sheikah look and
@@ -117,7 +114,6 @@ Current goal: buy a **POCO X7 Pro ($455)**, a test device equipped with a MediaT
   the SDK 20 kernel fixes, setjmp, NVN 55.
 - [Nycolazs](https://github.com/Nycolazs) for LASRecomp-Android-Plus (MIT): Vulkan driver compatibility.
 - [Eden](https://git.eden-emu.dev/eden-emu/eden) and [lsfg-vk](https://github.com/PancakeTAS/lsfg-vk) (GPL-3.0-or-later): Lossless Scaling frame generation, through Swap2-Native's C port (runtime/nvn/vulkan/lsfg, NOTICE.md).
-- [The412Banner](https://github.com/The412Banner/win-fg) for win-fg (MIT): the Win-FG frame generation chain (runtime/nvn/vulkan/winfg, NOTICE.md), which uses AMD FidelityFX Optical Flow's method (MIT).
 - The [zeldaret/botw](https://github.com/zeldaret/botw) decompilation and [open-ead/sead](https://github.com/open-ead/sead),
   for what is known about the engine TOTK grew from.
 - Upscaling and anti-aliasing: [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT),

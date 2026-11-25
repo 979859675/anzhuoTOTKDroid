@@ -68,7 +68,6 @@ bool menu_is_open(void) { return g_open.load(); }
 extern "C" bool touch_controls_visible(void);  // ui/touch_controls.mm
 extern "C" const char *vk_fg_status(void);      // nvn/vulkan/framegen.c
 extern "C" bool vk_fg_built(void);
-extern "C" bool vk_fg_lsfg_dll_present(void);  // nvn/vulkan/framegen.c
 extern "C" void touch_controls_draw(ImVec2 display, ImFont *font);
 #endif
 static void set_open(bool open);
@@ -571,6 +570,8 @@ static void tab_display(void) {
         opt_int("Overlay opacity", &g_settings.overlay_opacity, 20, 100, 5, 100, "%d%%",
                 "How see-through the overlay is: lower lets more of the game show through.");
         static const struct { int bit; const char *label, *desc; } items[] = {
+            {OVERLAY_FPS, "Frame rate and frame time", "The game's frames a second and the time of one; with frame "
+                                                       "generation, the game's > the shown rate."},
             {OVERLAY_THROTTLE, "Thermal state", "Android's thermal state, T: 0 (none) to 6 (shutdown): how much the phone is "
                                                 "holding back for heat."},
             {OVERLAY_GPU, "GPU time", "The GPU's time for one frame."},
@@ -622,51 +623,17 @@ static void tab_display(void) {
     if (g_settings.fps_mode == 5)
         ImGui::TextWrapped("%s", tr("As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock "
                                     "stays right. Cutscenes stay at 30. The phone works harder and heats more."));
-    {   // Frame generation (nvn/vulkan/framegen.c): Win-FG (built in) or LSFG (the player's own Lossless.dll). The row
-        // opens the list of the three: a tap on the row no longer steps through them (a quick second tap picked LSFG
-        // and turned the generation off)
-        void launcher_pick_lsfg_dll(void);
-        std::string launcher_lsfg_import_msg(void);
-        static bool fg_list;
-        static const char *engines[] = {"Off", "Win-FG", "LSFG"};
-        static const char *engine_desc[] = {
-            "No frame generation.",
-            "Built in (win-fg, MIT). Needs a spare GPU. Adds a little delay.",
-            "Lossless Scaling's frame generation. Needs your own Lossless.dll: import it below, or put it in the LSFG or "
-            "Download folder of the phone's storage."};
-        int eng = g_settings.fg_engine >= FG_OFF && g_settings.fg_engine <= FG_LSFG ? g_settings.fg_engine : FG_OFF;
-        if (opt_action("Frame generation", engines[eng], fg_list ? "Tap an engine to choose it."
-                                                                 : "Tap to choose Off, Win-FG or LSFG."))
-            fg_list = !fg_list;
-        if (fg_list) {
-            opt_indent(1);
-            bool dll = vk_fg_lsfg_dll_present();
-            for (int i = 0; i < 3; i++) {
-                bool no_dll = i == FG_LSFG && !dll;
-                const char *d = no_dll ? "Not available: no Lossless.dll yet. Import it below, or put it in the LSFG or "
-                                         "Download folder of the phone's storage."
-                                       : engine_desc[i];
-                if (no_dll) opt_disable_next();
-                if (opt_radio(engines[i], g_settings.fg_engine == i, d) && !no_dll) {
-                    g_settings.fg_engine = i;
-                    fg_list = false;
-                }
-            }
-            opt_indent(-1);
+    {   // Frame generation (Lossless Scaling's LSFG with the player's own Lossless.dll: nvn/vulkan/framegen.c)
+        static const char *fg[] = {"Off", "2x", "3x", "4x"};
+        int v = g_settings.lsfg ? g_settings.lsfg_mult - 1 : 0;
+        if (opt_choice("Frame generation (LSFG)", &v, fg, 4, 0,
+                       "Shows frames made between the game's own, for smoother motion (Lossless Scaling's frame "
+                       "generation). Needs your own Lossless.dll from Lossless Scaling: put it in the LSFG or Download folder "
+                       "of the phone's storage. Adds a little delay and needs a spare GPU; 2x on 30 fps shows 60.")) {
+            g_settings.lsfg = v > 0;
+            if (v > 0) g_settings.lsfg_mult = v + 1;
         }
-        if (g_settings.fg_engine) {
-            static const char *mults[] = {"2x", "3x", "4x"};
-            int m = g_settings.fg_mult - 2;
-            if (opt_choice("Images per game frame", &m, mults, 3, 0,
-                           "How many images are shown per game frame: 2x shows one made frame between the game's own."))
-                g_settings.fg_mult = m + 2;
-        }
-        if (g_settings.fg_engine == FG_WINFG) {
-            static const char *perfs[] = {"Quality", "Balanced", "Performance"};
-            opt_choice("Quality", &g_settings.fg_perf, perfs, 3, 1,
-                       "Win-FG's motion estimation: quality solves the finest level of the motion, performance a coarser one (faster, less exact).");
-        }
-        if (g_settings.fg_engine == FG_LSFG) {
+        if (g_settings.lsfg) {
             static const char *fl[] = {"Auto", "25%", "50%", "75%", "100%"};
             static const int flv[] = {0, 25, 50, 75, 100};
             int k = 0;
@@ -675,7 +642,10 @@ static void tab_display(void) {
                            "The resolution the motion between frames is measured at: lower is faster, higher looks cleaner. "
                            "Auto: the game's own."))
                 g_settings.lsfg_flow = flv[k];
+            ImGui::TextWrapped("%s", vk_fg_built() ? vk_fg_status() : tr("Not in this build."));
             if (vk_fg_built()) {  // (a copy in the app's own files: read without All files access; BOTWRecomp e3ccd7a)
+                void launcher_pick_lsfg_dll(void);
+                std::string launcher_lsfg_import_msg(void);
                 std::string m = launcher_lsfg_import_msg();
                 char id[900];
                 snprintf(id, sizeof id, "%s%s%s", tr("Picks your Lossless.dll with Android's file picker and keeps a copy "
@@ -684,7 +654,6 @@ static void tab_display(void) {
                 if (opt_button("Import Lossless.dll", id)) launcher_pick_lsfg_dll();
             }
         }
-        if (g_settings.fg_engine) ImGui::TextWrapped("%s", vk_fg_built() ? vk_fg_status() : tr("Not in this build."));
     }
 #endif
     opt_section("Rendering");
@@ -705,11 +674,11 @@ static void tab_display(void) {
         for (int i = 0; i < NRES; i++) if (res_mode[i] == g_settings.res_mode) ri = i;
         float sx, sy;
         renderer_get_scene_scale(&sx, &sy);
-        char d[768];
+        char d[640];
         int n = snprintf(d, sizeof d, tr("How sharp the 3D image is (the HUD is drawn at the Output resolution). Match "
                                          "display: the final image's resolution (your screen's, unless Output resolution is "
                                          "lower). Dynamic: as sharp as your GPU keeps at "
-                                         "full speed. 1x-8x: the Switch's 900p times that (the higher ones need a lot of GPU memory). 75%% / 50%% / 25%%: a share of the "
+                                         "full speed. 1x-2x: the Switch's 900p times that. 75%% / 50%% / 25%%: a share of the "
                                          "display, for slower devices.\n\nRendering the 3D image at %.0f x %.0f."),
                          1600.0 * sx, 900.0 * sy);
         if (g_settings.res_mode == RES_DYNAMIC && n > 0 && n < (int)sizeof d)

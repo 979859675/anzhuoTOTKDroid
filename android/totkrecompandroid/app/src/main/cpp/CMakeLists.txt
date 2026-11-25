@@ -47,10 +47,6 @@ else()
     list(REMOVE_ITEM RT_SRC ${R}/runtime/hle/movie.c)
 endif()
 file(GLOB VK_SRC CONFIGURE_DEPENDS ${R}/runtime/nvn/vulkan/*.c ${R}/runtime/nvn/vulkan/*.cpp)
-# Win-FG frame generation (runtime/nvn/vulkan/winfg, MIT, The412Banner/win-fg): always in the build (C++, for its
-# compute chain; NOTICE.md). Its engine is off unless the menu turns it on.
-file(GLOB WINFG_SRC CONFIGURE_DEPENDS ${R}/runtime/nvn/vulkan/winfg/*.cpp)
-list(APPEND VK_SRC ${WINFG_SRC})
 # Lossless Scaling frame generation (runtime/nvn/vulkan/lsfg, ported from Eden through Swap2-Native): GPL-3.0-or-later, so a
 # libmain.so built with it (the default) is GPL-3.0-or-later as a whole (NOTICE.md). -DTOTK_LSFG=OFF (Gradle
 # -PtotkLsfg=false) leaves it out: the rest of TOTKDroid is MIT, and vulkan/framegen.c then reports "not in this build"

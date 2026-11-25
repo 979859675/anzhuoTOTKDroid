@@ -107,16 +107,12 @@ static VkSampler sampler_new(lsfg_chain *c, VkSamplerAddressMode mode, VkCompare
 // The constants of a pass (Eden's LsfgConstants, 48 bytes) at their offset in the chain's uniform buffer; one entry per distinct (timestamp, first_iter, first_iter_s)
 typedef struct { uint32_t input_offset[2], first_iter, first_iter_s, advanced_color_kind, hdr_support; float resolution_inv_scale, timestamp, ui_threshold; uint32_t pad[3]; } lconst;
 _Static_assert(sizeof(lconst) == 48, "LsfgConstants");
-// The bytes written to the constant blocks since the start: what the generated frames upload (the [device] line)
-static uint64_t g_lsfg_uploaded;
-uint64_t lsfg_upload_bytes(void) { return g_lsfg_uploaded; }
-
 static VkDeviceSize ubo_get(lsfg_chain *c, float flow_scale, float ts, int fi, int fis) {
     for (int i = 0; i < c->nubo; i++) if (c->ubo[i].key.ts == ts && c->ubo[i].key.fi == fi && c->ubo[i].key.fis == fis) return c->ubo[i].off;
     if (c->nubo >= MAX_UBO) { VRED("lsfg: more than %d constant blocks", MAX_UBO); c->bad = 1; return 0; }
     lubo *u = &c->ubo[c->nubo]; u->key.ts = ts; u->key.fi = fi; u->key.fis = fis; u->off = (VkDeviceSize)c->nubo * c->ustride; c->nubo++;
     lconst k = {{0, 0}, fi ? 1u : 0u, fis ? 1u : 0u, 0, 0, 1.0f / flow_scale, ts, 0.5f, {0, 0, 0}};
-    if (c->umap) { memcpy(c->umap + u->off, &k, sizeof k); g_lsfg_uploaded += sizeof k; }
+    if (c->umap) memcpy(c->umap + u->off, &k, sizeof k);
     return u->off;
 }
 
