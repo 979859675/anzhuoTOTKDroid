@@ -777,20 +777,14 @@ static void tab_display(void) {
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. FXAA: a single, cheaper pass that also softens the image "
                "a little. Most useful at a lower internal resolution.");
-    {   // The sun's shadow maps: smaller (the game's own size, or the Lower steps: native.c fix_shadow_size) or larger
-        // (vulkan/textures.c shadow_scale: 960 px at 1x, 3840 at 4x). One control for both. Applies at the next start.
-        static const char *sizes[] = {"Lowest (256 px)", "Lower (288 px)", "1x (960 px)", "2x (1920 px)", "3x (2880 px)", "4x (3840 px)"};
-        int sc = g_settings.shadow_scale < 1 ? 1 : g_settings.shadow_scale > 4 ? 4 : g_settings.shadow_scale;
-        int ss = g_settings.shadow_res == 256 ? 0 : g_settings.shadow_res == 288 ? 1 : sc + 1;
-        if (opt_choice("Shadow map size", &ss, sizes, 6, 2,
-                       "The sun's shadow maps: smaller for a weaker GPU (softer, blockier shadows), or larger for sharper "
-                       "shadows. Each step up adds GPU memory: 4x takes a few hundred MB more. Experimental: at 2x and up the "
-                       "shadow edges may show extra copies, which are not fixed yet. Applies the next time the game starts.", false)) {
-            g_settings.shadow_res = ss == 0 ? 256 : ss == 1 ? 288 : 0;
-            g_settings.shadow_scale = ss >= 2 ? ss - 1 : 1;
-        }
-    }
     {   // The game's own rendering costs (runtime/native.c: shadow map size, its FXAA, the far plane). They apply at once.
+        static const char *shadows[] = {"Game", "Lower", "Lowest"};
+        static const int shadow_px[] = {0, 288, 256};
+        int si = g_settings.shadow_res == 288 ? 1 : g_settings.shadow_res == 256 ? 2 : 0;
+        if (opt_choice("Shadow quality", &si, shadows, 3, 0,
+                       "The size of the sun's shadow maps. Lower ones cost the GPU less, with softer, blockier shadows. "
+                       "It may help a weaker GPU; on a Snapdragon 8 Elite it made no difference.", false))
+            g_settings.shadow_res = shadow_px[si];
         opt_toggle("Shadows", &g_settings.shadows, true,
                    "The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is "
                    "flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. "

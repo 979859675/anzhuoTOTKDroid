@@ -433,7 +433,6 @@ static void pick_device(void) {
     g_vk.phys = pd[best];
     free(pd);
     vkGetPhysicalDeviceProperties(g_vk.phys, &g_vk.props);
-    renderer_set_shadow_scale(g_settings.shadow_scale);  // (textures.c: before the game makes its maps)
     uint32_t nq = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(g_vk.phys, &nq, NULL);
     VkQueueFamilyProperties *qp = calloc(nq, sizeof *qp);

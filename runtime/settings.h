@@ -45,8 +45,6 @@ typedef struct {
     bool motion;          // the phone's (or a controller's) gyroscope as the controller's motion sensor (hle/motion.c)
     int rumble;           // the game's vibration, % strength (0 off) on the controller, or the phone without one (hle/input.c)
     int shadow_res;       // the game's shadow map size: 0 its own, 288, 256 (native.c fix_shadow_size)
-    int shadow_scale;     // the sun's shadow maps made this many times larger on each side, 1..4 (0: 1); 960 at 1x, 3840 at 4x
-                          // (vulkan/textures.c shadow_map_scale)
     bool game_fxaa;       // the game's own FXAA pass (native.c fix_game_fxaa)
     bool shadows;         // the game's shadows drawn (off: the depth-only passes outside the 3D scene's targets skipped -
                           // a flatter picture, a little less GPU work; vulkan/exec.c)
