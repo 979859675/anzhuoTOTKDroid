@@ -429,7 +429,6 @@ static void init(void) {
         if (FILE *f = fopen(p, "rb")) fclose(f);
         else continue;
         g_overlay_font = io.Fonts->AddFontFromFileTTF(p, 48, &cfg);
-        i18n_merge_overlay_font(io.Fonts, 48);  // (the overlay's Chinese: ui/i18n.mm)
         break;
     }
 #endif

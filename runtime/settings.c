@@ -43,7 +43,7 @@ Settings g_settings = {
     .overlay_items = OVERLAY_ALL,
     .touch_pos = {{-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1},
                   {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}},
-    .touch_scheme = 0,   // (the classic layout everywhere: the action-icon one is not used)
+    .touch_scheme = 1,
     .touch_pos2 = {{-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1},
                    {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1},
                    {-1, -1}},
@@ -292,7 +292,7 @@ void settings_load(void) {
         else if (!strcmp(key, "overlay_scale")) g_settings.overlay_scale = atoi(val);
         else if (!strcmp(key, "overlay_opacity")) g_settings.overlay_opacity = atoi(val);
         else if (!strcmp(key, "cheats_on")) snprintf(g_settings.cheats_on, sizeof g_settings.cheats_on, "%s", val);
-        else if (!strcmp(key, "overlay_items")) g_settings.overlay_items = atoi(val) | OVERLAY_FPS;  // (the frame rate is always shown)
+        else if (!strcmp(key, "overlay_items")) g_settings.overlay_items = atoi(val);
         else if (!strcmp(key, "overlay_pos")) sscanf(val, "%f,%f", &g_settings.overlay_pos[0], &g_settings.overlay_pos[1]);
 #endif
 #ifdef __ANDROID__
@@ -325,7 +325,7 @@ void settings_load(void) {
                 while (*q == ',' || *q == ' ') q++;
             }
         }
-        else if (!strcmp(key, "touch_scheme")) g_settings.touch_scheme = 0;   // (the action-icon layout is no longer used)
+        else if (!strcmp(key, "touch_scheme")) g_settings.touch_scheme = atoi(val);
         else if (!strcmp(key, "touch_aim_sens")) g_settings.touch_aim_sens = (float)atof(val);
         else if (!strcmp(key, "touch_talk")) g_settings.touch_talk = atoi(val) != 0;
         else if (!strcmp(key, "touch_minimap_top")) g_settings.touch_minimap_top = atoi(val) != 0;

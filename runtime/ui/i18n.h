@@ -13,7 +13,3 @@ std::string ui_upper(const char *s);
 // After a menu font is added to atlas: the letters it lacks for the menu language (Cyrillic, Japanese, Korean, Chinese)
 // merged into it from the phone's own fonts, at about the same height (size_px: the font's own)
 void i18n_merge_fonts(ImFontAtlas *atlas, float size_px);
-// The performance overlay's text in Simplified Chinese whatever the menus' language (anything not in the table as written),
-// and the Chinese glyphs merged into its font (after the overlay's font is added; size_px: the font's own)
-const char *tr_zh(const char *en);
-void i18n_merge_overlay_font(ImFontAtlas *atlas, float size_px);

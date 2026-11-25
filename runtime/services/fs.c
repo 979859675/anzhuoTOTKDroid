@@ -675,14 +675,6 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
         if (n < 0) LOG("[fs] storage read failed at %llx: %s\n", off, strerror(errno));
         if (st->plain || R->dlc) break;
         {
-            const char *path = romfs_file_at(off);
-            static const char *last;
-            if (path && path != last) {
-                last = path;
-                // (diagnosis: on by default, so a crash log names the last game files read; LARECOMP_LOG_FILES=0 turns it off)
-                const char *lf = getenv("LARECOMP_LOG_FILES");
-                if (!lf || strcmp(lf, "0")) LOG("[fs] read %s\n", path);
-            }
         }
         static uint64_t reads, bytes;
         reads++;
