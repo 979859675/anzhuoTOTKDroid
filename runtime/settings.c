@@ -7,6 +7,7 @@
 
 #include "hle.h"
 #include "input_bind.h"
+#include "settings_cheats_line.h"
 #ifdef __ANDROID__
 #include <SDL3/SDL.h>
 #include <sys/system_properties.h>
@@ -319,6 +320,7 @@ void settings_load(void) {
         else if (!strcmp(key, "touch_sticks_hidden")) g_settings.touch_sticks_hidden = atoi(val) != 0;
         else if (!strcmp(key, "touch_half_areas")) g_settings.touch_half_areas = atoi(val) != 0;
         else if (!strcmp(key, "touch_layout")) {  // x,y per control (a share of the screen; negative: default)
+            settings_cheats_cut(val, g_settings.cheats_on, sizeof g_settings.cheats_on);  // (ae200ac's glued cheats_on)
             char *q = val;
             for (int i = 0; i < TOUCH_NCTL * 2 && *q; i++) {
                 g_settings.touch_pos[i / 2][i % 2] = strtof(q, &q);
@@ -438,7 +440,7 @@ void settings_save(void) {
     fprintf(f, "touch_scale = %.2f\ntouch_opacity = %.2f\ntouch_layout = ", g_settings.touch_scale, g_settings.touch_opacity);
     for (int i = 0; i < TOUCH_NCTL; i++)
         fprintf(f, "%s%.4f,%.4f", i ? "," : "", g_settings.touch_pos[i][0], g_settings.touch_pos[i][1]);
-    fprintf(f, "cheats_on = %s\n", g_settings.cheats_on);
+    settings_cheats_write(f, g_settings.cheats_on);   // (on its own line: settings_cheats_line.h)
     fprintf(f, "\ntouch_scheme = %d\ntouch_aim_sens = %.2f\ntouch_talk = %d\ntouch_icons_layout = ", g_settings.touch_scheme,
             g_settings.touch_aim_sens, g_settings.touch_talk ? 1 : 0);
     for (int i = 0; i < TOUCH_NCTL2; i++)

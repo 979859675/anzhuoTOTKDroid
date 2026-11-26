@@ -62,7 +62,7 @@
 - 未运行的情况（见 `docs/CHEATS.md`）：指令写入之外还有其他操作码、写入未整 4/8 字节的指令、写入移植器自己改过的指令、跳转到游戏代码中未被金手指写入的零字。
 - 重编译版（`LARECOMP_NATIVE=0`）中不运行代码金手指，数据金手指未验证。
 
-金手指开关保存在设置的 `cheats_on` 里，键是 `<模组文件夹名>/<金手指名>` 的 FNV-1a 32 位哈希。**重命名模组文件夹会把它的金手指全部关掉。**
+金手指开关保存在设置文件（`totkrecompandroid.ini`）的 `cheats_on` 一行里，键是 `<模组文件夹名>/<金手指名>` 的 FNV-1a 32 位哈希。这一行必须单独成行（`runtime/settings_cheats_line.h`）：0.4.2 的 ae200ac 曾把它接在 `touch_layout` 后面，开关会在每次开机时丢失。修复后读取时会自动拆出旧文件里接在一起的开关。**重命名模组文件夹会把它的金手指全部关掉。**
 
 ### 2. 金手指名称的中文显示
 
@@ -93,7 +93,7 @@
 - 增大被模组替换文件的表项，并为新增文件估算表项；
 - 把结果写到 `cache/restbl/ResourceSizeTable.zs`（`cache/` 不提交）。
 
-测试：`bash tests/restbl/run.sh`。
+测试：`bash tests/restbl/run.sh`（RESTBL）、`bash tests/settings/run.sh`（设置文件里的 `cheats_on` 行）。
 
 ### 7. romfs 读取日志
 
@@ -123,7 +123,7 @@
    ```
    如果失败，用 `files/` 中的完整文件覆盖对应路径，并核对 `FILES.txt`。
 3. 检查 `android/totkrecompandroid/gradlew` 的权限必须是 100755（`git ls-tree` 显示 `100755`）。从某些提交检出文件时权限会变成 100644，CI 的 `gradlew` 会失败（`79dcb4d`、`68365e0` 就因此失败，修复为 `chmod +x` 后提交）。
-4. 主机测试：`bash tests/cheat_vm/run.sh`、`bash tests/exefs/run.sh`、`bash tests/restbl/run.sh`。`.mm` 文件和 `perf_overlay.mm` 不能在主机上编译，以 CI 的 `gradlew assembleDebug` 为准。
+4. 主机测试：`bash tests/cheat_vm/run.sh`、`bash tests/exefs/run.sh`、`bash tests/restbl/run.sh`、`bash tests/settings/run.sh`。`.mm` 文件和 `perf_overlay.mm` 不能在主机上编译，以 CI 的 `gradlew assembleDebug` 为准。
 5. 不要再加入第一节“没有加入的内容”中的项，除非用户明确要求。
 
 ### 已知风险
