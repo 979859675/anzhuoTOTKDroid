@@ -13,6 +13,12 @@ function cfg(): array {
             exit('server not configured');
         }
         $c = require $f;
+        // (a config.php without 'return [ ... ];' makes require() give 1: say what to fix, not a TypeError)
+        if (!is_array($c) || !isset($c['db'])) {
+            http_response_code(500);
+            header('Content-Type: text/plain; charset=utf-8');
+            exit("server config error: config.php must start with <?php and end with: return [ ... ]; (see DEPLOY.md section 4)");
+        }
     }
     return $c;
 }

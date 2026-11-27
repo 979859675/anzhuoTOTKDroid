@@ -16,7 +16,7 @@
 
 ## 3. 上传代码
 
-把仓库里的 `server/` 目录放到服务器上，**网站根目录指向 `server/public/`**（不要指向 `server/`，否则配置文件会被下载）。
+把仓库里的 `server/` 目录放到服务器上，**网站根目录指向 `server/public/`**（不要指向 `server/`，否则配置文件会被下载）。宝塔里：网站 → 设置 → 网站目录 → 运行目录，选 `/public`，或直接把网站根目录设成 `/www/wwwroot/help.xzbbk.cn/public`。之后访问地址是 `https://help.xzbbk.cn/admin.php`，不是 `/public/admin.php`。
 
 ```
 server/
@@ -31,6 +31,9 @@ server/
 `src/` 和 `config.php` 都在 `public/` 的**上一级**，只有 `public/` 对外可见。`public/api.php` 通过 `../src/common.php` 读取代码，`common.php` 通过 `../config.php` 读取配置，所以 `config.php` 必须正好放在 `server/config.php`。
 
 ## 4. 写配置
+
+`config.php` 必须是下面这种格式：第一行是 `<?php`，中间用 `return [ ... ];` 返回配置数组。**少了 `return`，或者前面有空行、文字，都会报错。**（报错 `cfg(): Return value must be of type array, int returned` 就是这个原因。）
+
 
 复制 `config.example.php` 为 `config.php`，只需要改数据库密码：
 
