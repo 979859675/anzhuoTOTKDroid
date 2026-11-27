@@ -26,3 +26,6 @@ __pycache__/
 
 # test captures (screenshots, videos from testers)
 testes/
+
+# account server: the real config (database password, admin hash) lives only on the server
+server/config.php
