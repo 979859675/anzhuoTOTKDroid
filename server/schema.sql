@@ -24,6 +24,15 @@ CREATE TABLE IF NOT EXISTS devices (
   CONSTRAINT fk_devices_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- the admin account(s): created by the first visit to admin.php (the first name and password entered there)
+CREATE TABLE IF NOT EXISTS admins (
+  id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  username VARCHAR(20) NOT NULL,
+  pass_hash VARCHAR(255) NOT NULL,
+  created_at DATETIME NOT NULL,
+  UNIQUE KEY uq_admin (username)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- k / v: 'reg_passphrase_hash' (absent = registration closed)
 CREATE TABLE IF NOT EXISTS settings (
   k VARCHAR(32) NOT NULL PRIMARY KEY,

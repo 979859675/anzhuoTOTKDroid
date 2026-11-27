@@ -8,9 +8,7 @@ return [
         'user' => 'totk_accounts',
         'pass' => 'CHANGE_ME',       // the database password from the BT panel
     ],
-    // The web admin's password as a bcrypt hash. Make it with:
-    //   php -r 'echo password_hash("your admin password", PASSWORD_DEFAULT), PHP_EOL;'
-    'admin_hash' => '',
+    // (the web admin's account and password: set on the first visit to admin.php, see DEPLOY.md)
     'max_devices' => 2,   // devices per account
     'token_days' => 30,   // a login lasts this long (the app checks online at every launch)
 ];
