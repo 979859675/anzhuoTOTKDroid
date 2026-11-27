@@ -1,4 +1,4 @@
-# 账号服务器部署（help.xzbbk.cn，宝塔面板）
+# 账号服务器部署（ly.xzcqgzs.cn，宝塔面板）
 
 这套代码是 0.4.2 登录功能的服务端：注册、登录、每次启动校验、登出，外加一个网页后台。
 **还没有在真实服务器上测试**（开发环境没有 PHP 和 MySQL），第一次部署后请按第 6 节做一遍检查。
@@ -7,7 +7,7 @@
 
 - PHP **8.0 或更高**，启用扩展 `pdo_mysql`（默认一般已开）。
 - MySQL **8.0**。
-- 站点 `help.xzbbk.cn`，已申请 SSL 证书，强制 HTTPS。
+- 站点 `ly.xzcqgzs.cn`，已申请 SSL 证书，强制 HTTPS。
 
 ## 2. 建数据库
 
@@ -16,7 +16,7 @@
 
 ## 3. 上传代码
 
-把仓库里的 `server/` 目录放到服务器上，**网站根目录指向 `server/public/`**（不要指向 `server/`，否则配置文件会被下载）。宝塔里：网站 → 设置 → 网站目录 → 运行目录，选 `/public`，或直接把网站根目录设成 `/www/wwwroot/help.xzbbk.cn/public`。之后访问地址是 `https://help.xzbbk.cn/admin.php`，不是 `/public/admin.php`。
+把仓库里的 `server/` 目录放到服务器上，**网站根目录指向 `server/public/`**（不要指向 `server/`，否则配置文件会被下载）。宝塔里：网站 → 设置 → 网站目录 → 运行目录，选 `/public`，或直接把网站根目录设成 `/www/wwwroot/ly.xzcqgzs.cn/public`。之后访问地址是 `https://ly.xzcqgzs.cn/admin.php`，不是 `/public/admin.php`。
 
 ```
 server/
@@ -43,7 +43,7 @@ server/
 
 ## 5. 首次设置管理员（尽快做）
 
-打开 `https://help.xzbbk.cn/admin.php`。**第一次打开时，页面会让你输入一个账户和密码，输入的这个账户就是管理员。** 之后只能用这个账户和密码登录后台。
+打开 `https://ly.xzcqgzs.cn/admin.php`。**第一次打开时，页面会让你输入一个账户和密码，输入的这个账户就是管理员。** 之后只能用这个账户和密码登录后台。
 
 - 账户 3–20 位（字母、数字、下划线），密码至少 8 位。
 - 这一步没有任何人拦截：**部署好以后马上打开一次完成设置**，避免别人先于你设置。
@@ -59,24 +59,24 @@ server/
 
 ```
 # 注册（PHRASE 是后台设的注册口令）
-curl -s -X POST 'https://help.xzbbk.cn/api.php?action=register' \
+curl -s -X POST 'https://ly.xzcqgzs.cn/api.php?action=register' \
   -d '{"username":"test01","password":"test123","passphrase":"PHRASE"}'
 # 期望：{"ok":true}
 
 # 登录（得到 token）
-curl -s -X POST 'https://help.xzbbk.cn/api.php?action=login' \
+curl -s -X POST 'https://ly.xzcqgzs.cn/api.php?action=login' \
   -d '{"username":"test01","password":"test123","device_id":"devicetest000000001"}'
 # 期望：{"ok":true,"token":"64位十六进制","username":"test01"}
 
 # 校验（把上一步的 token 填进去）
-curl -s -X POST 'https://help.xzbbk.cn/api.php?action=check' \
+curl -s -X POST 'https://ly.xzcqgzs.cn/api.php?action=check' \
   -d '{"device_id":"devicetest000000001","token":"TOKEN"}'
 # 期望：{"ok":true}
 ```
 
 再用两个不同的设备 id 登录第 3 次，应得到 `{"ok":false,"error":"device limit"}`（HTTP 403）。
 
-确认 `https://help.xzbbk.cn/src/common.php` 和 `https://help.xzbbk.cn/config.php` 访问不到（应为 404）。
+确认 `https://ly.xzcqgzs.cn/src/common.php` 和 `https://ly.xzcqgzs.cn/config.php` 访问不到（应为 404）。
 
 测完在后台删掉测试账号。
 

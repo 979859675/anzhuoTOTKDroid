@@ -47,7 +47,7 @@
             android:configChanges="layoutDirection|locale|grammaticalGender|fontScale|fontWeightAdjustment|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
             android:preferMinimalPostProcessing="true"
             android:exported="false" />
-        <!-- The launcher and the shortcuts: the login (help.xzbbk.cn, server/): checks the login at every launch, and
+        <!-- The launcher and the shortcuts: the login (ly.xzcqgzs.cn, server/): checks the login at every launch, and
              starts the game only after it. Offline without a valid login: the login form. -->
         <activity
             android:name=".LoginActivity"

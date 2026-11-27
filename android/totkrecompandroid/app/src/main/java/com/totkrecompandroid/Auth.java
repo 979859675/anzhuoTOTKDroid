@@ -18,10 +18,10 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.UUID;
 
-/** The account server (help.xzbbk.cn, server/api.php): login, and the check at every launch. Network calls: never on the
+/** The account server (ly.xzcqgzs.cn, server/api.php): login, and the check at every launch. Network calls: never on the
  *  main thread. */
 final class Auth {
-    static final String SERVER = "https://help.xzbbk.cn/api.php?action=";
+    static final String SERVER = "https://ly.xzcqgzs.cn/api.php?action=";
     static final String GROUP = "1135442077";
     private static final String PREFS = "auth";
 

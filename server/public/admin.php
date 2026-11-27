@@ -1,6 +1,6 @@
 <?php
 // Web admin: set the registration passphrase, list accounts, disable / enable, clear the device list.
-// Open https://help.xzbbk.cn/admin.php (HTTPS only; see DEPLOY.md).
+// Open https://ly.xzcqgzs.cn/admin.php (HTTPS only; see DEPLOY.md).
 // The admin is set up on the first visit: the first account name and password entered here become the admin account.
 require __DIR__ . '/../src/common.php';
 
