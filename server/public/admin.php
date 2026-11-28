@@ -188,8 +188,14 @@ $out .= '<div class="card"><h2>注册口令</h2>'
         : '<span class="badge off">未设置，注册已关闭</span>') . '</p>'
     . '<form method="post" class="row"><input type="hidden" name="csrf" value="' . $csrf . '">'
     . '<input type="hidden" name="act" value="set_pass">'
-    . '<input type="text" name="passphrase" minlength="8" placeholder="新的注册口令（至少 8 位）" required autocomplete="off">'
-    . '<button>保存口令</button></form></div>';
+    . '<input type="text" name="passphrase" minlength="8" placeholder="' . ($has_pass ? '新的注册口令（至少 8 位）' : '注册口令（至少 8 位）') . '" required autocomplete="off">'
+    . '<button>' . ($has_pass ? '修改口令' : '设置口令') . '</button></form>'
+    . ($has_pass
+        ? '<form method="post" class="row" style="margin-top:10px" onsubmit="return confirm(\'确定删除注册口令？删除后用户无法注册。\')">'
+          . '<input type="hidden" name="csrf" value="' . $csrf . '"><input type="hidden" name="act" value="del_pass">'
+          . '<button class="warn">删除口令</button></form>'
+        : '')
+    . '</div>';
 
 $out .= '<div class="card"><h2>账号（' . count($rows) . '）</h2>';
 if (!$rows) {
