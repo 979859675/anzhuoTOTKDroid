@@ -12,6 +12,12 @@ val deps: File = repo.resolve("android/deps/out")  // android/deps/build_deps.sh
 val ffmpeg: File = repo.resolve("android/deps/ffmpeg").let { if (it.resolve("lib/libswresample.so").exists()) it else deps }
 fun depLib(name: String): File = (if (name.startsWith("libav") || name.startsWith("libsw")) ffmpeg else deps).resolve("lib/$name")
 val gen = layout.buildDirectory.dir("generated/totkrecompandroid")
+// The game's native library, encrypted with the key of the account server (B): TOTK_LIB_KEY (64 hex characters, the
+// build's ANDROID_LIB_KEY secret). Without it the library ships plain, as before. Release builds only (encryptMainLib).
+val libKeyHex: String? = System.getenv("TOTK_LIB_KEY")?.trim()?.ifEmpty { null }
+if (libKeyHex != null && !libKeyHex.matches(Regex("[0-9a-fA-F]{64}"))) throw GradleException("TOTK_LIB_KEY must be 64 hex characters")
+val libAssets = layout.buildDirectory.dir("generated/totkrecompandroid/libassets")
+val ASSET_NAME = "libmain.bin"  // (LibKey.java)
 // The release key: outside the repository, in ~/.totkrecompandroid/keystore.properties (storeFile, storePassword, keyAlias,
 // keyPassword); without it, release builds are signed with the debug key
 val releaseKey: File = File(System.getProperty("user.home"), ".totkrecompandroid/keystore.properties")
@@ -71,7 +77,7 @@ android {
         getByName("main") {
             java.srcDirs("src/main/java", deps.resolve("java"))  // (SDL's Java side, the same version as libSDL3.so)
             jniLibs.srcDirs(gen.get().asFile.resolve("jniLibs"))
-            assets.srcDirs(gen.get().asFile.resolve("assets"))
+            assets.srcDirs(gen.get().asFile.resolve("assets"), libAssets.get().asFile)
             res.srcDirs("src/main/res", gen.get().asFile.resolve("res"))
         }
     }
@@ -86,6 +92,7 @@ android {
             useLegacyPackaging = true  // adrenotools loads its hooks from nativeLibraryDir
             pickFirsts += listOf("**/libSDL3.so", "**/libshaderc_shared.so", "**/libavcodec.so", "**/libavformat.so",
                                  "**/libavutil.so", "**/libswscale.so", "**/libswresample.so")
+            if (libKeyHex != null) excludes += "**/libmain.so"  // (the encrypted copy is in the assets: LibKey.java)
         }
     }
 
@@ -210,6 +217,46 @@ val prepareTotkRecompAndroid by tasks.registering {
 tasks.named("preBuild") { dependsOn(prepareTotkRecompAndroid) }
 tasks.matching { it.name.startsWith("configureCMake") || it.name.startsWith("buildCMake") }.configureEach {
     dependsOn(prepareTotkRecompAndroid)
+}
+
+// Encrypts the game's native library (stripped, as packaged) into assets/libmain.bin: "TLB1" + IV + AES-256-GCM.
+val encryptMainLib = tasks.register("encryptMainLib") {
+    onlyIf { libKeyHex != null }
+    doLast {
+        val keyBytes = ByteArray(32) { libKeyHex!!.substring(2 * it, 2 * it + 2).toInt(16).toByte() }
+        val built = layout.buildDirectory.dir("intermediates/cxx").get().asFile.walkTopDown()
+            .filter { it.name == "libmain.so" && it.parentFile.name == "arm64-v8a" && it.path.contains("${File.separator}Release${File.separator}") }
+            .maxByOrNull { it.lastModified() } ?: throw GradleException("libmain.so of the release build not found")
+        // stripped the way the packaging strips it (llvm-strip of the NDK); without it, the unstripped one (larger)
+        val sdk = System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT") ?: ""
+        val strip = File(sdk, "ndk/30.0.16248370/toolchains/llvm/prebuilt").listFiles()
+            ?.map { it.resolve("bin/llvm-strip") }?.firstOrNull { it.exists() }
+        val lib = File(temporaryDir, "libmain.so")
+        built.copyTo(lib, overwrite = true)
+        if (strip != null) {
+            ProcessBuilder(strip.path, "--strip-unneeded", lib.path).inheritIO().start().waitFor()
+        } else {
+            logger.warn("encryptMainLib: no llvm-strip in the NDK; the encrypted library is not stripped")
+        }
+        val out = libAssets.get().asFile.resolve(ASSET_NAME)
+        out.parentFile.mkdirs()
+        out.delete()
+        val iv = ByteArray(12).also { java.security.SecureRandom().nextBytes(it) }
+        val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, javax.crypto.spec.SecretKeySpec(keyBytes, "AES"),
+            javax.crypto.spec.GCMParameterSpec(128, iv))
+        out.outputStream().use { raw ->
+            raw.write("TLB1".toByteArray(Charsets.US_ASCII))
+            raw.write(iv)
+            javax.crypto.CipherOutputStream(raw, cipher).use { enc -> lib.inputStream().use { it.copyTo(enc) } }
+        }
+        lib.delete()
+        logger.lifecycle("encryptMainLib: ${out.length()} bytes from ${built.length()}")
+    }
+}
+afterEvaluate {
+    encryptMainLib.configure { dependsOn(tasks.matching { it.name.startsWith("buildCMakeRelease") }) }
+    tasks.matching { it.name == "mergeReleaseAssets" }.configureEach { dependsOn(encryptMainLib) }
 }
 
 // The certificate the release APK is actually signed with: AGP's own signing config for the release type (the keystore.properties

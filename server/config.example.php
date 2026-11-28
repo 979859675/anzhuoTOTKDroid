@@ -11,4 +11,7 @@ return [
     // (the web admin's account and password: set on the first visit to admin.php, see DEPLOY.md)
     'max_devices' => 2,   // devices per account
     'token_days' => 30,   // a login lasts this long (the app checks online at every launch)
+    // the game library's key (64 hex characters): the same value as the GitHub secret ANDROID_LIB_KEY. Without it the
+    // app cannot start the encrypted game library (api.php?action=libkey answers 503).
+    'lib_key' => 'CHANGE_ME_64_HEX',
 ];

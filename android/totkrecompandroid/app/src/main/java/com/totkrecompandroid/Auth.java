@@ -90,6 +90,13 @@ final class Auth {
         return post("check", obj("device_id", deviceId(c), "token", token));
     }
 
+    /** The game library's key, with a valid session (LibKey.java); the answer's "key" is 64 hex characters. */
+    static Result libKey(Context c) {
+        String token = token(c);
+        if (token == null) return new Result(401, null);
+        return post("libkey", obj("device_id", deviceId(c), "token", token));
+    }
+
     private static JSONObject obj(String... kv) {
         JSONObject o = new JSONObject();
         try {

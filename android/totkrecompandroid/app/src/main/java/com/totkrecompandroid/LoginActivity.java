@@ -56,7 +56,7 @@ public class LoginActivity extends Activity {
                 Auth.Result r = Auth.check(this);
                 ui.post(() -> {
                     if (r.ok()) {
-                        startGame();
+                        enterGame();
                         return;
                     }
                     setBusy(false, "");
@@ -190,7 +190,7 @@ public class LoginActivity extends Activity {
                 Auth.Result r = Auth.login(this, u, p);
                 ui.post(() -> {
                     if (r.ok()) {
-                        startGame();
+                        enterGame();
                         return;
                     }
                     setBusy(false, "");
@@ -200,7 +200,30 @@ public class LoginActivity extends Activity {
         }
     }
 
-    private void startGame() {
+    // The game needs the key of its library when this build has it encrypted (LibKey): fetched now, with the session,
+    // and kept in memory for the game activity. Without the key the login page stays.
+    private void enterGame() {
+        if (!LibKey.encrypted(this)) {
+            launchGame();
+            return;
+        }
+        setBusy(true, "正在获取游戏密钥…");
+        new Thread(() -> {
+            Auth.Result r = Auth.libKey(this);
+            ui.post(() -> {
+                if (r.ok() && LibKey.set(r.body.optString("key", ""))) {
+                    launchGame();
+                    return;
+                }
+                setBusy(false, "");
+                showStatus(r.code == -1 ? "无法获取游戏密钥，请检查网络"
+                        : r.code == 503 ? "服务器未设置游戏密钥，请联系管理员"
+                        : "无法获取游戏密钥，请重新登录");
+            });
+        }).start();
+    }
+
+    private void launchGame() {
         // the game's own activity (not exported) with what this one got: the shortcut's action, the launch extras
         Intent game = new Intent(this, TOTKRecompAndroidActivity.class);
         game.setAction(getIntent().getAction());

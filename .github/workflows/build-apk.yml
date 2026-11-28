@@ -107,6 +107,9 @@ jobs:
       - name: Build the APK
         id: gradle
         working-directory: android/totkrecompandroid
+        env:
+          # the game library's key (the server's lib_key must be the same): encrypts libmain.so; empty = plain (as before)
+          TOTK_LIB_KEY: ${{ secrets.ANDROID_LIB_KEY }}
         run: |
           LOG="$RUNNER_TEMP/gradle.log"
           set +e

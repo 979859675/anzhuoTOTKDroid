@@ -92,7 +92,32 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
 
     @Override
     protected String[] getLibraries() {
-        return new String[] {"SDL3", "shaderc_shared", "main"};
+        // (an encrypted build loads "main" itself, once its key is here: loadLibraries below)
+        return LibKey.encrypted(this) ? new String[] {"SDL3", "shaderc_shared"}
+                                      : new String[] {"SDL3", "shaderc_shared", "main"};
+    }
+
+    @Override
+    public void loadLibraries() {
+        super.loadLibraries();
+        if (!LibKey.encrypted(this)) return;
+        try {
+            File lib = LibKey.decryptTo(this);
+            setenv("LARECOMP_LIBMAIN", lib.getAbsolutePath());  // (the game's builder links against this copy)
+            System.load(lib.getAbsolutePath());
+            LibKey.setLoadedPath(lib.getAbsolutePath());
+        } catch (Throwable t) {
+            // SDL shows this as its "could not start" message; the game does not run without its library
+            throw new UnsatisfiedLinkError("the game's library: " + t.getMessage());
+        } finally {
+            LibKey.forget();  // the key is not needed once the library is in memory
+        }
+    }
+
+    @Override
+    protected String getMainSharedObject() {
+        String loaded = LibKey.loadedPath();  // SDL opens the main library by this path: the decrypted copy
+        return loaded != null ? loaded : super.getMainSharedObject();
     }
 
     @Override

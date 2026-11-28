@@ -43,6 +43,8 @@ server/
 
 `max_devices`（每账号设备数，默认 2）和 `token_days`（登录有效天数，默认 30）可以按需改。后台的管理员不在配置文件里设置。
 
+`lib_key`（游戏核心库的解密密钥，64 位十六进制）必须和 GitHub 仓库 secret `ANDROID_LIB_KEY` 的值一模一样。改成你自己的值（不要用示例里的 `CHANGE_ME_64_HEX`）；没设好的话，应用会因为拿不到密钥而无法启动游戏。
+
 ## 5. 首次设置管理员（尽快做）
 
 打开 `https://ly.xzcqgzs.cn/admin.php`。**第一次打开时，页面会让你输入一个账户和密码，输入的这个账户就是管理员。** 之后只能用这个账户和密码登录后台。
@@ -92,6 +94,7 @@ curl -s -X POST 'https://ly.xzcqgzs.cn/api.php?action=check' \
 | `login` | `username`, `password`, `device_id` | `{"ok":true,"token","username"}` | 401 账号或密码错，403 设备数已满或账号被禁用 |
 | `check` | `device_id`, `token` | `{"ok":true}` | 401 未登录或已过期，403 被禁用 |
 | `logout` | `device_id`, `token` | `{"ok":true}` | — |
+| `libkey` | `device_id`, `token` | `{"ok":true,"key"}` | 401 未登录或已过期，403 被禁用，503 服务器没设 `lib_key` |
 
 用户名 3–20 位（字母、数字、下划线）；密码 6–72 字节；设备 id 16–64 位（字母、数字、`_`、`-`）。
 

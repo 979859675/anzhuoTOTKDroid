@@ -14,6 +14,7 @@ switch ($action) {
     case 'login':    login($in);    break;
     case 'check':    check($in);    break;
     case 'logout':   logout($in);   break;
+    case 'libkey':   libkey($in);   break;
     default:         json_out(404, ['ok' => false, 'error' => 'unknown action']);
 }
 
@@ -98,6 +99,13 @@ function login(array $in): void {
 
 // Called at every launch while online. Failure sends the app back to the login page.
 function check(array $in): void {
+    session_or_exit($in);
+    json_out(200, ['ok' => true]);
+}
+
+// The session (device id + token) must be valid, the account enabled and the token not expired; otherwise this
+// answers with the error and stops. Returns the device row id.
+function session_or_exit(array $in): int {
     $device = str_field($in, 'device_id');
     $token = str_field($in, 'token');
     if (!valid_device($device) || strlen($token) !== 64) json_out(401, ['ok' => false, 'error' => 'no session']);
@@ -113,7 +121,17 @@ function check(array $in): void {
     if ($r['token_expires'] === null || $r['token_expires'] < now_utc()) json_out(401, ['ok' => false, 'error' => 'expired']);
 
     db()->prepare('UPDATE devices SET last_seen = ? WHERE id = ?')->execute([now_utc(), $r['id']]);
-    json_out(200, ['ok' => true]);
+    return (int)$r['id'];
+}
+
+// The key that decrypts the game's native library in the app (B: the library is encrypted at build time, and the app
+// gets the key only with a valid session, at launch, in memory). Set cfg 'lib_key' (64 hex characters): the same
+// value as the build's ANDROID_LIB_KEY secret.
+function libkey(array $in): void {
+    session_or_exit($in);
+    $key = (string)(cfg()['lib_key'] ?? '');
+    if (!preg_match('/^[0-9a-f]{64}$/i', $key)) json_out(503, ['ok' => false, 'error' => 'lib key not configured']);
+    json_out(200, ['ok' => true, 'key' => strtolower($key)]);
 }
 
 function logout(array $in): void {
