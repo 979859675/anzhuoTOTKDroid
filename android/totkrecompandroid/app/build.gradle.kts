@@ -229,9 +229,12 @@ val encryptMainLib = tasks.register("encryptMainLib") {
     onlyIf { libKeyHex != null }
     doLast {
         val keyBytes = ByteArray(32) { libKeyHex!!.substring(2 * it, 2 * it + 2).toInt(16).toByte() }
-        val built = layout.buildDirectory.dir("intermediates/cxx").get().asFile.walkTopDown()
-            .filter { it.name == "libmain.so" && it.parentFile.name == "arm64-v8a" && it.path.contains("${File.separator}Release${File.separator}") }
-            .maxByOrNull { it.lastModified() } ?: throw GradleException("libmain.so of the release build not found")
+        // the CMake output (not yet merged or stripped by AGP), else whatever the build has of it
+        val found = layout.buildDirectory.get().asFile.walkTopDown()
+            .filter { it.name == "libmain.so" && it.parentFile.name == "arm64-v8a" }.toList()
+        val built = found.filter { it.path.contains("${File.separator}cxx${File.separator}") }.maxByOrNull { it.lastModified() }
+            ?: found.maxByOrNull { it.lastModified() }
+            ?: throw GradleException("libmain.so of the release build not found under ${layout.buildDirectory.get().asFile}")
         // stripped the way the packaging strips it (llvm-strip of the NDK); without it, the unstripped one (larger)
         val sdk = System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT") ?: ""
         val strip = File(sdk, "ndk/30.0.16248370/toolchains/llvm/prebuilt").listFiles()
@@ -260,7 +263,13 @@ val encryptMainLib = tasks.register("encryptMainLib") {
     }
 }
 afterEvaluate {
-    encryptMainLib.configure { dependsOn(tasks.matching { it.name.startsWith("buildCMakeRelease") }) }
+    // after the native build: the CMake tasks (their names differ between AGP versions) and the native libs merge
+    encryptMainLib.configure {
+        dependsOn(tasks.matching { t ->
+            t.name == "mergeReleaseNativeLibs" ||
+                (t.name.contains("Release") && (t.name.startsWith("buildCMake") || t.name.startsWith("externalNativeBuild")))
+        })
+    }
     tasks.matching { it.name == "mergeReleaseAssets" }.configureEach { dependsOn(encryptMainLib) }
 }
 

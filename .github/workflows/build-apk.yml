@@ -119,7 +119,7 @@ jobs:
           tail -n 60 "$LOG"
           if [ "$status" -ne 0 ]; then
             # the failing lines as annotations (readable through the API when the logs are not)
-            grep -E "^e: |error|FAILED|What went wrong|Execution failed|Could not|Caused by" "$LOG" | head -n 25 \
+            grep -E -A2 "^e: |error|FAILED|What went wrong|Execution failed|Could not|Caused by" "$LOG" | grep -v "^--$" | head -n 40 \
               | while IFS= read -r l; do echo "::error title=build::$(echo "$l" | cut -c1-900)"; done
             exit "$status"
           fi
