@@ -18,22 +18,25 @@ switch ($action) {
 }
 
 function register(array $in): void {
-    $passphrase = str_field($in, 'passphrase');   // the registration passphrase set in the web admin
+    $passphrase = trim(str_field($in, 'passphrase'));  // one of the passphrases the admin has enabled
     $user = str_field($in, 'username');
     $pw = str_field($in, 'password');
     if (!valid_username($user)) json_out(400, ['ok' => false, 'error' => 'bad username']);
     if (!valid_password($pw)) json_out(400, ['ok' => false, 'error' => 'bad password']);
 
-    $row = db()->query("SELECT v FROM settings WHERE k = 'reg_passphrase_hash'")->fetch();
-    if (!$row) json_out(503, ['ok' => false, 'error' => 'registration closed']);
-    if (!password_verify($passphrase, $row['v'])) {
+    $open = (int)db()->query('SELECT COUNT(*) AS n FROM passphrases WHERE enabled = 1')->fetch()['n'];
+    if ($open === 0) json_out(503, ['ok' => false, 'error' => 'registration closed']);
+    $st = db()->prepare('SELECT id FROM passphrases WHERE phrase = ? AND enabled = 1');  // (exact match: utf8mb4_bin)
+    $st->execute([$passphrase]);
+    $pp = $st->fetch();
+    if (!$pp) {
         usleep(800000);  // slows guessing of the passphrase
         json_out(401, ['ok' => false, 'error' => 'wrong passphrase']);
     }
 
     try {
-        db()->prepare('INSERT INTO users (username, pass_hash, disabled, created_at) VALUES (?, ?, 0, ?)')
-            ->execute([$user, password_hash($pw, PASSWORD_DEFAULT), now_utc()]);
+        db()->prepare('INSERT INTO users (username, pass_hash, disabled, created_at, passphrase_id) VALUES (?, ?, 0, ?, ?)')
+            ->execute([$user, password_hash($pw, PASSWORD_DEFAULT), now_utc(), (int)$pp['id']]);
     } catch (PDOException $e) {
         if ($e->getCode() === '23000') json_out(409, ['ok' => false, 'error' => 'name taken']);
         throw $e;

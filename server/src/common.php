@@ -69,3 +69,9 @@ function valid_device(string $d): bool { return preg_match('/^[A-Za-z0-9_-]{16,6
 
 // A password: 6-72 bytes (bcrypt reads at most 72).
 function valid_password(string $p): bool { return strlen($p) >= 6 && strlen($p) <= 72; }
+
+// A registration passphrase: 8-64 characters (Chinese characters count as one).
+function valid_passphrase(string $p): bool {
+    $n = function_exists('mb_strlen') ? mb_strlen($p, 'UTF-8') : strlen($p);
+    return $n >= 8 && $n <= 64;
+}
