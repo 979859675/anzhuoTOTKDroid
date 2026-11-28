@@ -79,6 +79,31 @@ jobs:
             exit "$status"
           fi
 
+      # The release signing key, from the repository secrets (ANDROID_RELEASE_*): the same key for every build, so an installed
+      # copy can be updated over. Without the secrets the build falls back to the runner's debug key (a different key per run).
+      - name: Set up the release signing key
+        env:
+          KS_B64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          KS_KEY_PASS: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KS_B64" ] || [ -z "$KS_PASS" ] || [ -z "$KS_ALIAS" ]; then
+            echo "::warning title=signing::no release signing key in the secrets; this APK is signed with the runner's debug key"
+            exit 0
+          fi
+          DIR="$HOME/.totkrecompandroid"
+          mkdir -p "$DIR"
+          printf '%s' "$KS_B64" | base64 -d > "$DIR/release.jks"
+          {
+            echo "storeFile=$DIR/release.jks"
+            echo "storePassword=$KS_PASS"
+            echo "keyAlias=$KS_ALIAS"
+            echo "keyPassword=${KS_KEY_PASS:-$KS_PASS}"
+          } > "$DIR/keystore.properties"
+          chmod 600 "$DIR/release.jks" "$DIR/keystore.properties"
+          echo "release signing key: set up from the secrets"
+
       - name: Build the APK
         id: gradle
         working-directory: android/totkrecompandroid
