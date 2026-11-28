@@ -86,7 +86,8 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
     private static native String nativeSaveDir();  // (this version's save_0, absolute)
     private static native void nativeSaveDone(int result, String detail);
     private static final int REQ_GAME = 0x4c41, REQ_DRIVER = 0x4c42, REQ_MOD = 0x4c46, REQ_LOG = 0x4c47,
-            REQ_DRIVER_RECOVER = 0x4c48, REQ_SAVE_IN = 0x4c49, REQ_SAVE_OUT = 0x4c4a, REQ_SAVE_IN_TREE = 0x4c4c;
+            REQ_DRIVER_RECOVER = 0x4c48, REQ_SAVE_IN = 0x4c49, REQ_SAVE_OUT = 0x4c4a, REQ_SAVE_IN_TREE = 0x4c4c, REQ_LSFG = 0x4c4e;
+    private static native void nativeLsfgImported(int result, String detail);  // (0 imported, 1 cancelled, 2 failed)
     private static TOTKRecompAndroidActivity self;
 
     @Override
@@ -103,6 +104,7 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
             copyIfChanged(new File(games, "totkgame.so"), new File(res, "totkgame.so"));
             copyIfChanged(new File(games, "totkgame.so.id"), new File(res, "totkgame.so.id"));
             setenv("LARECOMP_NATIVE_LIB_DIR", getApplicationInfo().nativeLibraryDir);
+            setenv("LARECOMP_APP", appLine());
             setenv("LARECOMP_LAST_EXIT", lastExit());
             File gen = new File(getFilesDir(), "gen");
             unpackGen(gen);
@@ -336,6 +338,35 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
         }
     }
 
+    // The game's rumble on the phone's own vibrator (runtime/hle/input.c input_rumble_tick): amplitude 1..255 for ms
+    // milliseconds, 0 stops it. Marked as a game's (media) vibration: SDL's haptic path vibrates with no attributes, and
+    // the POCO's HyperOS let none of those through (2026-11-14) - a full-strength second through SDL did nothing.
+    private static android.os.Vibrator vibrator;
+    public static void rumble(int amplitude, int ms) {
+        try {
+            if (vibrator == null) {
+                if (android.os.Build.VERSION.SDK_INT >= 31) {
+                    android.os.VibratorManager vm = (android.os.VibratorManager) self.getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
+                    vibrator = vm != null ? vm.getDefaultVibrator() : null;
+                } else {
+                    vibrator = (android.os.Vibrator) self.getSystemService(Context.VIBRATOR_SERVICE);
+                }
+                if (vibrator == null || !vibrator.hasVibrator()) { vibrator = null; return; }
+            }
+            if (amplitude <= 0 || ms <= 0) { vibrator.cancel(); return; }
+            int a = vibrator.hasAmplitudeControl() ? Math.min(255, amplitude) : android.os.VibrationEffect.DEFAULT_AMPLITUDE;
+            android.os.VibrationEffect e = android.os.VibrationEffect.createOneShot(ms, a);
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                vibrator.vibrate(e, android.os.VibrationAttributes.createForUsage(android.os.VibrationAttributes.USAGE_MEDIA));
+            } else {
+                vibrator.vibrate(e, new android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_GAME).build());
+            }
+        } catch (Exception ex) {
+            Log.w("TOTKRecompAndroid", "rumble: " + ex);
+        }
+    }
+
     // a new process: the driver is loaded once, at start
     public static void restartApp() {
         self.runOnUiThread(() -> {
@@ -384,6 +415,12 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
                 else if (req == REQ_SAVE_IN_TREE) importSave(u);
                 else exportSaveZip(u);
             }, "saves").start();
+            return;
+        }
+        if (req == REQ_LSFG) {
+            Uri f = result == Activity.RESULT_OK && data != null ? data.getData() : null;
+            if (f == null) nativeLsfgImported(1, "");
+            else new Thread(() -> importLsfgDll(f), "lsfg-dll").start();
             return;
         }
         if (req == REQ_LOG) {
@@ -444,7 +481,63 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
         }
     }
 
+    // The start screen's banner (runtime/ui/launcher.mm banner_thread, on its own thread, never the UI's): url (https,
+    // or a file:// one for tests) saved to dst, at most maxBytes. false on any failure (offline, 404, too big): dst is
+    // then left as it was.
+    public static boolean download(String url, String dst, int maxBytes) {
+        File part = new File(dst + ".part");
+        try {
+            java.net.URLConnection c = new java.net.URL(url).openConnection();
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(8000);
+            c.setUseCaches(false);
+            c.setRequestProperty("User-Agent", "TOTKDroid/" + appVersion());
+            if (c instanceof java.net.HttpURLConnection && ((java.net.HttpURLConnection) c).getResponseCode() != 200) {
+                ((java.net.HttpURLConnection) c).disconnect();
+                return false;
+            }
+            try (InputStream in = c.getInputStream(); OutputStream out = new FileOutputStream(part)) {
+                byte[] buf = new byte[65536];
+                long total = 0;
+                for (int n; (n = in.read(buf)) > 0;) {
+                    if ((total += n) > maxBytes) throw new IOException("over " + maxBytes + " bytes");
+                    out.write(buf, 0, n);
+                }
+            }
+            if (!part.renameTo(new File(dst))) throw new IOException("rename");
+            return true;
+        } catch (Exception e) {
+            Log.i(TAG, "banner: " + url + ": " + e);
+            part.delete();
+            return false;
+        }
+    }
+
     // The folder's name for the settings page ("Download/TOTKRecomp"); "" with none
+    // A file the SDL dialog picked, as the content:// URI it hands back (the start screen's Import fonts,
+    // runtime/ui/launcher.mm import_fonts): its name - the URI ends in a document id - and a copy of it at dst, an
+    // absolute path (fopen can't open the URI; BOTWRecomp issue #122). "" / false when it can't be read.
+    public static String documentName(String uri) {
+        try (Cursor c = self.getContentResolver().query(Uri.parse(uri), new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst() && !c.isNull(0)) return c.getString(0);
+        } catch (Exception ignored) {
+        }
+        return "";
+    }
+
+    public static boolean copyDocument(String uri, String dst) {
+        try (InputStream in = self.getContentResolver().openInputStream(Uri.parse(uri));
+             java.io.FileOutputStream out = new java.io.FileOutputStream(dst)) {
+            if (in == null) return false;
+            byte[] buf = new byte[1 << 16];
+            for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "copy " + uri + " to " + dst, e);
+            return false;
+        }
+    }
+
     public static String logFolderName() {
         Uri tree = logTree();
         if (tree == null) return "";
@@ -494,6 +587,42 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
             i.setType("*/*");  // (zip types vary by provider: application/zip, application/x-zip-compressed...)
             return i;
         });
+    }
+
+    // ---- frame generation's Lossless.dll (Video > Frame generation > Import Lossless.dll): a copy in the app's own
+    // files, which the runtime reads without All files access (nvn/vulkan/framegen.c find_dll; BOTWRecomp e3ccd7a)
+    public static void pickLsfgDll() {
+        self.runOnUiThread(() -> {
+            try {
+                Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                i.addCategory(Intent.CATEGORY_OPENABLE);
+                i.setType("*/*");
+                self.startActivityForResult(i, REQ_LSFG);
+            } catch (Exception e) {
+                Log.e(TAG, "Lossless.dll picker", e);
+                nativeLsfgImported(2, e.toString());
+            }
+        });
+    }
+
+    private void importLsfgDll(Uri u) {
+        File dir = getExternalFilesDir(null), tmp = new File(dir, "Lossless.dll.tmp"), dst = new File(dir, "Lossless.dll");
+        try (InputStream in = getContentResolver().openInputStream(u)) {
+            if (in == null) throw new IOException("can't open the file");
+            copy(in, tmp);
+            byte[] head = new byte[2];
+            try (InputStream h = new java.io.FileInputStream(tmp)) {
+                if (h.read(head) != 2 || head[0] != 'M' || head[1] != 'Z') throw new IOException("not a Windows DLL - pick Lossless.dll");
+            }
+            if (dst.exists() && !dst.delete()) throw new IOException("can't replace the copy before");
+            if (!tmp.renameTo(dst)) throw new IOException("can't put the copy in place");
+            Log.i(TAG, "Lossless.dll imported into " + dst + " (" + dst.length() + " bytes)");
+            nativeLsfgImported(0, dst.getAbsolutePath());
+        } catch (Exception e) {
+            tmp.delete();
+            Log.w(TAG, "Lossless.dll import", e);
+            nativeLsfgImported(2, e.getMessage() != null ? e.getMessage() : e.toString());
+        }
     }
 
     public static void pickSaveImportFolder() { pick(REQ_SAVE_IN_TREE, () -> new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE)); }
@@ -1166,6 +1295,27 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
         }
     }
 
+    // The fastest refresh the screen offers at its current resolution (vulkan/device.c, Frame rate 40 / 45): SDL knows
+    // only the current mode, and HyperOS keeps a game at 60 Hz on a 120 Hz screen until the window asks for more. 0:
+    // unknown. (from BOTWRecomp 8964997)
+    public static float maxRefreshRate() {
+        TOTKRecompAndroidActivity a = self;
+        if (a == null) return 0;
+        try {
+            android.view.Display d = a.getDisplay();
+            if (d == null) return 0;
+            android.view.Display.Mode cur = d.getMode();
+            float best = 0;
+            for (android.view.Display.Mode m : d.getSupportedModes())
+                if (m.getPhysicalWidth() == cur.getPhysicalWidth() && m.getPhysicalHeight() == cur.getPhysicalHeight())
+                    best = Math.max(best, m.getRefreshRate());
+            return best;
+        } catch (Throwable t) {
+            Log.w("TOTKRecompAndroid", "maxRefreshRate: " + t);
+            return 0;
+        }
+    }
+
     // ---- a graphics driver error that stops the app (runtime/platform/android.c plat_fatal_notice): the driver is
     // loaded before the start screen, so the Settings rows that choose it can't be reached when it fails. This dialog
     // installs a driver package, or goes back to the system's driver, and starts the app again; else it closes. Blocks
@@ -1238,6 +1388,19 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
 
     // How the previous run ended (ApplicationExitInfo), for the log: a setup that vanished with nothing in the log was
     // the system closing the app - for memory or something else (issue #18). "" when unknown.
+    // The log's first line: which build wrote it, on what ("0.4.0-beta (versionCode 39), Xiaomi 2510DPC44G, Android 16
+    // (API 36)") - the reports' logs couldn't be told apart by version.
+    private String appLine() {
+        String v = "?";
+        try {
+            android.content.pm.PackageInfo p = getPackageManager().getPackageInfo(getPackageName(), 0);
+            v = p.versionName + " (versionCode " + p.getLongVersionCode() + ")";
+        } catch (Exception ignored) {
+        }
+        return v + ", " + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL + ", Android "
+                + android.os.Build.VERSION.RELEASE + " (API " + android.os.Build.VERSION.SDK_INT + ")";
+    }
+
     private static final String[] EXIT_REASONS = {"unknown", "exit self", "signaled", "low memory", "crash", "native crash",
             "not responding", "initialization failure", "permission change", "excessive resource usage", "user requested",
             "user stopped", "dependency died", "other", "freezer", "package state change", "package updated"};
@@ -1454,6 +1617,8 @@ public class TOTKRecompAndroidActivity extends SDLActivity {
             deleteTree(stage);
             Doc romfsDoc = named(children(tree, mod.id), "romfs");
             copyDocs(tree, romfsDoc, new File(stage, "romfs"));
+            Doc cheatsDoc = named(children(tree, mod.id), "cheats");  // (its cheat files: runtime/cheats.c)
+            if (cheatsDoc != null && cheatsDoc.dir) copyDocs(tree, cheatsDoc, new File(stage, "cheats"));
             for (Doc k : children(tree, mod.id))  // (its notes: the menu shows one as its description)
                 if (!k.dir && k.name != null && k.name.toLowerCase().endsWith(".txt")) copyDoc(tree, k, new File(stage, k.name));
             File dst = new File(mods, name);

@@ -112,6 +112,7 @@ uint32_t ipc_connect_named_port(const char *name);
 enum { RT_REBOOT_NONE, RT_REBOOT_GAME, RT_REBOOT_TITLE };  // GAME: boot again at once; TITLE: start screen
 void rt_request_reboot(int kind);  // any thread; the window loop (ui_run) returns it and main() carries it out
 int rt_reboot_requested(void);
+unsigned rt_reboot_count(void);
 extern volatile int g_rt_unwind;   // set while guest threads are being stopped (kernel.c)
 void rt_unwind_point(void);        // guest threads: unwind to thread_main if a reboot is stopping them
 
@@ -125,6 +126,7 @@ bool native_wanted(void);                 // (the setting, or LARECOMP_NATIVE)
 void native_begin_boot(void);             // native_on() for this boot
 bool native_on(void);
 void native_prepare(void);                // the loaded modules rewritten and made executable
+bool native_site_reserved(uint64_t addr, uint32_t w);  // a word the port rewrites itself or a fix's site (cheats.c)
 void native_call(Cpu *c, uint64_t addr);  // guest_call's native path
 void native_thread_end(void);
 uint64_t native_ticks(void);

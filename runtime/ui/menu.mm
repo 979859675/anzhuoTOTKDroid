@@ -10,6 +10,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <atomic>
+#include <string>
 #include <vector>
 
 #include "i18n.h"
@@ -22,6 +23,8 @@
 #else
 #include "imgui_impl_vulkan.h"
 extern "C" bool vk_imgui_backend_init(void);  // runtime/nvn/vulkan/imgui_glue.cpp
+extern "C" bool vk_low_ram(void);                // runtime/nvn/vulkan/exec.c: RAM saving as the app started
+extern "C" bool vk_low_ram_auto(long *total_mb); // (what Automatic picks on this device)
 #endif
 
 extern "C" {
@@ -68,6 +71,7 @@ extern "C" bool vk_fg_built(void);
 extern "C" void touch_controls_draw(ImVec2 display, ImFont *font);
 #endif
 static void set_open(bool open);
+extern "C" int nfp_reader_state(void);  // (services/nfp.c: the game looks for an amiibo)
 extern "C" void menu_test_open(void) {
     set_open(true);
     if (getenv("LARECOMP_MENU_TAB")) { extern int g_tab_request_ext; g_tab_request_ext = atoi(getenv("LARECOMP_MENU_TAB")); }
@@ -87,6 +91,8 @@ static void set_open(bool open) {
         static bool opened;  // the controller's cursor: the first tab (Controls) the first time this session, later the
         menu_tabs_focus(!opened);  // selected one
         opened = true;
+        extern int g_tab_request_ext;
+        if (nfp_reader_state() == 1) g_tab_request_ext = 8;  // (the game looks for an amiibo: Controls, amiibo on top)
     }
     else { settings_save(); osk_cancel(); g_text_busy = false; }
 }
@@ -149,7 +155,7 @@ static ImGuiKey key_from_pad(Uint8 b) {
 // they last used a controller.
 static std::atomic<int> g_kbd{0};  // 1 open, 2 confirmed, 3 cancelled
 static std::atomic<bool> g_last_pad{false};
-static char g_kbd_text[96];
+static char g_kbd_text[260], g_kbd_prompt[260];  // (UTF-8: up to 64 characters; the prompt is the game's header)
 static int g_kbd_max = 8;
 static bool capturing() { return g_open.load() || g_kbd.load() == 1; }
 // The game gets no input while this is true (runtime/hle/input.c): menu or name entry up.
@@ -290,7 +296,7 @@ void menu_apply_window_requests(void *win) {
 #ifdef __ANDROID__
     // With a controller, the in-app keyboard only: Android's own keyboard would open over it, and while it is up it
     // takes the controller's stick and d-pad (after naming Link the stick no longer moved him; buttons still worked)
-    if (want_text && SDL_HasGamepad()) want_text = false;
+    if (want_text && input_pad_present()) want_text = false;
     // ... and otherwise only while a text field is being typed in, without the in-app keyboard (the name entry has
     // it): with the menu merely open, Android's keyboard came up over it every time
     extern bool osk_is_open(void);
@@ -426,6 +432,7 @@ static void init(void) {
         if (FILE *f = fopen(p, "rb")) fclose(f);
         else continue;
         g_overlay_font = io.Fonts->AddFontFromFileTTF(p, 48, &cfg);
+        i18n_merge_overlay_font(io.Fonts, 48);  // (the overlay's Chinese: ui/i18n.mm)
         break;
     }
 #endif
@@ -499,7 +506,13 @@ static bool choice(const char *label, int *value, const char *const *names, int 
     ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.45f);
     bool changed = false;
     ImGui::SetNextItemWidth(reserve > 0 ? -reserve : -1);
-    if (ImGui::BeginCombo("##c", tr(names[*value]))) {
+    // (the open list: taller, its scrollbar wide and its grab long enough for a finger, and it scrolls with a finger)
+    ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, ImGui::GetFontSize() * 0.9f);
+    ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, ImGui::GetFontSize() * 2.0f);
+    bool open_list = ImGui::BeginCombo("##c", tr(names[*value]), ImGuiComboFlags_HeightLarge);
+    ImGui::PopStyleVar(2);
+    if (open_list) {
+        ui_touch_scroll();
         for (int i = 0; i < n; i++) {
             ImGui::PushID(i);  // (the shown names may repeat once translated)
             if (ImGui::Selectable(tr(names[i]), i == *value)) { *value = i; changed = true; }
@@ -537,10 +550,11 @@ static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
     opt_begin("##video", scale);
     opt_section("Display");
-    const char *aspects[] = {"Unlocked", "Original 16:9"};
-    opt_choice("Aspect ratio", &g_settings.aspect, aspects, 2, ASPECT_UNLOCKED,
-               "Unlocked: the view will fill wider screens once the game's cameras are widened - not done yet for this "
-               "game, so it stays 16:9 with bars for now. Original 16:9: the game's own framing, with bars.");
+    const char *aspects[] = {"Unlocked", "Original 16:9", "Stretched"};
+    opt_choice("Aspect ratio", &g_settings.aspect, aspects, 3, ASPECT_UNLOCKED,
+               "Unlocked: on screens wider than 16:9 the view widens to fill them. Original 16:9: the game's own "
+               "framing, with bars. Stretched: the 16:9 image stretched to fill the screen, for 4:3 and other narrower "
+               "screens. Applies when the game starts again.");
 #ifndef __ANDROID__  // (Android: always the whole screen)
     bool fs = g_settings.fullscreen;
     if (opt_toggle("Fullscreen", &fs, false, "Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.")) {
@@ -552,8 +566,16 @@ static void tab_display(void) {
     opt_toggle("Show FPS", &g_settings.show_fps, false,
                "Shows the performance overlay: the frame rate and how the phone is doing. Drag it with a finger to move it; "
                "double-tap it to switch compact / detailed.");
+    // (folded by default: nine rows under Show FPS crowded the page. The what-it-shows rows only for the detailed
+    // style - the compact line always shows the same five readings)
+    static bool overlay_open;
     if (g_settings.show_fps) {  // (ui/perf_overlay.mm; LASRecompAndroid's, with Swap2-Native's overlay's settings - BOTW's)
         opt_indent(1);
+        if (opt_action("Overlay settings", overlay_open ? "Hide" : "Show",
+                       "The overlay's style, size and opacity, and what the detailed style shows."))
+            overlay_open = !overlay_open;
+    }
+    if (g_settings.show_fps && overlay_open) {
         static const char *styles[] = {"Detailed", "Compact"};
         opt_choice("Overlay style", &g_settings.overlay_style, styles, 2, 0,
                    "Detailed: the GPU, frame rate and frame time with 48 s charts, CPU clock caps, temperatures, battery, "
@@ -574,13 +596,14 @@ static void tab_display(void) {
             {OVERLAY_BATTERY, "Battery and temperatures", "The SoC's and the battery's temperature, and the battery's level."},
             {OVERLAY_MEMORY, "Memory", "The game's memory (and its chart) and the phone's free memory."},
         };
-        for (const auto &it : items) {
-            bool on = (g_settings.overlay_items & it.bit) != 0;
-            if (opt_toggle(it.label, &on, true, it.desc))
-                g_settings.overlay_items = on ? g_settings.overlay_items | it.bit : g_settings.overlay_items & ~it.bit;
-        }
-        opt_indent(-1);
+        if (g_settings.overlay_style == 0)
+            for (const auto &it : items) {
+                bool on = (g_settings.overlay_items & it.bit) != 0;
+                if (opt_toggle(it.label, &on, true, it.desc))
+                    g_settings.overlay_items = on ? g_settings.overlay_items | it.bit : g_settings.overlay_items & ~it.bit;
+            }
     }
+    if (g_settings.show_fps) opt_indent(-1);
 #else
     opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate in the top right corner.");
 #endif
@@ -596,18 +619,28 @@ static void tab_display(void) {
         int version = g_game_version ? g_game_version : 143;
         bool sixty = version == 182 || version == 143;
         if (!sixty && g_settings.fps_mode > 1) g_settings.fps_mode = 1;
+        if (version != 143 && g_settings.fps_mode == 5) g_settings.fps_mode = 2;  // (Unlocked: TOTK only)
         static const char *fr[] = {"Auto (20 / 30)", "30 fps"};
-        static const char *fr60[] = {"Auto (30 / 60)", "30 fps", "60 fps", "20 fps", "40 / 45 fps"};
-        opt_choice("Frame rate", &g_settings.fps_mode, sixty ? fr60 : fr, sixty ? 5 : 2, 1,
+        static const char *fr60[] = {"Auto (30 / 60)", "30 fps", "60 fps", "20 fps", "40 / 45 fps", "Unlocked (up to 120 fps)"};
+        opt_choice("Frame rate", &g_settings.fps_mode, sixty ? fr60 : fr, sixty ? (version == 143 ? 6 : 5) : 2, 1,
                    sixty ? "Auto: 60 fps where your device keeps up, 30 where it doesn't (the game's clock stays right "
                            "either way). 30 fps: steady and cooler - the phone heats less. 60 fps: always aims for 60."
                          : "Auto: the game's own pacing, as on the Switch. 30 fps: never more than 30 frames a "
                            "second.");
+        // (the game's own 60 / 30 pick, where it decides - Auto, 60, 40 / 45: native.c fix_hyst_*, totk-android's)
+        if (sixty && g_settings.fps_mode != 1 && g_settings.fps_mode != 3)
+            opt_toggle("Hold 60 fps through short dips", &g_settings.fps60_hysteresis, false,
+                       "The game drops from 60 to 30 fps after 3 late frames in a row. On: only after 7 in a row, and it "
+                       "tries 60 again sooner, so short dips stay at 60. It measured worse on some devices: try it and keep "
+                       "it if the game feels smoother.");
     }
 #endif
 
 #ifdef __ANDROID__
     if (g_settings.fps_mode == 4) ImGui::TextWrapped("%s", tr("40 fps on a 120 Hz display, 45 on 90 Hz, 30 on 60 Hz."));
+    if (g_settings.fps_mode == 5)
+        ImGui::TextWrapped("%s", tr("As fast as your device draws, up to the screen's fastest refresh (at most 120 fps). The game's clock "
+                                    "stays right. Cutscenes stay at 30. The phone works harder and heats more."));
     {   // Frame generation (Lossless Scaling's LSFG with the player's own Lossless.dll: nvn/vulkan/framegen.c)
         static const char *fg[] = {"Off", "2x", "3x", "4x"};
         int v = g_settings.lsfg ? g_settings.lsfg_mult - 1 : 0;
@@ -628,6 +661,16 @@ static void tab_display(void) {
                            "Auto: the game's own."))
                 g_settings.lsfg_flow = flv[k];
             ImGui::TextWrapped("%s", vk_fg_built() ? vk_fg_status() : tr("Not in this build."));
+            if (vk_fg_built()) {  // (a copy in the app's own files: read without All files access; BOTWRecomp e3ccd7a)
+                void launcher_pick_lsfg_dll(void);
+                std::string launcher_lsfg_import_msg(void);
+                std::string m = launcher_lsfg_import_msg();
+                char id[900];
+                snprintf(id, sizeof id, "%s%s%s", tr("Picks your Lossless.dll with Android's file picker and keeps a copy "
+                         "in the app's own files, which the app can always read - for when it says it can't open the "
+                         "file where you put it."), m.empty() ? "" : "\n\n", m.c_str());
+                if (opt_button("Import Lossless.dll", id)) launcher_pick_lsfg_dll();
+            }
         }
     }
 #endif
@@ -704,8 +747,11 @@ static void tab_display(void) {
                                    "(Internal resolution) follows it.\n\nThe final image is %.0f x %.0f."),
                  1920.0 * ox, 1080.0 * oy);
         if (on > 0 && on < (int)sizeof od)
-            snprintf(od + on, sizeof od - on, "\n\n%s", tr("Auto: 1080p on screens with more lines than that, where it costs the "
-                                                           "GPU the most; the screen's own on the others."));
+            snprintf(od + on, sizeof od - on, "\n\n%s", vk_low_ram()
+                         ? tr("Auto: 720p at most, with RAM saving on - on these devices the GPU is the limit, and the "
+                              "last passes at more lines cost it frames.")
+                         : tr("Auto: 1080p on screens with more lines than that, where it costs the GPU the most; the "
+                              "screen's own on the others."));
 #ifdef __ANDROID__
         enum { OUT_DEFAULT = 0 };  // (Auto: settings.c)
 #else
@@ -718,15 +764,87 @@ static void tab_display(void) {
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. FXAA: a single, cheaper pass that also softens the image "
                "a little. Most useful at a lower internal resolution.");
+    {   // The game's own rendering costs (runtime/native.c: shadow map size, its FXAA, the far plane). They apply at once.
+        static const char *shadows[] = {"Game", "Lower", "Lowest"};
+        static const int shadow_px[] = {0, 288, 256};
+        int si = g_settings.shadow_res == 288 ? 1 : g_settings.shadow_res == 256 ? 2 : 0;
+        if (opt_choice("Shadow quality", &si, shadows, 3, 0,
+                       "The size of the sun's shadow maps. Lower ones cost the GPU less, with softer, blockier shadows. "
+                       "It may help a weaker GPU; on a Snapdragon 8 Elite it made no difference.", false))
+            g_settings.shadow_res = shadow_px[si];
+        opt_toggle("Shadows", &g_settings.shadows, true,
+                   "The game's shadows: of the sun, of Link and of everything around. Off: none are drawn - the picture is "
+                   "flatter and evenly lit, for a little less GPU work each frame; only worth it on a phone at its limit. "
+                   "Applies at once.");
+        opt_toggle("Game's anti-aliasing", &g_settings.game_fxaa, true,
+                   "The game's own FXAA pass, apart from the Anti-aliasing above. Off saves a little GPU time; edges and "
+                   "grass shimmer more.");
+        static const char *dists[] = {"Game", "12 km", "8 km", "5 km"};
+        static const int dist_m[] = {0, 12000, 8000, 5000};
+        int di = g_settings.far_clip == 12000 ? 1 : g_settings.far_clip == 8000 ? 2 : g_settings.far_clip == 5000 ? 3 : 0;
+        if (opt_choice("Draw distance", &di, dists, 4, 0,
+                       "How far the camera draws; the game's goes to 25 km. Shorter can cut the farthest scenery from view. "
+                       "The world, its objects and their behavior are not changed, only what is drawn.", false))
+            g_settings.far_clip = dist_m[di];
+        // The shadow passes the drawing thread records (native.c fix_shadow_cascades / fix_point_shadows): off by default, no
+        // measurement of their cost in looks or in frames yet (totk-android's patches)
+        static const char *casc[] = {"Game", "3", "2", "1"};
+        static const int casc_n[] = {0, 3, 2, 1};
+        int ci = g_settings.shadow_cascades == 3 ? 1 : g_settings.shadow_cascades == 2 ? 2 : g_settings.shadow_cascades == 1 ? 3 : 0;
+        if (opt_choice("Sun shadow cascades", &ci, casc, 4, 0,
+                       "The sun's shadow is drawn in 4 cascades, each a ring of the world around you at its own sharpness. Fewer "
+                       "cascades are fewer shadow draws for the CPU, but the shadow reaches less far and the farther ground "
+                       "goes unshadowed. It can help where the CPU is the limit.", false))
+            g_settings.shadow_cascades = casc_n[ci];
+        static const char *pts[] = {"Game", "4", "2", "1"};
+        static const int pts_n[] = {0, 4, 2, 1};
+        int pi = g_settings.point_shadows == 4 ? 1 : g_settings.point_shadows == 2 ? 2 : g_settings.point_shadows == 1 ? 3 : 0;
+        if (opt_choice("Point light shadows", &pi, pts, 4, 0,
+                       "How many torches, lamps and fires at once cast a shadow; the game's own number is the limit, this only "
+                       "lowers it. Fewer are fewer shadow draws for the CPU, and lights past the limit cast none. Applies the "
+                       "next time the game sets up its lights: restart TOTKDroid.", false))
+            g_settings.point_shadows = pts_n[pi];
+    }
 #ifdef __ANDROID__
     opt_toggle("Sync lag", &g_settings.sync_lag, true,
                "The game starts its next frame while the GPU still finishes the last one: a few more fps. What the game reads "
                "back from the GPU then comes a frame late, and Link's legs can sink into the ground while he stands "
                "still. Turn it off if that bothers you. Applies at once.");
+    opt_toggle("Wait for shaders", &g_settings.shader_wait, false,
+               "On: a draw waits for its shader to be built - nothing flickers or pops in, but the game stops for a moment "
+               "when a new one is built. Off: it's skipped until its shader is ready - smoother, but scenery, grass or "
+               "shadows may be missing for a few frames. Applies the next time the game starts.");
+    opt_toggle("Pipeline prewarming", &g_settings.pipe_prewarm, false,
+               "Records the graphics pipelines used in the world and builds them on background workers while the game "
+               "loads, so fewer draws are skipped or wait when you enter the world. Off by default: in this game it helps little yet. Applies the next time "
+               "the game starts.");
     opt_toggle("32-bit shader math", &g_settings.shader_int32, false,
                "Translates the game's shaders with 32-bit address math, the path used for drivers without 64-bit "
                "integers (Adreno 6xx / 7xx and Mali stock drivers). Try it if lighting, grass or text are missing or wrong "
                "on your GPU. Applies to shaders translated from now on: restart the app for all of them.");
+    {   // RAM saving (vulkan/exec.c vk_low_ram): read once as the app starts
+        void launcher_restart_app(void);  // (ui/launcher.mm)
+        static const char *ram[] = {"Automatic", "On", "Off"};  // display order -> low_ram -1 / 1 / 0
+        int ri = g_settings.low_ram < 0 ? 0 : g_settings.low_ram ? 1 : 2;
+        bool autolow = vk_low_ram_auto(NULL);
+        if (opt_choice("RAM saving", &ri, ram, 3, 0,
+                       autolow ? "For devices with 4 GB of RAM or less, where Android closes the game when memory runs out: "
+                                 "smaller GPU buffers, compressed textures at "
+                                 "half size, and the drawing thread on a fast core. Uses less memory and is faster on such "
+                                 "devices; textures can look a little softer. Automatic: on for this device. Applies when "
+                                 "TOTKDroid restarts."
+                               : "For devices with 4 GB of RAM or less, where Android closes the game when memory runs out: "
+                                 "smaller GPU buffers, compressed textures at "
+                                 "half size, and the drawing thread on a fast core. Uses less memory and is faster on such "
+                                 "devices; textures can look a little softer. Automatic: off for this device (more than 4 GB). "
+                                 "Applies when TOTKDroid restarts."))
+            g_settings.low_ram = ri == 0 ? -1 : ri == 1 ? 1 : 0;
+        bool want = g_settings.low_ram < 0 ? autolow : g_settings.low_ram != 0;
+        if (want != vk_low_ram() && !getenv("LARECOMP_LOW_RAM") &&
+            opt_button("Restart to apply RAM saving", "Closes TOTKDroid and opens it again with the new setting. "
+                                                      "Progress since the game's last save is lost."))
+            launcher_restart_app();
+    }
 #endif
     opt_end();
 }
@@ -787,7 +905,39 @@ static void tab_quit(float scale, bool in_game) {
     opt_end();
 }
 
+// amiibo (services/nfp.c, ported from BOTWRecomp): a figure picked here is "touched" on the game's virtual reader. At the
+// top of Controls while the game looks for one (the Purah Pad's amiibo ability: a second tap on the touch controls' power
+// opens the menu here), lower down otherwise.
+extern "C" int nfp_amiibo_count(void);
+extern "C" const char *nfp_amiibo_name(int i);
+extern "C" void nfp_touch(int i);
+extern "C" void nfp_lift(void);
+static void amiibo_section(int state) {
+    static int pick;
+    static std::vector<const char *> names;
+    if (names.empty())
+        for (int i = 0; i < nfp_amiibo_count(); i++) names.push_back(nfp_amiibo_name(i));
+    header("amiibo");
+    choice("amiibo", &pick, names.data(), (int)names.size());
+    hint(state == 1 ? "The game is looking for an amiibo: pick one and touch it."
+         : state == 2 ? "An amiibo is on the reader."
+                      : "Choose the amiibo ability on the Purah Pad (the ability wheel) and aim it, then open this menu and "
+                        "touch an amiibo here. Each figure gives its items once a day, as on the Switch.");
+    // (a big button, the page's width: a finger's)
+    if (state == 1 && ImGui::Button(tr("Touch the amiibo"), ImVec2(-FLT_MIN, ImGui::GetFontSize() * 2.6f))) {
+        nfp_touch(pick);
+        set_open(false);  // (back to the game, which reads it)
+    }
+    if (state == 2) {
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Lift the amiibo"))) nfp_lift();
+    }
+    ImGui::Spacing();
+}
+
 static void tab_about(void) {
+    int nfp_state = nfp_reader_state();
+    if (nfp_state) amiibo_section(nfp_state);
     header("System language");
     {
         // what the game is told the console's language is: its text follows this (runtime/settings.c)
@@ -815,7 +965,12 @@ static void tab_about(void) {
     if (toggle("Phone motion like the Switch's screen", &g_settings.motion_flat)) settings_save();  // (hle/motion.c, #211 #247)
     hint("Off: the phone moves the aim as a controller would. On: as the Switch's own screen in handheld mode - try it if "
          "tilting the phone turns the aim, and turning it tilts.");
+    if (g_settings.rumble < 0 || g_settings.rumble > 300) g_settings.rumble = 100;
+    if (opt_int("Vibration", &g_settings.rumble, 0, 300, 25, 100, "%d%%",
+                "The game's rumble: on the controller's motors, or the phone's own vibrator without a controller. 0%: off."))
+        settings_save();
     ImGui::Spacing();
+    if (!nfp_state) amiibo_section(0);
     controls_bindings_draw(ImGui::GetFontSize() / 34);
     ImGui::Spacing();
     header("Menu");
@@ -841,6 +996,13 @@ RT_ON_RESET(menu_reset) {
 }
 
 static int name_filter(ImGuiInputTextCallbackData *d) { return d->EventChar < 0x20 ? 1 : 0; }
+// The name's length in characters, not bytes (UTF-8: an accented letter is two), and cut to max of them
+static int u8_len(const char *s) { int n = 0; for (; *s; s++) n += ((unsigned char)*s & 0xc0) != 0x80; return n; }
+static void u8_cut(char *s, int max) {
+    for (int n = 0; *s; s++)
+        if (((unsigned char)*s & 0xc0) != 0x80 && n++ == max) { *s = 0; return; }
+}
+static const char *kbd_title(void) { return g_kbd_prompt[0] ? g_kbd_prompt : tr("Enter your name"); }
 
 #ifdef __ANDROID__
 // Touch (no controller): typed with Android's keyboard, which covers the lower half - so at the top, in the menu's
@@ -858,13 +1020,13 @@ static void keyboard_draw_touch(ImGuiIO &io, float scale, bool appearing) {
                                     ImGuiWindowFlags_AlwaysAutoResize);
     ImFont *big = g_menu_font_big ? g_menu_font_big : g_font_big, *small = g_menu_font ? g_menu_font : g_font;
     ImGui::PushFont(big);
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr("Enter your name"));
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", kbd_title());
     if (appearing) ImGui::SetKeyboardFocusHere();
     ImGui::SetNextItemWidth(-1);
     ImGui::InputText("##name", g_kbd_text, (size_t)(g_kbd_max * 4 + 1 < (int)sizeof g_kbd_text ? g_kbd_max * 4 + 1 : sizeof g_kbd_text),
                      ImGuiInputTextFlags_CallbackCharFilter, name_filter);
     ImGui::PopFont();
-    if ((int)strlen(g_kbd_text) > g_kbd_max) g_kbd_text[g_kbd_max] = 0;
+    u8_cut(g_kbd_text, g_kbd_max);
     float bw = 340 * scale, bh = 120 * scale, sp = ImGui::GetStyle().ItemSpacing.x;
     // one row: the count at the left, the buttons at the right (placed, not SameLine: the same top for both)
     float y = ImGui::GetCursorPosY(), x0 = ImGui::GetCursorPosX(), xr = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
@@ -876,7 +1038,7 @@ static void keyboard_draw_touch(ImGuiIO &io, float scale, bool appearing) {
     ImGui::PopFont();
     ImGui::PushFont(small);
     ImGui::SetCursorPos(ImVec2(x0, y + (bh - ImGui::GetTextLineHeight()) * 0.5f));
-    ImGui::TextDisabled("%d / %d", (int)strlen(g_kbd_text), g_kbd_max);
+    ImGui::TextDisabled("%d / %d", u8_len(g_kbd_text), g_kbd_max);
     ImGui::PopFont();
     ImGui::End();
     ImGui::PopStyleVar(5);
@@ -901,7 +1063,7 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
     ImGui::Begin("##kbd", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                                     ImGuiWindowFlags_AlwaysAutoResize);
     ImGui::PushFont(g_font_big);
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr("Enter your name"));
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", kbd_title());
     ImGui::PopFont();
     if (!pad) {  // keyboard: type straight into the field
         if (appearing) ImGui::SetKeyboardFocusHere();
@@ -910,8 +1072,8 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
         ImGui::InputText("##name", g_kbd_text, (size_t)(g_kbd_max * 4 + 1 < (int)sizeof g_kbd_text ? g_kbd_max * 4 + 1 : sizeof g_kbd_text),
                          ImGuiInputTextFlags_CallbackCharFilter, name_filter);
         ImGui::PopFont();
-        if ((int)strlen(g_kbd_text) > g_kbd_max) g_kbd_text[g_kbd_max] = 0;
-        ImGui::TextDisabled("Enter  confirm      Esc  cancel      (%d / %d)", (int)strlen(g_kbd_text), g_kbd_max);
+        u8_cut(g_kbd_text, g_kbd_max);
+        ImGui::TextDisabled("Enter  confirm      Esc  cancel      (%d / %d)", u8_len(g_kbd_text), g_kbd_max);
     } else {  // controller: on-screen keyboard (osk.mm, shared with our menus' text fields)
         int r = osk_keys(g_kbd_text, sizeof g_kbd_text, g_kbd_max, appearing, scale, g_font_big);
         if (r) g_kbd = r > 0 ? 2 : 3;  // (Start / + confirms in menu_handle_event too)
@@ -922,10 +1084,12 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
 
 // Game thread (runtime/hle/swkbd.c): show the dialog, re-present the last frame until it's answered.
 // Returns 1 confirmed (out = text, UTF-8), 0 cancelled.
-extern "C" int menu_keyboard_run(const char *initial, int max_len, char *out, int cap) {
+extern "C" int menu_keyboard_run(const char *prompt, const char *initial, int max_len, char *out, int cap) {
     extern void backend_represent(void);
+    snprintf(g_kbd_prompt, sizeof g_kbd_prompt, "%s", prompt ? prompt : "");
     snprintf(g_kbd_text, sizeof g_kbd_text, "%s", initial ? initial : "");
-    g_kbd_max = max_len > 0 && max_len < (int)sizeof g_kbd_text / 4 ? max_len : 8;
+    g_kbd_max = max_len > 0 && max_len <= (int)(sizeof g_kbd_text - 1) / 4 ? max_len : 8;
+    u8_cut(g_kbd_text, g_kbd_max);
     input_reset();
     g_kbd = 1;
     // (test) LARECOMP_KBD_AUTO=<text>: answer at once
@@ -1178,6 +1342,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(18 * scale, 18 * scale));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(14 * scale, 14 * scale));
     ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 22 * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, 48 * scale);  // (the scrollbar's grab: long enough for a finger on long pages)
     float bottom = 84 * scale, height = fmaxf(1, ImGui::GetContentRegionAvail().y - bottom);
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
     ImGui::BeginChild("##touchpage", ImVec2(0, height), ImGuiChildFlags_None);
@@ -1223,7 +1388,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
         ImGui::PopStyleVar();
         ImGui::PopStyleColor();
     }
-    ImGui::PopStyleVar(3);
+    ImGui::PopStyleVar(4);
     g_tab_request = -2;
     opt_focus_first(false);
     return;

@@ -24,6 +24,7 @@
 #include "../maxwell/shader.h"
 
 void vk_device_fault_report(void);
+#include "watchdog.h"
 #ifdef __ANDROID__
 void vk_android_load(void);  // android_driver.c: the Vulkan driver (adrenotools / system) into volk
 const char *vk_driver_rejected(void);  // (the chosen driver package the system's stood in for; "" none)
@@ -32,8 +33,9 @@ void vk_vamm_before_map(uint64_t addr, uint64_t size);
 bool vk_vamm_buffer(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off);
 void vk_vamm_reset(void);
 #endif
+const char *vk_fatal_hint(VkResult r);  // exec.c: what to change, after an out-of-memory error ("" none)
 #define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { if (r_ == VK_ERROR_DEVICE_LOST) vk_device_fault_report(); \
-    FATAL("%s failed: %d (%s:%d)\n", #x, r_, __FILE__, __LINE__); } } while (0)
+    FATAL("%s failed: %d (%s:%d)%s\n", #x, r_, __FILE__, __LINE__, vk_fatal_hint(r_)); } } while (0)
 // The most swapchain images the renderer keeps (one view and one present semaphore each): it asks for few, but drivers
 // may make more - a Mali-G57's made 12 (issue #1)
 #define VK_MAX_SWAP_IMAGES 16
@@ -58,8 +60,11 @@ typedef struct {
                                   // 2's) baked into pipelines (exec.c PipeKey.fx)
     bool eds2;                    // extended dynamic state 2 in use; without it, depth bias and primitive restart are
                                   // pipeline state (exec.c PipeKey.prim_restart)
+    bool dyn_vi;                  // VK_EXT_vertex_input_dynamic_state in use: vertex attributes / bindings set per draw, not in
+                                  // the pipeline (dyn_vi.h; from BOTWRecomp 8146cfa)
 #ifdef __ANDROID__
     bool mem_dmabuf;              // external memory may be exported as DMA-BUF instead of OPAQUE_FD
+    bool mem_ahb;                 // Android hardware buffers may be imported (the heap from gralloc: exec.c heap_ahb_place)
     bool mem_fd;                  // VK_KHR_external_memory_fd: the same through an exported file mapped there (vk_heap_place)
     bool map_placed;              // VK_EXT_map_memory_placed: the guest heap mapped as GPU memory (exec.c vk_heap_place)
     uint64_t placed_align;
@@ -121,7 +126,11 @@ typedef struct TexBackend {
     uint8_t skip;                 // first guest mip retained on low-RAM devices
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     uint16_t same_run;    // (a large dynamic texture: full hashes in a row that found it unchanged - textures.c)
+    uint8_t check_suspect;  // (textures.c tex_check thread: its sample differed - checked on the render thread at the next
+                            // use; __atomic builtins)
     uint64_t dyn_sample;  // (and its sampled hash at the last full one)
+    bool discarded; // (low RAM) its guest bytes given back to the OS after the upload: zero pages there (textures.c)
+    uint64_t disc_hash;  // (discarded) the full hash of its memory right after: still that one = unchanged
     bool scalable, presented;
     uint8_t rs_group;  // RS_*: which output scale its allocation follows (textures.c)
     uint64_t touched_frame, frame_cleared;
@@ -140,6 +149,11 @@ typedef struct TexBackend {
     int reg;  // slot in textures.c's live list + 1 (a reboot destroys them all)
     VkFormat fmt_twin;  // (Android) a format-listed render target (textures.c, UBWC): the one other view format allowed
     bool fmt_listed;
+    // CPU writes (WriteTexels) into it while the GPU owns it: the rectangle to send up on its next use (textures.c
+    // renderer_texels_written; under its lock). cw: 0 none, 1 the rectangle (level cw_lv, layers cw_l0..cw_l1, blocks
+    // cw_x0..cw_x1 x cw_y0..cw_y1), 2 more than one level - the whole texture from memory
+    uint8_t cw;
+    uint32_t cw_lv, cw_l0, cw_l1, cw_x0, cw_y0, cw_x1, cw_y1;
 } TexBackend;
 
 VkFormat vk_view_format(NvnTexture *t, VkFormat vf);  // the format a view asking for vf gets (textures.c)

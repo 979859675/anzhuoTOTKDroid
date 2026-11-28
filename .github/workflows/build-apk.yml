@@ -1,0 +1,118 @@
+# Builds the release APK (arm64-v8a) on GitHub's runner and uploads it as the "totkdroid-release-apk" artifact.
+# The APK includes the GPL-3.0-or-later LSFG folder (the default; see NOTICE.md). The game's files
+# are not in the APK: they are pushed to the phone separately (README: push_game.sh).
+name: Build debug APK
+
+on:
+  push:
+    branches: ["arena/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # The runner's own Android SDK (ANDROID_HOME); the NDK and CMake the build needs are added to it.
+      - name: Install the NDK and CMake
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKMANAGER" ] || SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -n 1)"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "ndk;30.0.16248370" "cmake;3.30.4"
+
+      # The native dependencies (SDL3, shaderc, the headers, the font): android/deps/build_deps.sh. Cached by its
+      # script and patch, so a rebuild with unchanged deps skips the long shaderc build.
+      - name: Cache the native dependencies
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: android/deps/out
+          key: deps-${{ hashFiles('android/deps/build_deps.sh', 'android/deps/sdl-aaudio-resume.patch') }}
+
+      - name: Build the native dependencies
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: bash android/deps/build_deps.sh
+
+      # FFmpeg (the movies, the voices; runtime/services/hwopus.c needs its headers): android/deps/build_ffmpeg.sh,
+      # with the runner's NDK (the same version) instead of a download. Cached like the dependencies above.
+      - name: Cache FFmpeg
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: android/deps/ffmpeg
+          key: ffmpeg-${{ hashFiles('android/deps/build_ffmpeg.sh') }}
+
+      - name: Build FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: |
+          export ANDROID_NDK_LINUX="$ANDROID_HOME/ndk/30.0.16248370"
+          test -x "$ANDROID_NDK_LINUX/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          LOG="$RUNNER_TEMP/ffmpeg.log"
+          set +e
+          bash android/deps/build_ffmpeg.sh > "$LOG" 2>&1
+          status=$?
+          set -e
+          tail -n 40 "$LOG"
+          if [ "$status" -ne 0 ]; then
+            # the end of the log and of FFmpeg's config.log, as annotations (readable through the API)
+            echo "::error title=ffmpeg-log::$(tail -n 40 "$LOG" | tr '\n' '|' | cut -c1-3500)"
+            CL="$HOME/totkrecompandroid-ffmpeg/ffmpeg/ffbuild/config.log"
+            [ -f "$CL" ] && echo "::error title=ffmpeg-config::$(tail -n 40 "$CL" | tr '\n' '|' | cut -c1-3500)"
+            exit "$status"
+          fi
+
+      - name: Build the APK
+        id: gradle
+        working-directory: android/totkrecompandroid
+        run: |
+          LOG="$RUNNER_TEMP/gradle.log"
+          set +e
+          bash ./gradlew assembleRelease --no-daemon > "$LOG" 2>&1
+          status=$?
+          set -e
+          tail -n 60 "$LOG"
+          if [ "$status" -ne 0 ]; then
+            # the failing lines as annotations (readable through the API when the logs are not)
+            grep -E -A2 "^e: |error|FAILED|What went wrong|Execution failed|Could not|Caused by" "$LOG" | grep -v "^--$" | head -n 40 \
+              | while IFS= read -r l; do echo "::error title=build::$(echo "$l" | cut -c1-900)"; done
+            exit "$status"
+          fi
+
+      - name: Keep the Gradle log
+        if: always()
+        run: cp "$RUNNER_TEMP/gradle.log" "$RUNNER_TEMP/gradle-log.txt" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gradle-log
+          path: ${{ runner.temp }}/gradle-log.txt
+          if-no-files-found: ignore
+
+      - name: Find the APK
+        id: apk
+        run: echo "path=$(ls android/totkrecompandroid/app/build/outputs/apk/release/*.apk | head -n 1)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: totkdroid-release-apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error

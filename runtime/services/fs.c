@@ -11,6 +11,7 @@
 #include "../hle.h"
 #include "../ipc.h"
 #include "../romfs_build.h"
+#include "restbl.h"
 
 #define FS_PATH_NOT_FOUND MAKE_RESULT(2, 1)
 #define FS_PATH_EXISTS MAKE_RESULT(2, 2)
@@ -338,6 +339,183 @@ static void add_new_files(int fd, const uint64_t *h, const uint8_t *dmeta, uint6
     LOG("[fs] mods: %d new romfs files%s\n", added, new_dirs ? " (and new directories)" : "");
 }
 
+// ------------------------------------------------------------------ resource size table (restbl.c)
+// The game sizes the buffer each file loads into from the file's entry in the resource size table (RESTBL), so a mod
+// file larger than the game's own needs a bigger entry, or the game crashes when it loads it, possibly long after the
+// start. restbl_prepare merges the table a mod ships (if one does) into the game's, raises the entries of the files the
+// mods replace and estimates those of the files they add, and writes the result to cache/restbl. rom_index then
+// serves that file in place of the game's table. When the table needs no change, the game's table stays as it is.
+#define RESTBL_PREFIX "System/Resource/ResourceSizeTable."
+#define RESTBL_SUFFIX ".Nin_NX_NVN.rsizetable.zs"
+#define RESTBL_FILE "cache/restbl/ResourceSizeTable.zs"
+
+static bool restbl_is_table(const char *p) {
+    size_t n = strlen(p), k = strlen(RESTBL_SUFFIX);
+    return !strncmp(p, RESTBL_PREFIX, sizeof RESTBL_PREFIX - 1) && n > k && !strcmp(p + n - k, RESTBL_SUFFIX);
+}
+
+static bool restbl_mc(const char *p) {  // a mesh codec file: its entry counts compressed bytes
+    size_t n = strlen(p);
+    return n >= 3 && !strcmp(p + n - 3, ".mc");
+}
+
+// The decompressed size of the file at host (its zstd frame's content size), total for a file that is not zstd.
+static uint64_t host_content_size(const char *host, uint64_t total) {
+    uint8_t head[18];
+    int f = open(host, O_RDONLY);
+    if (f < 0) return total;
+    ssize_t n = pread(f, head, sizeof head, 0);
+    close(f);
+    return restbl_content_size(head, n > 0 ? (size_t)n : 0, total);
+}
+
+// The same for the game's file of the image fd at off (total bytes).
+static uint64_t image_content_size(int fd, uint64_t off, uint64_t total) {
+    uint8_t head[18];
+    ssize_t n = img_pread(fd, head, sizeof head, (off_t)off);
+    return restbl_content_size(head, n > 0 ? (size_t)n : 0, total);
+}
+
+// The whole of a host file (malloc'd, *n its size); NULL when it is not a regular file of up to 64 MiB.
+static uint8_t *host_read(const char *host, size_t *n) {
+    struct stat sb;
+    if (stat(host, &sb) || !S_ISREG(sb.st_mode) || sb.st_size > (64 << 20)) return NULL;
+    FILE *f = fopen(host, "rb");
+    if (!f) return NULL;
+    uint8_t *d = malloc(sb.st_size ? (size_t)sb.st_size : 1);
+    size_t got = d ? fread(d, 1, (size_t)sb.st_size, f) : 0;
+    fclose(f);
+    if (!d || got != (size_t)sb.st_size) {
+        free(d);
+        return NULL;
+    }
+    *n = got;
+    return d;
+}
+
+// The game image's resource size table, with the mods' files in it (see above). Returns its index in rom_files and
+// writes the host path that replaces it to gen; -1 (gen empty) when the game's table is served as it is.
+static int restbl_prepare(int fd, char *gen, size_t cap) {
+    gen[0] = 0;
+    if (R->dlc || (!mods_file_count() && !mods_dir())) return -1;   // (no mod serves a file: the game's table stays)
+    int ti = -1;
+    for (int i = 0; i < rom_nfiles && ti < 0; i++)
+        if (restbl_is_table(rom_files[i].path)) ti = i;
+    if (ti < 0) return -1;
+    uint64_t gsz = rom_files[ti].size;
+    uint8_t *gz = gsz && gsz <= (64u << 20) ? malloc((size_t)gsz) : NULL;
+    Restbl *base = NULL, *out = NULL;
+    if (gz && img_pread(fd, gz, (size_t)gsz, (off_t)rom_files[ti].off) == (ssize_t)gsz) {
+        base = restbl_unpack(gz, (size_t)gsz);
+        out = restbl_unpack(gz, (size_t)gsz);
+    }
+    free(gz);
+    if (!base || !out) {
+        LOG("[fs] resource size table: the game's table can't be read; the mods' files keep their entries\n");
+        restbl_free(base);
+        restbl_free(out);
+        return -1;
+    }
+    // a table a mod ships under the same name: its entries that are larger than the game's are kept
+    int merged = 0;
+    char shipped_host[1200];
+    if (mods_override(rom_files[ti].path, shipped_host, sizeof shipped_host) ||
+        mods_romfs_override(rom_files[ti].path, shipped_host, sizeof shipped_host)) {
+        size_t n = 0;
+        uint8_t *z = host_read(shipped_host, &n);
+        Restbl *t = z ? restbl_unpack(z, n) : NULL;
+        free(z);
+        if (t) merged = restbl_merge(out, base, t);
+        else LOG("[fs] resource size table: %s is not a resource size table; left out\n", shipped_host);
+        restbl_free(t);
+    }
+    // the replaced files: an entry the game has grows to what the file needs
+    int raised = 0, files = 0, estimated = 0;
+    for (int i = 0; i < rom_nfiles; i++) {
+        char host[1200];
+        if (i == ti) continue;
+        if (!mods_override(rom_files[i].path, host, sizeof host) && !mods_romfs_override(rom_files[i].path, host, sizeof host))
+            continue;
+        struct stat sb;
+        if (stat(host, &sb) || !S_ISREG(sb.st_mode)) continue;
+        char key[4200];
+        restbl_key(rom_files[i].path, key, sizeof key);
+        uint32_t entry;
+        if (!restbl_get(base, key, &entry)) continue;   // the game sizes it without the table (streamed)
+        int mc = restbl_mc(rom_files[i].path);
+        uint64_t was = mc ? rom_files[i].size : image_content_size(fd, rom_files[i].off, rom_files[i].size);
+        uint64_t now = mc ? (uint64_t)sb.st_size : host_content_size(host, (uint64_t)sb.st_size);
+        uint32_t want = restbl_grow(key, entry, was, now, mc);
+        if (want) raised += restbl_raise(out, key, want);
+        files++;
+    }
+    // the added files: an entry of their own, estimated from their size
+    char **known = malloc(sizeof *known * (size_t)(rom_nfiles ? rom_nfiles : 1));
+    for (int i = 0; i < rom_nfiles; i++) known[i] = rom_files[i].path;
+    qsort(known, rom_nfiles, sizeof *known, path_cmp);
+    NewFile *nf = NULL;
+    int nn = 0, cap_nf = 0;
+    if (mods_dir()) {
+        char root[1100];
+        snprintf(root, sizeof root, "%s/romfs", mods_dir());
+        walk_new(root, "", known, rom_nfiles, &nf, &nn, &cap_nf);
+    }
+    for (int i = 0; i < mods_file_count(); i++) {
+        const char *rel, *host;
+        struct stat sb;
+        if (!mods_file(i, &rel, &host) || !rel || bsearch(&rel, known, rom_nfiles, sizeof *known, path_cmp)) continue;
+        if (stat(host, &sb) || !S_ISREG(sb.st_mode)) continue;
+        if (nn == cap_nf) {
+            cap_nf = cap_nf ? cap_nf * 2 : 64;
+            nf = realloc(nf, sizeof *nf * (size_t)cap_nf);
+        }
+        strlcpy(nf[nn].rel, rel, sizeof nf[nn].rel);
+        strlcpy(nf[nn].host, host, sizeof nf[nn].host);
+        nf[nn].size = (uint64_t)sb.st_size;
+        nn++;
+    }
+    for (int i = 0; i < nn; i++) {
+        char key[4200];
+        restbl_key(nf[i].rel, key, sizeof key);
+        int mc = restbl_mc(nf[i].rel);
+        uint64_t now = mc ? nf[i].size : host_content_size(nf[i].host, nf[i].size);
+        uint32_t want = restbl_estimate(key, mc ? now * 8 : now);
+        if (!want) continue;
+        estimated++;
+        raised += restbl_raise(out, key, want);
+    }
+    free(nf);
+    free(known);
+    restbl_free(base);
+    if (!merged && !raised) {
+        restbl_free(out);
+        LOG("[fs] resource size table: the mods' files fit the game's entries\n");
+        return -1;
+    }
+    size_t zn = 0;
+    uint8_t *z = restbl_pack(out, &zn);
+    restbl_free(out);
+    bool ok = false;
+    if (z) {
+        mkdir("cache", 0755);
+        mkdir("cache/restbl", 0755);
+        FILE *f = fopen(RESTBL_FILE, "wb");
+        if (f) {
+            ok = fwrite(z, 1, zn, f) == zn;
+            ok = fclose(f) == 0 && ok;
+        }
+    }
+    free(z);
+    if (!ok) {
+        LOG("[fs] resource size table: cannot write %s; the game's table is kept\n", RESTBL_FILE);
+        return -1;
+    }
+    snprintf(gen, cap, "%s", RESTBL_FILE);
+    LOG("[fs] resource size table: %d tables merged, %d entries raised for %d mod files, %d added files estimated\n",
+        merged, raised, files, estimated);
+    return ti;
+}
+
 static void rom_index(int fd) {
     uint64_t h[10];
     if (img_pread(fd, h, sizeof h, 0) != (ssize_t)sizeof h) return;
@@ -372,9 +550,12 @@ static void rom_index(int fd) {
     // point them at data appended past the end of the image; reads there go to host files.
     mods_scan();
     mods_select_dlc(R->dlc);  // (the DLC's image: the mods of its title)
+    char gen[1200];
+    int gen_i = restbl_prepare(fd, gen, sizeof gen);  // the resource size table, rewritten when a mod needs it
     for (int i = 0; i < rom_nfiles; i++) {
         char host[1200];
-        if (!(!R->dlc && mods_override(rom_files[i].path, host, sizeof host)) && !mods_romfs_override(rom_files[i].path, host, sizeof host))
+        if (i == gen_i) snprintf(host, sizeof host, "%s", gen);
+        else if (!(!R->dlc && mods_override(rom_files[i].path, host, sizeof host)) && !mods_romfs_override(rom_files[i].path, host, sizeof host))
             continue;
         struct stat sb;
         if (stat(host, &sb)) continue;
@@ -498,7 +679,9 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
             static const char *last;
             if (path && path != last) {
                 last = path;
-                if (getenv("LARECOMP_LOG_FILES")) LOG("[fs] read %s\n", path);
+                // (diagnosis: on by default, so a crash log names the last game files read; LARECOMP_LOG_FILES=0 turns it off)
+                const char *lf = getenv("LARECOMP_LOG_FILES");
+                if (!lf || strcmp(lf, "0")) LOG("[fs] read %s\n", path);
             }
         }
         static uint64_t reads, bytes;
@@ -552,8 +735,18 @@ static Service *open_romfs_storage(void) {
 }
 
 // ------------------------------------------------------------------ host-directory filesystem
-typedef struct { char root[1024]; } HostFs;
-typedef struct { int fd; char path[1100]; } HostFile;
+typedef struct { char root[1024]; bool save; } HostFs;  // save: a save data's (not the SD card's)
+typedef struct { int fd; char path[1100]; bool save; } HostFile;
+
+// A save being written: the game's changes to a save since its last Commit (0: none). The app in the background holds
+// the game at its next present only once that save is committed (nvn/objects.c nvn_background), so Android killing
+// the app in the background doesn't cut a save in half. A save not committed within 20 s doesn't hold it up longer.
+static uint64_t save_dirty_ns;  // (__atomic_*)
+static void save_dirty(bool save) { if (save) __atomic_store_n(&save_dirty_ns, plat_now_ns() | 1, __ATOMIC_RELAXED); }
+bool fs_save_pending(void) {
+    uint64_t t = __atomic_load_n(&save_dirty_ns, __ATOMIC_RELAXED);
+    return t && plat_now_ns() - t < 20000000000ull;
+}
 typedef struct { DIR *d; char path[1024]; int mode; } HostDir;
 
 static const char *in_path(IpcReq *req, int i) {
@@ -594,11 +787,12 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
         IpcBuf *a = in_buf(req, 0);
         if (strstr(f->path, "savedata"))
             LOG("[save] write %s off %lld size %lld <- guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)a->addr);
+        save_dirty(f->save);
         if (pwrite(f->fd, (void *)(uintptr_t)a->addr, (size_t)size, off) < 0) resp->result = errno_result();
         break;
     }
     case 2: fsync(f->fd); break;
-    case 3: if (ftruncate(f->fd, IN(int64_t, 0))) resp->result = errno_result(); break;
+    case 3: save_dirty(f->save); if (ftruncate(f->fd, IN(int64_t, 0))) resp->result = errno_result(); break;
     case 4: {
         struct stat sb;
         fstat(f->fd, &sb);
@@ -678,6 +872,7 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
     HostFs *fs = s->state;
     char p[2048], p2[2048];
     host_path(fs, in_path(req, 0), p, sizeof p);
+    if (req->cmd <= 6 || req->cmd == 13) save_dirty(fs->save);  // (create, delete, rename, clean: the save changes)
     switch (req->cmd) {
     case 0: {  // CreateFile(option, size)
         int fd = open(p, O_CREAT | O_EXCL | O_RDWR, 0644);
@@ -707,6 +902,7 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
         if (fd < 0) { resp->result = errno_result(); break; }
         HostFile *f = calloc(1, sizeof *f);
         f->fd = fd;
+        f->save = fs->save;
         strlcpy(f->path, p, sizeof f->path);
         ipc_return_object(resp, service_new("IFile", file, f));
         break;
@@ -721,7 +917,7 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
         ipc_return_object(resp, service_new("IDirectory", directory, hd));
         break;
     }
-    case 10: break;  // Commit
+    case 10: if (fs->save) __atomic_store_n(&save_dirty_ns, 0, __ATOMIC_RELAXED); break;  // Commit
     case 11: case 12: OUT(int64_t, 0) = 0x40000000; resp_size(resp, 8); break;
     case 13: rm_rf(p, true); break;
     case 14: memset(resp->data, 0, 0x20); resp_size(resp, 0x20); break;
@@ -805,6 +1001,7 @@ static Service *open_host_fs(const char *sub) {
     HostFs *fs = calloc(1, sizeof *fs);
     if (getenv("LARECOMP_SAVE_DIR")) g_save_dir = getenv("LARECOMP_SAVE_DIR");  // test runs use a scratch copy
     snprintf(fs->root, sizeof fs->root, "%s/%s", g_save_dir, sub);
+    fs->save = strcmp(sub, "sdcard") != 0;
     {   // LARECOMP_SAVE_SEED=<save folder>: a save that doesn't exist yet starts as a copy of that one's (another game
         // version's data root starting from the player's saves - android/run_ver.sh)
         const char *seed = getenv("LARECOMP_SAVE_SEED");
