@@ -1,5 +1,10 @@
 import java.util.Properties
 import java.security.KeyStore
+import java.security.SecureRandom
+import javax.crypto.Cipher
+import javax.crypto.CipherOutputStream
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 import java.security.MessageDigest
 
 plugins {
@@ -241,14 +246,14 @@ val encryptMainLib = tasks.register("encryptMainLib") {
         val out = libAssets.get().asFile.resolve(ASSET_NAME)
         out.parentFile.mkdirs()
         out.delete()
-        val iv = ByteArray(12).also { java.security.SecureRandom().nextBytes(it) }
-        val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, javax.crypto.spec.SecretKeySpec(keyBytes, "AES"),
-            javax.crypto.spec.GCMParameterSpec(128, iv))
+        val iv = ByteArray(12).also { SecureRandom().nextBytes(it) }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(keyBytes, "AES"),
+            GCMParameterSpec(128, iv))
         out.outputStream().use { raw ->
             raw.write("TLB1".toByteArray(Charsets.US_ASCII))
             raw.write(iv)
-            javax.crypto.CipherOutputStream(raw, cipher).use { enc -> lib.inputStream().use { it.copyTo(enc) } }
+            CipherOutputStream(raw, cipher).use { enc -> lib.inputStream().use { it.copyTo(enc) } }
         }
         lib.delete()
         logger.lifecycle("encryptMainLib: ${out.length()} bytes from ${built.length()}")
