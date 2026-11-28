@@ -96,6 +96,22 @@ jobs:
             exit "$status"
           fi
 
+      # The anti-tamper check (Integrity.java) passes only if the APK is signed with the certificate built into it. Check here,
+      # so a mismatch fails the build instead of showing up on the phone.
+      - name: Check the APK's certificate against the built-in one
+        run: |
+          APK=$(ls android/totkrecompandroid/app/build/outputs/apk/release/*.apk | head -n 1)
+          BC=$(find android/totkrecompandroid/app/build/generated -name BuildConfig.java -path '*release*' | head -n 1)
+          EXP=$(grep -o 'EXPECTED_CERT_SHA256 = "[0-9a-f]*"' "$BC" | grep -o '[0-9a-f]\{64\}' || true)
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)
+          GOT=$("$APKSIGNER" verify --print-certs "$APK" | awk -F': ' '/SHA-256 digest/{print $2; exit}')
+          echo "built-in: $EXP"
+          echo "signed:   $GOT"
+          if [ -z "$EXP" ] || [ "$EXP" != "$GOT" ]; then
+            echo "::error title=signature::the APK is signed with a different certificate than the one built into it"
+            exit 1
+          fi
+
       - name: Keep the Gradle log
         if: always()
         run: cp "$RUNNER_TEMP/gradle.log" "$RUNNER_TEMP/gradle-log.txt" 2>/dev/null || true

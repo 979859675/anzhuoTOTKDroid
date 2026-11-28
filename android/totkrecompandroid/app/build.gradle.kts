@@ -31,21 +31,6 @@ fun certSha256(store: File, password: String, alias: String): String? {
     }
     return null
 }
-val signer: Triple<File, String, String> = if (releaseKey.exists()) {
-    val p = Properties().apply { releaseKey.inputStream().use { load(it) } }
-    Triple(file(p.getProperty("storeFile")), p.getProperty("storePassword"), p.getProperty("keyAlias"))
-} else {
-    Triple(File(System.getProperty("user.home"), ".android/debug.keystore"), "android", "androiddebugkey")
-}
-if (!releaseKey.exists() && !signer.first.exists()) {  // the debug key: the build tools make it on first use; make the same one
-    signer.first.parentFile.mkdirs()
-    ProcessBuilder("keytool", "-genkeypair", "-keystore", signer.first.path, "-storepass", signer.second,
-        "-keypass", signer.second, "-alias", signer.third, "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
-        "-dname", "CN=Android Debug,O=Android,C=US").inheritIO().start().waitFor()
-}
-val expectedCert: String = certSha256(signer.first, signer.second, signer.third)
-    ?: throw GradleException("no signing certificate in ${signer.first} (alias ${signer.third})")
-
 android {
     namespace = "com.totkrecompandroid"
     compileSdk = 36
@@ -57,7 +42,6 @@ android {
 
     defaultConfig {
         applicationId = "com.totkrecompandroid"
-        buildConfigField("String", "EXPECTED_CERT_SHA256", "\"$expectedCert\"")
         minSdk = 30
         targetSdk = 36
         versionCode = 13
@@ -226,4 +210,24 @@ val prepareTotkRecompAndroid by tasks.registering {
 tasks.named("preBuild") { dependsOn(prepareTotkRecompAndroid) }
 tasks.matching { it.name.startsWith("configureCMake") || it.name.startsWith("buildCMake") }.configureEach {
     dependsOn(prepareTotkRecompAndroid)
+}
+
+// The certificate the release APK is actually signed with: AGP's own signing config for the release type (the keystore.properties
+// one, or else the debug key at the place AGP keeps it, which can differ from ~/.android). Set here, after the DSL is read.
+afterEvaluate {
+    val sc = android.buildTypes.getByName("release").signingConfig
+        ?: throw GradleException("release build has no signing config")
+    val store: File = sc.storeFile ?: throw GradleException("release signing config has no storeFile")
+    val storePw: String = sc.storePassword ?: throw GradleException("release signing config has no storePassword")
+    val alias: String = sc.keyAlias ?: throw GradleException("release signing config has no keyAlias")
+    val keyPw: String = sc.keyPassword ?: storePw
+    if (!store.exists()) {  // the build tools make the debug key on first use; make it here, so this and the signing read the same one
+        store.parentFile.mkdirs()
+        ProcessBuilder("keytool", "-genkeypair", "-keystore", store.path, "-storepass", storePw, "-keypass", keyPw,
+            "-alias", alias, "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
+            "-dname", "CN=Android Debug,O=Android,C=US").inheritIO().start().waitFor()
+    }
+    val expectedCert: String = certSha256(store, storePw, alias)
+        ?: throw GradleException("no signing certificate in $store (alias $alias)")
+    android.defaultConfig.buildConfigField("String", "EXPECTED_CERT_SHA256", "\"$expectedCert\"")
 }
