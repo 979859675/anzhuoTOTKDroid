@@ -156,6 +156,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 ->execute([password_hash($p, PASSWORD_DEFAULT)]);
             $msg = '注册口令已更新';
         }
+    } elseif ($act === 'del_pass') {
+        $db->prepare("DELETE FROM settings WHERE k = 'reg_passphrase_hash'")->execute();
+        $msg = '注册口令已删除，注册已关闭';
     } elseif ($act === 'toggle' || $act === 'reset_devices') {
         $id = (int)($_POST['id'] ?? 0);
         if ($id > 0 && $act === 'toggle') {
