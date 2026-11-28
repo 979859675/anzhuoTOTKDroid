@@ -25,7 +25,11 @@ final class Integrity {
         if (Debug.isDebuggerConnected()) return "debugger";
         if (tracerAttached()) return "tracer";
         String cert = signerSha256(c);
-        if (!BuildConfig.EXPECTED_CERT_SHA256.equalsIgnoreCase(cert)) return "signature";
+        if (!BuildConfig.EXPECTED_CERT_SHA256.equalsIgnoreCase(cert)) {
+            // (the first 16 characters of each, to find which side is wrong; a certificate's hash is not a secret)
+            return "signature: installed " + (cert.isEmpty() ? "none" : cert.substring(0, 16))
+                    + ", expected " + BuildConfig.EXPECTED_CERT_SHA256.substring(0, Math.min(16, BuildConfig.EXPECTED_CERT_SHA256.length()));
+        }
         return null;
     }
 
