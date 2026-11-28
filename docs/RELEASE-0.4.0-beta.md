@@ -27,7 +27,7 @@ Atualiza por cima das versões anteriores sem apagar os saves. **Não desinstale
   - As texturas BC agora são decodificadas em quatro partes ao mesmo tempo.
   - Menos cópias no modo de cópia: vértices, tabelas e compute em sequência.
   - Do Swap2-Native: a profundidade que um passe só lê não é gravada de volta, e desenhos sem saída de cor ficam sem fragment shader.
-  - **Para testar (opcional):** o heap do jogo em blocos de AHardwareBuffer, para o driver de sistema da Mali. Coloque `LARECOMP_VK_MEMFD=1,LARECOMP_VK_MEMFD_AHB=3` em *Variáveis do driver*. Na Mali simulada num POCO, foram 26,4 fps contra 16,5. Se testar, mande o log.
+  - **Para testar (opcional):** o heap do jogo em blocos de AHardwareBuffer, para o driver de sistema da Mali. Coloque `LARECOMP_VK_MEMFD=1 LARECOMP_VK_MEMFD_AHB=3` (separadas por espaço) em *Variáveis do driver*. Na Mali simulada num POCO, foram 26,4 fps contra 16,5. Se testar, mande o log.
   - Tudo isso foi testado simulando Mali num Adreno 830, não numa Mali de verdade.
 - **Drivers Qualcomm 891.x no Android 15:** caíam no driver do sistema sem avisar. Agora carregam.
 - **Outras:**
@@ -76,7 +76,7 @@ Installs over earlier versions and keeps your saves. **Don't uninstall the app f
   - BC textures are now decoded in four parts at once.
   - Fewer copies in copy mode: vertices, tables and back-to-back compute.
   - From Swap2-Native: depth a pass only reads isn't written back, and draws with no colour output get no fragment shader.
-  - **To test (optional):** the game's heap in Android hardware buffer blocks, for Mali's system driver. Put `LARECOMP_VK_MEMFD=1,LARECOMP_VK_MEMFD_AHB=3` in *Driver variables*. On a simulated Mali on a POCO it ran at 26.4 fps against 16.5. If you try it, please send the log.
+  - **To test (optional):** the game's heap in Android hardware buffer blocks, for Mali's system driver. Put `LARECOMP_VK_MEMFD=1 LARECOMP_VK_MEMFD_AHB=3` (separated by a space) in *Driver variables*. On a simulated Mali on a POCO it ran at 26.4 fps against 16.5. If you try it, please send the log.
   - All of this was tested by simulating Mali on an Adreno 830, not on a real Mali.
 - **Qualcomm 891.x drivers on Android 15:** they fell back to the system driver without a word. Now they load.
 - **Other:**

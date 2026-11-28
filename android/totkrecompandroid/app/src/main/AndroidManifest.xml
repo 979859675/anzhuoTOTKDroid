@@ -38,7 +38,6 @@
         <!-- simpleperf over adb on release builds (CPU profiles: docs/las/ANDROID-PORT.md); nothing else changes -->
         <profileable android:shell="true" />
 
-        <!-- The game. Not exported: the app is entered through LoginActivity (the account check), which starts it. -->
         <activity
             android:name=".TOTKRecompAndroidActivity"
             android:alwaysRetainTaskState="true"
@@ -46,15 +45,6 @@
             android:screenOrientation="sensorLandscape"
             android:configChanges="layoutDirection|locale|grammaticalGender|fontScale|fontWeightAdjustment|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
             android:preferMinimalPostProcessing="true"
-            android:exported="false" />
-        <!-- The launcher and the shortcuts: the login (ly.xzcqgzs.cn, server/): checks the login at every launch, and
-             starts the game only after it. Offline without a valid login: the login form. -->
-        <activity
-            android:name=".LoginActivity"
-            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
-            android:screenOrientation="sensorLandscape"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation"
-            android:windowSoftInputMode="adjustResize"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

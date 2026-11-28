@@ -1,10 +1,4 @@
 import java.util.Properties
-import java.security.KeyStore
-import java.security.SecureRandom
-import javax.crypto.Cipher
-import javax.crypto.CipherOutputStream
-import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
 import java.security.MessageDigest
 
 plugins {
@@ -17,46 +11,21 @@ val deps: File = repo.resolve("android/deps/out")  // android/deps/build_deps.sh
 val ffmpeg: File = repo.resolve("android/deps/ffmpeg").let { if (it.resolve("lib/libswresample.so").exists()) it else deps }
 fun depLib(name: String): File = (if (name.startsWith("libav") || name.startsWith("libsw")) ffmpeg else deps).resolve("lib/$name")
 val gen = layout.buildDirectory.dir("generated/totkrecompandroid")
-// The game's native library, encrypted with the key of the account server (B): TOTK_LIB_KEY (64 hex characters, the
-// build's ANDROID_LIB_KEY secret). Without it the library ships plain, as before. Release builds only (encryptMainLib).
-val libKeyHex: String? = System.getenv("TOTK_LIB_KEY")?.trim()?.ifEmpty { null }
-if (libKeyHex != null && !libKeyHex.matches(Regex("[0-9a-fA-F]{64}"))) throw GradleException("TOTK_LIB_KEY must be 64 hex characters")
-val libAssets = layout.buildDirectory.dir("generated/totkrecompandroid/libassets")
-val ASSET_NAME = "libmain.bin"  // (LibKey.java)
 // The release key: outside the repository, in ~/.totkrecompandroid/keystore.properties (storeFile, storePassword, keyAlias,
 // keyPassword); without it, release builds are signed with the debug key
 val releaseKey: File = File(System.getProperty("user.home"), ".totkrecompandroid/keystore.properties")
 
-// The certificate the release build is signed with (the debug key unless keystore.properties exists). Its SHA-256 goes into
-// the app (BuildConfig.EXPECTED_CERT_SHA256); Integrity.java checks that the running APK is signed with it.
-fun certSha256(store: File, password: String, alias: String): String? {
-    for (type in listOf("PKCS12", "JKS")) {
-        try {
-            val ks = KeyStore.getInstance(type)
-            store.inputStream().use { ks.load(it, password.toCharArray()) }
-            val cert = ks.getCertificate(alias) ?: continue
-            return MessageDigest.getInstance("SHA-256").digest(cert.encoded).joinToString("") { "%02x".format(it) }
-        } catch (e: Exception) {
-            // (not this store type: the next one)
-        }
-    }
-    return null
-}
 android {
     namespace = "com.totkrecompandroid"
     compileSdk = 36
     ndkVersion = "30.0.16248370"
-
-    buildFeatures {
-        buildConfig = true  // BuildConfig.EXPECTED_CERT_SHA256 (Integrity.java)
-    }
 
     defaultConfig {
         applicationId = "com.totkrecompandroid"
         minSdk = 30
         targetSdk = 36
         versionCode = 13
-        versionName = "0.4.2-beta"
+        versionName = "0.5.0-beta+features"
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -82,7 +51,7 @@ android {
         getByName("main") {
             java.srcDirs("src/main/java", deps.resolve("java"))  // (SDL's Java side, the same version as libSDL3.so)
             jniLibs.srcDirs(gen.get().asFile.resolve("jniLibs"))
-            assets.srcDirs(gen.get().asFile.resolve("assets"), libAssets.get().asFile)
+            assets.srcDirs(gen.get().asFile.resolve("assets"))
             res.srcDirs("src/main/res", gen.get().asFile.resolve("res"))
         }
     }
@@ -97,7 +66,6 @@ android {
             useLegacyPackaging = true  // adrenotools loads its hooks from nativeLibraryDir
             pickFirsts += listOf("**/libSDL3.so", "**/libshaderc_shared.so", "**/libavcodec.so", "**/libavformat.so",
                                  "**/libavutil.so", "**/libswscale.so", "**/libswresample.so")
-            if (libKeyHex != null) excludes += "**/libmain.so"  // (the encrypted copy is in the assets: LibKey.java)
         }
     }
 
@@ -113,10 +81,7 @@ android {
 
     buildTypes {
         getByName("release") {
-            // R8: the Java side shrunk and renamed (proguard-rules.pro keeps what the native code and the manifest name).
-            // proguard-android.txt (shrink and rename only, no optimization): fewer surprises at runtime.
-            isMinifyEnabled = true
-            proguardFiles(getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro")
+            isMinifyEnabled = false
             signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
@@ -222,73 +187,4 @@ val prepareTotkRecompAndroid by tasks.registering {
 tasks.named("preBuild") { dependsOn(prepareTotkRecompAndroid) }
 tasks.matching { it.name.startsWith("configureCMake") || it.name.startsWith("buildCMake") }.configureEach {
     dependsOn(prepareTotkRecompAndroid)
-}
-
-// Encrypts the game's native library (stripped, as packaged) into assets/libmain.bin: "TLB1" + IV + AES-256-GCM.
-val encryptMainLib = tasks.register("encryptMainLib") {
-    onlyIf { libKeyHex != null }
-    doLast {
-        val keyBytes = ByteArray(32) { libKeyHex!!.substring(2 * it, 2 * it + 2).toInt(16).toByte() }
-        // the CMake output (not yet merged or stripped by AGP), else whatever the build has of it
-        val found = layout.buildDirectory.get().asFile.walkTopDown()
-            .filter { it.name == "libmain.so" && it.parentFile.name == "arm64-v8a" }.toList()
-        val built = found.filter { it.path.contains("${File.separator}cxx${File.separator}") }.maxByOrNull { it.lastModified() }
-            ?: found.maxByOrNull { it.lastModified() }
-            ?: throw GradleException("libmain.so of the release build not found under ${layout.buildDirectory.get().asFile}")
-        // stripped the way the packaging strips it (llvm-strip of the NDK); without it, the unstripped one (larger)
-        val sdk = System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT") ?: ""
-        val strip = File(sdk, "ndk/30.0.16248370/toolchains/llvm/prebuilt").listFiles()
-            ?.map { it.resolve("bin/llvm-strip") }?.firstOrNull { it.exists() }
-        val lib = File(temporaryDir, "libmain.so")
-        built.copyTo(lib, overwrite = true)
-        if (strip != null) {
-            ProcessBuilder(strip.path, "--strip-unneeded", lib.path).inheritIO().start().waitFor()
-        } else {
-            logger.warn("encryptMainLib: no llvm-strip in the NDK; the encrypted library is not stripped")
-        }
-        val out = libAssets.get().asFile.resolve(ASSET_NAME)
-        out.parentFile.mkdirs()
-        out.delete()
-        val iv = ByteArray(12).also { SecureRandom().nextBytes(it) }
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(keyBytes, "AES"),
-            GCMParameterSpec(128, iv))
-        out.outputStream().use { raw ->
-            raw.write("TLB1".toByteArray(Charsets.US_ASCII))
-            raw.write(iv)
-            CipherOutputStream(raw, cipher).use { enc -> lib.inputStream().use { it.copyTo(enc) } }
-        }
-        lib.delete()
-        logger.lifecycle("encryptMainLib: ${out.length()} bytes from ${built.length()}")
-    }
-}
-afterEvaluate {
-    // after the native build: the CMake tasks (their names differ between AGP versions) and the native libs merge
-    encryptMainLib.configure {
-        dependsOn(tasks.matching { t ->
-            t.name == "mergeReleaseNativeLibs" ||
-                (t.name.contains("Release") && (t.name.startsWith("buildCMake") || t.name.startsWith("externalNativeBuild")))
-        })
-    }
-    tasks.matching { it.name == "mergeReleaseAssets" }.configureEach { dependsOn(encryptMainLib) }
-}
-
-// The certificate the release APK is actually signed with: AGP's own signing config for the release type (the keystore.properties
-// one, or else the debug key at the place AGP keeps it, which can differ from ~/.android). Set here, after the DSL is read.
-afterEvaluate {
-    val sc = android.buildTypes.getByName("release").signingConfig
-        ?: throw GradleException("release build has no signing config")
-    val store: File = sc.storeFile ?: throw GradleException("release signing config has no storeFile")
-    val storePw: String = sc.storePassword ?: throw GradleException("release signing config has no storePassword")
-    val alias: String = sc.keyAlias ?: throw GradleException("release signing config has no keyAlias")
-    val keyPw: String = sc.keyPassword ?: storePw
-    if (!store.exists()) {  // the build tools make the debug key on first use; make it here, so this and the signing read the same one
-        store.parentFile.mkdirs()
-        ProcessBuilder("keytool", "-genkeypair", "-keystore", store.path, "-storepass", storePw, "-keypass", keyPw,
-            "-alias", alias, "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
-            "-dname", "CN=Android Debug,O=Android,C=US").inheritIO().start().waitFor()
-    }
-    val expectedCert: String = certSha256(store, storePw, alias)
-        ?: throw GradleException("no signing certificate in $store (alias $alias)")
-    android.defaultConfig.buildConfigField("String", "EXPECTED_CERT_SHA256", "\"$expectedCert\"")
 }

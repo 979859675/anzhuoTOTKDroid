@@ -1,4 +1,4 @@
-# Builds the release APK (arm64-v8a, R8 on; signed with the same key as before) on GitHub's runner and uploads it as the "totkdroid-release-apk" artifact.
+# Builds the release APK (arm64-v8a) on GitHub's runner and uploads it as the "totkdroid-release-apk" artifact.
 # The APK includes the GPL-3.0-or-later LSFG folder (the default; see NOTICE.md). The game's files
 # are not in the APK: they are pushed to the phone separately (README: push_game.sh).
 name: Build debug APK
@@ -79,37 +79,9 @@ jobs:
             exit "$status"
           fi
 
-      # The release signing key, from the repository secrets (ANDROID_RELEASE_*): the same key for every build, so an installed
-      # copy can be updated over. Without the secrets the build falls back to the runner's debug key (a different key per run).
-      - name: Set up the release signing key
-        env:
-          KS_B64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
-          KS_PASS: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
-          KS_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
-          KS_KEY_PASS: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
-        run: |
-          if [ -z "$KS_B64" ] || [ -z "$KS_PASS" ] || [ -z "$KS_ALIAS" ]; then
-            echo "::warning title=signing::no release signing key in the secrets; this APK is signed with the runner's debug key"
-            exit 0
-          fi
-          DIR="$HOME/.totkrecompandroid"
-          mkdir -p "$DIR"
-          printf '%s' "$KS_B64" | base64 -d > "$DIR/release.jks"
-          {
-            echo "storeFile=$DIR/release.jks"
-            echo "storePassword=$KS_PASS"
-            echo "keyAlias=$KS_ALIAS"
-            echo "keyPassword=${KS_KEY_PASS:-$KS_PASS}"
-          } > "$DIR/keystore.properties"
-          chmod 600 "$DIR/release.jks" "$DIR/keystore.properties"
-          echo "release signing key: set up from the secrets"
-
       - name: Build the APK
         id: gradle
         working-directory: android/totkrecompandroid
-        env:
-          # the game library's key (the server's lib_key must be the same): encrypts libmain.so; empty = plain (as before)
-          TOTK_LIB_KEY: ${{ secrets.ANDROID_LIB_KEY }}
         run: |
           LOG="$RUNNER_TEMP/gradle.log"
           set +e
@@ -122,23 +94,6 @@ jobs:
             grep -E -A2 "^e: |error|FAILED|What went wrong|Execution failed|Could not|Caused by" "$LOG" | grep -v "^--$" | head -n 40 \
               | while IFS= read -r l; do echo "::error title=build::$(echo "$l" | cut -c1-900)"; done
             exit "$status"
-          fi
-
-      # The anti-tamper check (Integrity.java) passes only if the APK is signed with the certificate built into it. Check here,
-      # so a mismatch fails the build instead of showing up on the phone.
-      - name: Check the APK's certificate against the built-in one
-        run: |
-          APK=$(ls android/totkrecompandroid/app/build/outputs/apk/release/*.apk | head -n 1)
-          BC=$(find android/totkrecompandroid/app/build/generated -name BuildConfig.java -path '*release*' | head -n 1)
-          EXP=$(grep -o 'EXPECTED_CERT_SHA256 = "[0-9a-f]*"' "$BC" | grep -o '[0-9a-f]\{64\}' || true)
-          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)
-          GOT=$("$APKSIGNER" verify --print-certs "$APK" | awk '/SHA-256 digest/{print $NF; exit}' | tr -d ': ' | tr 'A-F' 'a-f')
-          EXP=$(echo "$EXP" | tr -d ': ' | tr 'A-F' 'a-f')
-          echo "built-in: $EXP"
-          echo "signed:   $GOT"
-          if [ -z "$EXP" ] || [ "$EXP" != "$GOT" ]; then
-            echo "::error title=signature::built-in=[$EXP] signed=[$GOT]"
-            exit 1
           fi
 
       - name: Keep the Gradle log

@@ -1,6 +1,4 @@
 # your own game files and what's made from them (building from source puts them here)
-# mod folders (game files of the mods: never committed; the folder sits at the repository root)
-/mod文件夹/
 input/
 /ROM/
 # the BOTW dump (exefs/ + romfs/ under Dump/<title id>/): never committed
@@ -26,6 +24,3 @@ __pycache__/
 
 # test captures (screenshots, videos from testers)
 testes/
-
-# account server: the real config (database password, admin hash) lives only on the server
-server/config.php

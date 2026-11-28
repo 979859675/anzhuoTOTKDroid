@@ -128,6 +128,43 @@ static int nlclear;
 static uint32_t pass_written;  // (the attachments this pass's draws wrote so far: draw_writes)
 static uint32_t pass_dup_null;  // (color slots left unbound: their image is bound in another slot - begin_pass)
 
+// ---- Color targets a pass never draws into, left out of it (a tiler's: Mali; LARECOMP_DETACH=0 / 1: off / on any
+// GPU). A tiler loads every attachment into tile memory when a pass begins and stores it all back when it ends, and
+// the game's lighting passes keep the whole G-buffer bound while drawing into one target. Which targets a pass writes
+// is known only once its draws have run, so it is remembered per pass (its targets and first fragment shader) and the
+// next time that pass begins the others are left out (as pass_dup_null's: a draw writing one ends the pass first, so a
+// wrong guess costs a pass, not a picture). From SavageWindRecomp's Mali branch (087f2c5, MIT).
+#define DET_TAB 4096
+static struct { uint64_t key; uint8_t written; } det_tab[DET_TAB];
+static uint64_t pass_key;      // (the open pass's, 0: none)
+static uint8_t pass_detached;  // color slots left out of the open pass
+static bool det_clear_next;    // (a clear begins the next pass: everything attached)
+static uint64_t stat_det_passes, stat_det_slots, stat_det_miss;
+static uint64_t g_cur_fs_hash;  // (below)
+static int det_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_DETACH");
+        on = e ? atoi(e) != 0 : g_vk.props.vendorID == 0x13B5;
+        if (on) LOG("[vk] color targets a pass doesn't draw into left out of it\n");
+    }
+    return on;
+}
+static uint64_t det_key(void);  // (st's targets: below)
+static uint8_t det_predict(uint64_t key, uint8_t present, bool depth) {  // the color slots to leave out
+    if (!key || det_clear_next) return 0;
+    uint32_t slot = (uint32_t)(key >> 40) & (DET_TAB - 1);
+    if (det_tab[slot].key != key) return 0;
+    uint8_t out = (uint8_t)(present & ~det_tab[slot].written);
+    return out == present && !depth ? 0 : out;  // (never all of them without a depth target)
+}
+static void det_note(uint64_t key, uint8_t written) {
+    if (!key) return;
+    uint32_t slot = (uint32_t)(key >> 40) & (DET_TAB - 1);
+    if (det_tab[slot].key == key) det_tab[slot].written |= written;
+    else det_tab[slot].key = key, det_tab[slot].written = written;
+}
+
 // (diagnosis) LARECOMP_DRV_TIMES=1: time in the driver calls around submissions, per frame every 120 frames ("[drvt]")
 enum { DT_RESET_DS, DT_RESET_CMD, DT_BEGIN, DT_END, DT_SUBMIT, DT_COMPLETED, DT_ALLOC_SET, DT_AFTER, DT_N };
 static uint64_t drvt_ns[DT_N], drvt_n[DT_N];
@@ -1061,7 +1098,25 @@ VkCommandBuffer vk_upload_cmd(void) {
     return s->upload;
 }
 
+// Pass barriers held to fragment work (begin_pass, frag_barrier_on): GPU work outside passes (copies, dispatches - each
+// behind a full barrier) or a draw storing to memory may have written what a later pass's vertex stage reads (vertex
+// data, instances a compute shader culled): the next pass begins behind a full barrier then. From SavageWindRecomp's
+// Mali branch (8defa9b, MIT).
+static bool vtx_hazard = true;
+static bool pass_frag_only;      // the open pass began behind a fragment-only barrier
+static bool pass_vs_reads_next;  // the pass about to begin has a draw whose vertex stage reads textures or memory
+static uint64_t stat_frag_barriers, stat_frag_restarts;
+static bool frag_barrier_on(void) {  // (Mali only by default; LARECOMP_BARRIER_FRAG=0 / 1: off / on any GPU)
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_BARRIER_FRAG");
+        on = e ? atoi(e) != 0 : g_vk.props.vendorID == 0x13B5;
+        if (on) LOG("[vk] pass barriers hold back fragment work only, unless a vertex stage may read fresh GPU writes\n");
+    }
+    return on;
+}
 void vk_full_barrier(VkCommandBuffer cb) {
+    vtx_hazard = true;  // (begin_pass clears it after its own)
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
@@ -1832,10 +1887,23 @@ static void *worker(void *a) {
     return NULL;
 }
 
+// Draws wait for their shader / pipeline (built on first use, blocking): LARECOMP_SYNC_SHADERS when set ("0": off,
+// anything else on), else the "Wait for shaders" setting (Video tab, shader_wait). Read once, again after a reboot
+// (vk_exec_reset: Quit > Return to start), so a change applies the next time the game starts.
+static int g_sync_shaders = -1;
 static bool sync_shaders(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("LARECOMP_SYNC_SHADERS") != NULL;
-    return v;
+    int v = g_sync_shaders;
+    if (v < 0) {
+        const char *e = getenv("LARECOMP_SYNC_SHADERS");
+        if (e) v = e[0] != '0';
+#ifdef __ANDROID__
+        else v = __atomic_load_n(&g_settings.shader_wait, __ATOMIC_RELAXED) ? 1 : 0;
+#else
+        else v = 0;
+#endif
+        g_sync_shaders = v;
+    }
+    return v != 0;
 }
 
 // Shader translation: one dedicated thread (the translator isn't re-entrant - translate.c's RSC2 string ring - and
@@ -2077,6 +2145,14 @@ static struct {
     uint32_t restart_index;
     uint64_t copy_row_stride, copy_image_stride;
 } st;
+
+static uint64_t det_key(void) {  // (a pass's targets, views and first fragment shader: det_tab)
+    if (!det_on()) return 0;
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t *p = (const uint8_t *)&st.rt;
+    for (size_t i = 0; i < sizeof st.rt; i++) h = (h ^ p[i]) * 1099511628211ull;
+    return (h ^ g_cur_fs_hash) * 0x9E3779B97F4A7C15ull | 1;
+}
 
 uint32_t nvn_window_origin(void);
 uint32_t nvn_depth_mode(void);
@@ -2751,6 +2827,9 @@ static void vk_end_pass_at(int line) {
     if (g_vk.dyn_render && rp_on) rpCmdEndRendering(vk_cmd_rp());  // (a packet for the replay thread, replay.h)
     else vk_end_rendering(vk_cmd());
     in_pass = false;
+    det_note(pass_key, (uint8_t)(pass_written & 0xFF));  // (what it drew into or cleared: the next such pass, begin_pass)
+    pass_key = 0;
+    pass_detached = 0;
     {   extern TexBackend *g_dump_sampled;
         if (g_dump_sampled) { TexBackend *db = g_dump_sampled; g_dump_sampled = NULL; dump_layers_raw(db); }
     }
@@ -2836,7 +2915,26 @@ static bool no_chunks_now(void) {
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     pipeline_dirty = true;
-    vk_end_pass();
+    uint64_t new_key = det_key();
+    uint8_t present = 0;
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++) if (st.rt.color[i]) present |= (uint8_t)(1u << i);
+    uint8_t new_detached = det_predict(new_key, present, st.rt.depth != NULL);
+    det_clear_next = false;
+    vk_end_pass();  // (notes what the pass that ends wrote under its own key)
+    pass_key = new_key;
+    pass_detached = new_detached;
+    if (new_key) {
+        stat_det_passes++;
+        stat_det_slots += (uint64_t)__builtin_popcount(new_detached);
+        static uint64_t next;
+        uint64_t now = plat_now_ns();
+        if (now >= next) {
+            if (next) LOG("[vk] passes %llu, color targets left out %llu, wrong guesses %llu (10 s)\n",
+                          (unsigned long long)stat_det_passes, (unsigned long long)stat_det_slots, (unsigned long long)stat_det_miss);
+            next = now + 10000000000ull;
+            stat_det_passes = stat_det_slots = stat_det_miss = 0;
+        }
+    }
     if (st.rt.depth && st.rt.ncolor >= 3 && st.rt.color[0] && vk_texture_scale_group(st.rt.color[0]) == RS_SCENE) {
         // (LARECOMP_LOG_SCENE=1: the game's dynamic resolution - the first such pass of each frame, its target's size,
         // when it differs from the last frame's; TOTK draws several of them a frame, at other sizes too)
@@ -2900,7 +2998,29 @@ static void begin_pass(void) {
     static int no_barrier = -1;  // (LARECOMP_VK_NO_PASS_BARRIER=1: none - unsafe, a measurement of what it costs)
     if (no_barrier < 0) no_barrier = getenv("LARECOMP_VK_NO_PASS_BARRIER") != NULL;
     extern int vk_ab(const char *what);
-    if (!no_barrier && AB("nobarrier") != 1) rpFullBarrier(cb);  // passes, copies and dispatches see each other's results
+    bool frag_only = frag_barrier_on() && !vtx_hazard && !pass_vs_reads_next;
+    pass_frag_only = frag_only;
+    pass_vs_reads_next = false;
+    if (no_barrier || AB("nobarrier") == 1) {
+    } else if (frag_only) {  // (only the fragment work waits: the vertex work may overlap the passes before - a tiler's)
+        stat_frag_barriers++;
+        rpMemBarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                         VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                     VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    } else
+        rpFullBarrier(cb);  // passes, copies and dispatches see each other's results
+    vtx_hazard = false;
+    {
+        static uint64_t next;
+        uint64_t now = plat_now_ns();
+        if (frag_barrier_on() && now >= next) {
+            if (next) LOG("[vk] pass barriers: %llu held to fragment work, %llu passes restarted for a vertex stage's reads (10 s)\n",
+                          (unsigned long long)stat_frag_barriers, (unsigned long long)stat_frag_restarts);
+            next = now + 10000000000ull;
+            stat_frag_barriers = stat_frag_restarts = 0;
+        }
+    }
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
@@ -3019,6 +3139,12 @@ static void begin_pass(void) {
             ca[drop].imageView = VK_NULL_HANDLE;
             pass_color[drop] = VK_FORMAT_UNDEFINED;
             pass_dup_null |= 1u << drop;
+        }
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++)  // (the color targets this pass is known not to draw into: det_tab)
+        if (((pass_detached >> i) & 1) && ca[i].imageView) {
+            ca[i].imageView = VK_NULL_HANDLE;
+            pass_color[i] = VK_FORMAT_UNDEFINED;
+            pass_dup_null |= 1u << i;
         }
     pass_depth = pass_stencil = VK_FORMAT_UNDEFINED;
     bool has_d = false, has_s = false;
@@ -3202,6 +3328,11 @@ static VkRect2D scissor_rect(void) {
             float k = t0->height / 1080.0f;  // (target pixels a layout unit)
             float dy = widescreen_hud_top((x + sw * 0.5f - t0->width * 0.5f) / k, (t0->height * 0.5f - (y + sh * 0.5f)) / k);
             if (dy != 0) y -= (int)lroundf(dy * k);
+            // (and out to the screen's edge with its panes: widescreen_hud_shift_143 - the minimap's own scissor stayed
+            // in the middle 16:9 part, and only a sliver of the map showed in its moved disc)
+            extern float widescreen_hud_shift_143(float x);
+            float dx = widescreen_hud_shift_143((x + sw * 0.5f - t0->width * 0.5f) / k);
+            if (dx != 0) x += (int)lroundf(dx * k);
         }
     }
     {   // Widescreen (1.8.2): the HUD's camera widens with the scene's (widescreen.c rt_persp_update), which puts the 16:9
@@ -3392,7 +3523,13 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     if (in_pass && pass_dnone && depth) st.rt_dirty = true, stat_dnone_split++, dnone_note_split(st.rt.depth);  // (a depth clear: stored again)
     rec_clear(index);
     if (index >= 0 && index < st.rt.ncolor && (mask & 0xF) == 0xF && keep_screen_skip(st.rt.color[index])) return;  // (#76)
+    if (index >= 0 && index < 8 && det_on()) {  // (a color target left out of the open pass: it ends, the next has it)
+        if (in_pass && !st.rt_dirty && ((pass_detached >> index) & 1))
+            det_note(pass_key, (uint8_t)(1u << index)), st.rt_dirty = true, stat_det_miss++;
+        if (!in_pass || st.rt_dirty) det_clear_next = true;
+    }
     begin_pass();
+    if (index >= 0 && index < 8) det_note(pass_key, (uint8_t)(1u << index));
     for (int i = 0; i < nlclear; i++) {  // (done by the pass's load operations: begin_pass - each once)
         if (lclear[i].rec != g_cur_rec) continue;
         uint32_t asp = lclear[i].aspects;
@@ -3461,13 +3598,29 @@ static void descriptor_plan(const VkBindingInfo *binds, int count, uint32_t set,
     for (int i = 0; i < count; i++) {
         const VkBindingInfo *b = &binds[i];
         if (b->set != set) continue;
+        int ubo = b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         if ((b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->binding >= 32) ||
-            (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) || b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+            (ubo && b->binding < 17) || b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
             plan->regular[plan->nregular++] = (uint8_t)i;
-        else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+        else if (ubo &&
                  (b->binding == 18 || b->binding == 19 || b->binding == GMAP_BUFFER_INDEX || b->binding == CBPATCH_BUFFER_INDEX))
             plan->deferred[plan->ndeferred++] = (uint8_t)i;
     }
+}
+#endif
+#ifdef __ANDROID__
+// Pipeline prewarming (pipeline_prewarm.inc; from BOTWRecomp 6454ccc1): a program's identity across runs, the hashes of
+// its two SPIR-V modules and of the shader keys, set when the program is made (compile_program_from_spirv)
+typedef struct { uint64_t vs_h, fs_h, key_h; uint32_t nv, nf; } PwProgId;
+static _Atomic int pw_env = -2;  // -2 unread, -1 unset, 0 forced off, 1 forced on
+static bool prewarm_enabled(void) {
+    int e = atomic_load_explicit(&pw_env, memory_order_relaxed);
+    if (e == -2) {
+        const char *v = getenv("LARECOMP_PIPE_PREWARM");
+        e = (v && *v) ? (atoi(v) != 0) : -1;
+        atomic_store_explicit(&pw_env, e, memory_order_relaxed);
+    }
+    return e >= 0 ? e != 0 : __atomic_load_n(&g_settings.pipe_prewarm, __ATOMIC_RELAXED);
 }
 #endif
 typedef struct {
@@ -3480,6 +3633,7 @@ typedef struct {
     int nbinds;
 #ifdef __ANDROID__
     DescriptorPlan descriptor_plans[2];
+    PwProgId pw_id;  // (pipeline prewarming; written once by the worker that makes the program, read after state 1)
 #endif
     VkDescriptorSetLayout set_layout[2];
     VkPipelineLayout layout;
@@ -3565,6 +3719,17 @@ static bool meta_cache_on(void);  // (.smeta: below)
 // the .spv cache after a translation) or from prog_fast_or_translate (from_meta: no translation at all; BOTWRecomp b4e80e7)
 static void compile_program_from_spirv(Prog *p, uint32_t *sv, size_t nv, uint32_t *sf, size_t nf, bool from_meta) {
     if (!sv || !sf || atomic_load_explicit(&jobs_abort, memory_order_acquire)) { free(sv); free(sf); signal_build_done(&p->state, 2); return; }
+#ifdef __ANDROID__
+    if (prewarm_enabled()) {  // (the program's identity for the prewarm records: its SPIR-V and shader keys, the same from the .smeta cache or a translation)
+        p->pw_id.nv = (uint32_t)nv;
+        p->pw_id.nf = (uint32_t)nf;
+        uint64_t vh = hash_words(0xcbf29ce484222325ull, sv, nv * sizeof *sv);
+        p->pw_id.vs_h = vh ? vh : 1;
+        p->pw_id.fs_h = hash_words(0xcbf29ce484222325ull, sf, nf * sizeof *sf);
+        uint64_t kh = hash_words(0xcbf29ce484222325ull, &p->vkey, sizeof p->vkey);
+        p->pw_id.key_h = hash_words(kh, &p->fkey, sizeof p->fkey);
+    }
+#endif
     p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
     p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
     p->vs = vk_module(sv, nv);
@@ -4158,6 +4323,29 @@ static uint32_t rt_format(int i) {
     return st.rt.has_cview[i] && (st.rt.cview[i].setmask & 4) ? st.rt.cview[i].format : st.rt.color[i]->format;
 }
 
+// The shader key's kind for an output into format f: rt_kind's, and on a Mali 5 / 6 (unsigned) and 7 / 8 (signed) for
+// 16 / 8-bit integer components, so the fragment shader writes the register's low bits (translate.c) as NVIDIA's
+// hardware stores them. Mali saturates a wider value instead: the BC4 blocks drawn through an RGBA16_UINT view (above)
+// with bits above 16 left over (SavageWindRecomp 9950b9e, BOTWRecomp 86ac04d). Other GPUs: as before (their shaders and
+// pipeline keys unchanged). LARECOMP_RT_NARROW=0 / 1: off / on any GPU.
+static int rt_kind_key(uint32_t f) {
+    int k = rt_kind(f);
+    if (!k) return 0;
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_RT_NARROW");
+        on = e ? atoi(e) != 0 : g_vk.props.vendorID == 0x13B5;
+    }
+    if (!on) return k;
+    switch (vk_format(f)) {
+    case VK_FORMAT_R16_UINT: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16B16_UINT: case VK_FORMAT_R16G16B16A16_UINT: return 5;
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8_UINT: case VK_FORMAT_R8G8B8A8_UINT: return 6;
+    case VK_FORMAT_R16_SINT: case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16_SINT: case VK_FORMAT_R16G16B16A16_SINT: return 7;
+    case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8_SINT: case VK_FORMAT_R8G8B8A8_SINT: return 8;
+    default: return k;
+    }
+}
+
 // ================================================================== graphics pipelines
 // The draw's states set dynamically with extended dynamic state, baked into the pipeline where the driver lacks it
 // (g_vk.eds false: Mali's older drivers); all zero otherwise, so the keys stay as they were. (Depth bias and primitive
@@ -4191,7 +4379,18 @@ typedef struct {
     uint32_t used_s;     // when it was last bound (g_exec_s: no clock read per draw, BOTWRecomp fd7ec98)
     uint64_t seq;        // and that submission (pipe_evict)
     bool evicted;        // its VkPipeline destroyed by pipe_evict: built again at its next use
+    uint32_t retry_s;    // (failed for lack of memory) built again at its first use from then on (g_exec_s), 0: never
+#ifdef __ANDROID__
+    bool prewarmed;      // built ahead by pipeline_prewarm.inc, no draw has used it yet
+#endif
 } Pipe;
+#ifdef __ANDROID__
+static Pipe *pw_pending;  // (the prewarmed pipeline being built now; cleared where a pipeline is freed)
+#endif
+// A pipeline that failed for lack of memory (build_pipeline): pipe_evict frees the unused ones at once, whatever
+// pipe_keep says, and the failed one is built again at its first use 5 s later (BOTWRecomp 2d825023, #520: before, the
+// failure was for good - its draws dropped for the rest of the session, until the game crashed a few seconds later).
+static _Atomic int pipe_oom;
 static VkObjectCache pipe_cache;  // (growable, BOTWRecomp 848e08c: the fixed 8192-entry table's probe never ended once full)
 static Pipe *last_pipeline;  // (draw_'s: the previous draw's, reused when nothing changed)
 
@@ -4216,16 +4415,17 @@ static int pipe_keep(void) {
 static void pipe_evict(void) {
     static uint32_t next;
     int keep = pipe_keep();
-    if (keep <= 0 || g_exec_s < next) return;
+    bool oom = atomic_exchange(&pipe_oom, 0) != 0;  // (out of memory: now, and down to 3/4 of the live ones)
+    if (!oom && (keep <= 0 || g_exec_s < next)) return;
     next = g_exec_s + 10;  // (every 10 s)
     int live = 0;
     for (size_t i = 0; i < pipe_cache.capacity; i++) {
         Pipe *p = pipe_cache.entries[i].object;
         if (p && !p->evicted && atomic_load(&p->state) == 1) live++;
     }
-    if (live <= keep) return;
+    if (!oom && live <= keep) return;
     uint64_t done = vk_completed_seq();
-    int target = keep * 4 / 5, gone = 0;
+    int target = oom ? live * 3 / 4 : keep * 4 / 5, gone = 0;
     // oldest first: two passes, the unused for 2 minutes, then for 30 s
     static const uint32_t ages[2] = {120, 30};  // (s)
     for (int pass = 0; pass < 2 && live > target; pass++) {
@@ -4252,6 +4452,9 @@ static void pipe_evict(void) {
 // allocated (vk_exec_reset) or is tried again at the next check (prog_evict). A job's last act is its state store.
 static void pipe_free(Pipe *pp) {
     if (pp == last_pipeline) last_pipeline = NULL;
+#ifdef __ANDROID__
+    if (pp == pw_pending) pw_pending = NULL;
+#endif
     if (pp->pipe) {
         vkDestroyPipeline(g_vk.dev, pp->pipe, NULL);
         if (!pp->evicted && atomic_load(&pp->state) == 1) atomic_fetch_sub(&live_gpipes, 1);
@@ -4492,6 +4695,18 @@ static void build_pipeline(void *arg) {
     uint64_t fp = vk_fp_host("a pipeline");  // (FPCR 0 around the compile: vk_fpenv.h)
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
     vk_fp_put(fp);
+    {   // LARECOMP_PIPE_FAIL_OOM=<n>: the n-th to (n+19)-th pipelines built fail once as out of device memory (a test of
+        // the retry, BOTWRecomp 2d825023, #520; twenty, so some of them are drawn again)
+        static long fail_at = -1;
+        static _Atomic long built;
+        if (fail_at < 0) fail_at = getenv("LARECOMP_PIPE_FAIL_OOM") ? atol(getenv("LARECOMP_PIPE_FAIL_OOM")) : 0;
+        long nth = fail_at > 0 && r == VK_SUCCESS ? atomic_fetch_add(&built, 1) + 1 : 0;
+        if (nth && nth >= fail_at && nth < fail_at + 20) {
+            vkDestroyPipeline(g_vk.dev, pp->pipe, NULL);
+            pp->pipe = VK_NULL_HANDLE;
+            r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+    }
     if (r != VK_SUCCESS) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
@@ -4526,10 +4741,16 @@ static void build_pipeline(void *arg) {
 #endif
     atomic_fetch_add(&stat_compiles, 1);
     if (r == VK_SUCCESS) atomic_fetch_add(&live_gpipes, 1);
-    if (r != VK_SUCCESS) {  // (each failing key once: its draws are dropped)
+    if (r != VK_SUCCESS) {  // (each failing key once: its draws are dropped - for lack of memory, until a retry)
         static int n;
-        if (n++ < 20) LOG("[vk] graphics pipeline failed (%d): vs %llx fs %llx\n", (int)r,
-                          (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
+        bool mem = r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_OUT_OF_HOST_MEMORY;
+        if (n++ < 20) LOG("[vk] graphics pipeline failed (%d): vs %llx fs %llx%s\n", (int)r,
+                          (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1],
+                          mem ? " - out of memory: unused pipelines freed, built again in 5 s" : "");
+        if (mem) {
+            pp->retry_s = g_exec_s + 5;
+            atomic_store(&pipe_oom, 1);
+        }
     }
     signal_build_done(&pp->state, r == VK_SUCCESS ? 1 : 2);
 }
@@ -4550,6 +4771,10 @@ static void schedule_pipeline_build(Pipe *pp, bool keep) {
     }
     run_job(build_pipeline, pp);
 }
+
+#ifdef __ANDROID__
+#include "pipeline_prewarm.inc"
+#endif
 
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
 static NvnTexture *feedback_tex[4];
@@ -5299,6 +5524,24 @@ static void panefix_log(const char *why, const float *f) {
         (unsigned long long)g_cur_fs_hash, why, f[19], f[132], f[133], f[44], f[45], framepace_in_menu(), widescreen_in_menu());
 }
 
+// TOTK's HUD out to the screen's edges (widescreen.c widescreen_hud_shift_143), by rows: a pane drawn right after one of
+// the same shader and near it (a row of hearts, 40 of them reaching almost to the middle in the 100% save) moves as the
+// first of its row did - by its own place, the hearts nearer the middle moved less and the row came apart.
+static float hud_dx_143(float x) {  // (per shader: a heart's fill and frame may be drawn by turns)
+    extern float widescreen_hud_shift_143(float x);
+    static struct { uint64_t fs, frame; float x, d; } row[8];
+    static unsigned next;
+    uint64_t pf = renderer_present_count();
+    int i = 0;
+    while (i < 8 && row[i].fs != g_cur_fs_hash) i++;
+    float d;
+    if (i < 8 && row[i].frame == pf && fabsf(x - row[i].x) < 150.0f) d = row[i].d;
+    else d = widescreen_hud_shift_143(x);
+    if (i == 8) i = (int)(next++ & 7);
+    row[i].fs = g_cur_fs_hash, row[i].frame = pf, row[i].x = x, row[i].d = d;
+    return d;
+}
+
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
     if (k == 0) {
@@ -5544,6 +5787,10 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                     else m[19] = fabsf(f[19]) <= 960.0f ? f[19] * g : f[19] + copysignf(960.0f * (g - 1), f[19]);
                 } else if (map)
                     m[3] = f[3];  // (text: its origin where the spread layout puts it)
+                else if (g > 1.001f) {  // (the HUD out to the screen's edges while playing: widescreen_hud_shift_143)
+                    if (size >= 0x230) m[19] += hud_dx_143(f[19]);
+                    else m[3] += hud_dx_143(f[3] * 960.0f) / (960.0f * g);  // (text: its origin, in NDC)
+                }
                 m[23] += dy;
                 return ubo_span(c, size);
             }
@@ -5921,6 +6168,7 @@ bool vk_heap_file_possible(void) { return g_vk.mem_fd; }  // (the start screen's
 // BLOB, and asking it for such sizes again and again restarted its system_server (2026-11-14) - untried on a Mali yet.
 #include <android/hardware_buffer.h>
 int vk_ahb_alloc(uint64_t size, AHardwareBuffer **out, const char **why);
+extern int g_ahb_cpu_rarely;  // (memfd_probe.c vk_ahb_alloc: the CPU use asked of gralloc)
 bool vk_ahb_import(AHardwareBuffer *ahb, uint64_t size, VkBufferUsageFlags usage, bool bda, VkBuffer *pbuf,
                    VkDeviceMemory *pmem, int *ptype, const char **why);
 bool vk_ahb_coherent(uint8_t *p, VkBuffer buf, VkDeviceMemory mem, uint64_t off, VkBufferUsageFlags usage, const char **why);
@@ -6001,8 +6249,18 @@ static bool heap_ahb_blocks(uint64_t size, VkBufferUsageFlags usage) {
         if (k == 0) {
             VkPhysicalDeviceMemoryProperties mp;
             vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
-            LOG("[vk] game memory in blocks of Android hardware buffers: block 0 coherent, memory type %d (flags 0x%x)\n", type,
-                (unsigned)mp.memoryTypes[type].propertyFlags);
+            // (and how fast the CPU reads and writes it: uncached memory - a CPU used rarely - makes the game's own code slower)
+            volatile uint64_t *q = (volatile uint64_t *)at;
+            uint64_t n8 = (sz < (16u << 20) ? sz : (16u << 20)) / 8, sum = 0, tw = plat_now_ns();
+            for (uint64_t i = 0; i < n8; i++) q[i] = i;
+            uint64_t tr = plat_now_ns();
+            for (uint64_t i = 0; i < n8; i++) sum += q[i];
+            uint64_t te = plat_now_ns();
+            memset((void *)at, 0, n8 * 8);
+            LOG("[vk] game memory in blocks of Android hardware buffers: block 0 coherent, memory type %d (flags 0x%x), CPU %s, "
+                "writes %.1f GB/s, reads %.1f GB/s (%llu)\n", type, (unsigned)mp.memoryTypes[type].propertyFlags,
+                g_ahb_cpu_rarely ? "used rarely" : "used often", n8 * 8 / ((tr - tw) + 1.0), n8 * 8 / ((te - tr) + 1.0),
+                (unsigned long long)(sum & 1));
         }
     }
     if (!why) {
@@ -6019,6 +6277,9 @@ static bool heap_ahb_blocks(uint64_t size, VkBufferUsageFlags usage) {
         hch[j].buf = VK_NULL_HANDLE, hch[j].mem = VK_NULL_HANDLE;
     }
     plat_reset_guest(HEAP_BASE, HEAP_BASE + size);  // (the window's own pages back)
+    // (A block the GPU didn't see the CPU's bytes in: gralloc gave cached memory - a MediaTek gralloc, POCO X7 Pro. Asking
+    // it again for a CPU used rarely - uncached - restarted that phone as the game started, 2026-11-25: never automatic.
+    // LARECOMP_VK_AHB_RARELY=1 asks for that from the start, a test only.)
     return false;
 }
 
@@ -6065,9 +6326,9 @@ bool vk_heap_place(uint64_t size) {
     if (!memfd && (!g_vk.map_placed || no_placed)) return NOT_PLACED();
     extern bool vk_turnip_path_on(int setting);
     if (memfd ? g_settings.gpu_heap == 0 : !vk_turnip_path_on(g_settings.gpu_heap)) {
-        // (the start screen's Driver compatibility: Automatic leaves it to the Adreno 8xx it was made on)
+        // (the start screen's Driver compatibility: Automatic: Adreno 7xx and 8xx, device.c vk_heap_auto)
         LOG("[vk] guest heap as GPU memory: off (%s) - shader global memory through CPU copies\n",
-            g_settings.gpu_heap < 0 ? "automatic: not an Adreno 8xx" : "settings");
+            g_settings.gpu_heap < 0 ? "automatic: not an Adreno 7xx / 8xx" : "settings");
         return NOT_PLACED();
     }
     {   // The placed heap is committed at once (~3.1 GB for BOTW), where CPU copies commit only the pages the game
@@ -6600,10 +6861,81 @@ static void gfast_finish(VkCommandBuffer cb) {
 // What a storing shader wrote goes back to guest memory once its submission is done (gcopy_retire: from vk_transient
 // before the ring reuses a chunk, and after every wait). Without this, global loads read zero: the game's text is
 // drawn by a vertex shader that reads its vertices that way (nothing of it showed).
-typedef struct { const uint8_t *src; uint64_t addr, len, seq; uint8_t *shadow; const uint64_t *bseq; } GcBack;  // (arena)
+// (shadow, bseq: the arena's; pre: outside it, the range as it was when copied for the GPU - gcopy_back_changed)
+typedef struct { const uint8_t *src; uint64_t addr, len, seq; uint8_t *shadow; const uint64_t *bseq; uint8_t *pre; } GcBack;
 static GcBack gc_back[256];
 static int gc_nback;
 static pthread_mutex_t gc_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// One 256-byte block of the arena back into guest memory: only the 8-byte words the GPU changed (src against the
+// shadow), each with a compare-and-swap that expects the shadow's value, so a word the game's threads wrote since -
+// even while this runs - stays theirs. The check before (gcopy_retire: the CPU didn't write the block) and a plain
+// memcpy after it left a window: a game thread writing the block in between lost that write. The ranges have a
+// 4 KB margin before each bound buffer and gaps of up to 4 KB merged in (gcopy_ranges), where the game's heap keeps
+// its block headers and free-list links (BOTWRecomp d36c06a1, #401: a Mali-G1 hung walking a heap free list that
+// looped). LARECOMP_GA_BACK_WHOLE=1: the whole block, as before.
+static void ga_back_block(uint8_t *g, const uint8_t *src, uint8_t *sh, uint64_t n) {
+    static int whole = -1;
+    if (whole < 0) whole = getenv("LARECOMP_GA_BACK_WHOLE") && atoi(getenv("LARECOMP_GA_BACK_WHOLE"));
+    if (whole || ((uintptr_t)g & 7) || (n & 7)) {
+        memcpy(g, src, n);
+        return;
+    }
+    uint64_t *gw = (uint64_t *)g;
+    const uint64_t *sw = (const uint64_t *)src, *hw = (const uint64_t *)sh;
+    for (uint64_t w = 0; w < n / 8; w++) {
+        uint64_t s = sw[w], expect = hw[w];
+        if (s == expect) continue;  // (the GPU didn't change it: the game's, whatever it holds now)
+        if (__atomic_compare_exchange_n(&gw[w], &expect, s, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) continue;
+        // (the game wrote it since the check: kept. Before, this write was lost - logged, the evidence for #401)
+        static int told;
+        if (told < 20) {
+            told++;
+            LOG("[vk] arena copy-back: a word the game wrote meanwhile kept, at heap+%llx (GPU %016llx, game %016llx)\n",
+                (unsigned long long)((uintptr_t)&gw[w] - HEAP_BASE), (unsigned long long)s, (unsigned long long)expect);
+        }
+    }
+}
+
+// Outside the arena (on a Mali whose driver offers the host import the arena is off): what a storing shader wrote
+// went back as a whole-range memcpy of the copy it worked on, taken when the call was translated, so every word the
+// game's threads wrote since - in the 4 KB margin before each bound buffer and the gaps merged in (gcopy_ranges), where
+// the game's heap keeps its block headers and free-list links - went back to its old value (BOTWRecomp 97f14f22, #401).
+// Now only the 8-byte words the GPU changed (src against pre, the range as it was copied) go back, each by
+// compare-and-swap expecting pre's value: a word the game wrote meanwhile stays the game's (counted, the first ones
+// logged). Unaligned ends byte by byte, the same rule. LARECOMP_GCOPY_WHOLE=1: the whole range, as before.
+static void gcopy_back_changed(uint8_t *g, const uint8_t *src, const uint8_t *pre, uint64_t n) {
+    static uint64_t kept, told;
+    uint64_t k0 = kept, i = 0;
+    for (; i < n && ((uintptr_t)(g + i) & 7); i++) {  // (the head, to 8-byte alignment)
+        if (src[i] == pre[i]) continue;
+        if (g[i] == pre[i]) g[i] = src[i]; else kept++;
+    }
+    for (; i + 8 <= n; i += 8) {
+        uint64_t s, p;
+        memcpy(&s, src + i, 8);
+        memcpy(&p, pre + i, 8);
+        if (s == p) continue;  // (the GPU didn't change it: the game's, whatever it holds now)
+        uint64_t expect = p;
+        if (__atomic_compare_exchange_n((uint64_t *)(g + i), &expect, s, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) continue;
+        kept++;  // (the game wrote it since the copy: kept - the whole-range copy undid it)
+        if (told < 20) {
+            told++;
+            LOG("[vk] copy-back: a word the game wrote meanwhile kept, at heap+%llx (GPU %016llx, game %016llx, before %016llx)\n",
+                (unsigned long long)((uintptr_t)(g + i) - HEAP_BASE), (unsigned long long)s, (unsigned long long)expect,
+                (unsigned long long)p);
+        }
+    }
+    for (; i < n; i++) {  // (the tail)
+        if (src[i] == pre[i]) continue;
+        if (g[i] == pre[i]) g[i] = src[i]; else kept++;
+    }
+    static uint64_t next_log = 1;
+    if (kept != k0 && kept >= next_log) {  // (1, 2, 4, 8... so far)
+        next_log = kept * 2;
+        LOG("[vk] copy-back: %llu game writes kept so far (the whole-range copy undid them)\n", (unsigned long long)kept);
+    }
+}
 
 static void gcopy_retire(uint64_t done) {
     pthread_mutex_lock(&gc_lock);
@@ -6611,7 +6943,10 @@ static void gcopy_retire(uint64_t done) {
     for (int i = 0; i < gc_nback; i++) {
         if (gc_back[i].seq <= done) {
             if (!gc_back[i].shadow) {
-                memcpy((void *)(uintptr_t)gc_back[i].addr, gc_back[i].src, gc_back[i].len);
+                if (gc_back[i].pre) {
+                    gcopy_back_changed((uint8_t *)(uintptr_t)gc_back[i].addr, gc_back[i].src, gc_back[i].pre, gc_back[i].len);
+                    free(gc_back[i].pre);
+                } else memcpy((void *)(uintptr_t)gc_back[i].addr, gc_back[i].src, gc_back[i].len);
                 continue;
             }
             // (the arena: 256 bytes at a time, what the GPU changed since the last upload - the shadow - and the CPU
@@ -6627,7 +6962,7 @@ static void gcopy_retire(uint64_t done) {
                 // GPU's and wrote them over the CPU's: the game's allocator lists looped, the game hung)
                 if (gc_back[i].bseq[b / 256] > gc_back[i].seq) continue;
                 if (!memcmp(src + b, sh + b, n) || memcmp(g + b, sh + b, n)) continue;  // (GPU unchanged / CPU wrote)
-                memcpy(g + b, src + b, n);
+                ga_back_block(g + b, src + b, sh + b, n);
                 memcpy(sh + b, src + b, n);
             }
         } else gc_back[k++] = gc_back[i];
@@ -7165,6 +7500,7 @@ static VkDescriptorBufferInfo gmiss_info(void) {
 static void gres_reset(void) {
     gres_gen++;
     pthread_mutex_lock(&gc_lock);
+    for (int i = 0; i < gc_nback; i++) free(gc_back[i].pre);
     gc_nback = 0;  // (their shadow / bseq pointers and guest addresses belong to the boot being torn down)
     pthread_mutex_unlock(&gc_lock);
     for (int i = 0; i < ga_nres; i++) { free(ga_res[i].shadow); free(ga_res[i].bseq); }
@@ -7385,8 +7721,14 @@ static void gcopy_prepare_(unsigned stage_mask, bool store) {
         gmap_tab[i * 4 + 0] = (uint32_t)r[i].lo;
         gmap_tab[i * 4 + 1] = (uint32_t)len;
         gmap_tab[i * 4 + 2] = (uint32_t)(off >> 2);
-        if (r[i].store && !gres_init() && gc_nback < 256)
-            gc_back[gc_nback++] = (GcBack){(const uint8_t *)gc_span.ptr + off, HEAP_BASE + r[i].lo, len, seq, NULL, NULL};
+        if (r[i].store && !gres_init() && gc_nback < 256) {
+            // (the range as it is now, kept: gcopy_retire writes back only what the GPU changed from it - #401)
+            static int whole = -1;
+            if (whole < 0) whole = getenv("LARECOMP_GCOPY_WHOLE") && atoi(getenv("LARECOMP_GCOPY_WHOLE"));
+            uint8_t *pre = whole ? NULL : malloc(len);
+            if (pre) memcpy(pre, (const uint8_t *)gc_span.ptr + off, len);
+            gc_back[gc_nback++] = (GcBack){(const uint8_t *)gc_span.ptr + off, HEAP_BASE + r[i].lo, len, seq, NULL, NULL, pre};
+        }
         off += (len + 255) & ~255ull;
     }
     pthread_mutex_unlock(&gc_lock);
@@ -7530,6 +7872,7 @@ static void vc_mark_gpu(uint64_t lo, uint64_t hi) {
 // the stage, its shader's code address, the submission and the storage buffers bound (where its stores may land)
 static void note_gmem_store(int stage) {
     atomic_store(&g_gmem_store_seq, vk_pending_seq());
+    vtx_hazard = true;  // (the next pass's vertex stage may read it: begin_pass's barrier)
     static long at = -2;
     if (at == -2) at = getenv("LARECOMP_LOG_STORES") ? atol(getenv("LARECOMP_LOG_STORES")) : -1;
     if (at < 0 || (long)renderer_present_count() != at || !st.program) return;
@@ -7746,6 +8089,10 @@ static int compute_reset(void);  // (below compute_program)
 // the safety net, not the mechanism.
 void vk_exec_reset(void) {
     jobs_drain();
+    g_sync_shaders = -1;  // (LARECOMP_SYNC_SHADERS / "Wait for shaders": read again for the game that starts next)
+#ifdef __ANDROID__
+    prewarm_reset();
+#endif
 #ifdef __ANDROID__
     vk_vamm_reset();
 #endif
@@ -8333,6 +8680,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     rpCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     rpCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
     rpCmdDispatch(cb, gx, gy, gz);
+    vtx_hazard = true;  // (a later pass's vertex stage may read what it wrote: begin_pass)
     if (cp->si->uses_gmem_map && cp->si->uses_gmem_store) gfast_finish(cb);
 #ifdef __ANDROID__
     if (gc && (cp->si->uses_gmem_store || cs_writes_image(cp->si))) {  // (owes one barrier after it; at once if the buffer changed)
@@ -8535,7 +8883,7 @@ static void draw_(CmdRec *r, bool indexed) {
     vkey.flip_y = fkey.flip_y = nvn_window_origin() == 0;
     vkey.depth_minus_one = nvn_depth_mode() == 0;
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
-    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(rt_format(i));
+    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind_key(rt_format(i));
 #ifdef __ANDROID__
     if (maxwell_gmem_miss_log)  // (copy mode: early depth tests for the shaders that log misses - ShaderKey)
         fkey.no_ds_write = !st.rt.depth || !((st.ds[0] && st.ds[1]) || (st.ds[3] && ((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF)));
@@ -8857,6 +9205,8 @@ static void draw_(CmdRec *r, bool indexed) {
         if (fb) snapshots_mark_fb_dirty(st.rt.depth);
         else snapshots_invalidate(st.rt.depth);
     }
+    if (in_pass && !st.rt_dirty && (draw_w & pass_detached))  // (a color target left out of the pass: det_tab learns it)
+        det_note(pass_key, (uint8_t)(draw_w & 0xFF)), stat_det_miss++;
     if (in_pass && (draw_w & pass_dup_null)) st.rt_dirty = true, prof_dirty[2]++;  // (writes a slot begin_pass left unbound)
     snap_reason = "draw-colorwrite";
     for (int i = 0; i < st.rt.ncolor; i++) {
@@ -8881,6 +9231,12 @@ static void draw_(CmdRec *r, bool indexed) {
         bool writes_depth = st.ds[0] && st.ds[1];
         if (in_pass && pass_dnone && writes_depth) st.rt_dirty = true, stat_dnone_split++, dnone_note_split(st.rt.depth);
         pass_open_dw = writes_depth;
+        // (pass barriers held to fragment work: a vertex stage reading textures or memory another pass or dispatch may
+        // have just written begins its pass behind a full barrier - ending one held to fragment work)
+        if (frag_barrier_on() && (pr->vi->ntex > 0 || pr->vi->uses_gmem)) {
+            if (in_pass && pass_frag_only && !st.rt_dirty) st.rt_dirty = true, stat_frag_restarts++;
+            pass_vs_reads_next = true;
+        }
         begin_pass();
         pass_open_dw = -1;
     }
@@ -9044,13 +9400,30 @@ static void draw_(CmdRec *r, bool indexed) {
 #endif
         VkObjectEntry *entry = vk_object_slot(&pipe_cache, ph);
         pp = entry->object;
+#ifdef __ANDROID__
+        if (pp && pp->prewarmed && memcmp(&k, &pp->k, sizeof k) != 0 && !prewarm_resolve_collision(pp, &k)) {
+            stat_skipped++;  // (a prewarmed pipeline of another key under this hash, still building: this draw is skipped)
+            skip_note("pipeline");
+            return;
+        }
+#endif
         if (!pp) {
             pp = calloc(1, sizeof *pp);
             pp->k = k;
             entry->object = pp;
+#ifdef __ANDROID__
+            if (prewarm_enabled()) prewarm_record(&k);
+#endif
             schedule_pipeline_build(pp, keep);
         } else if (pp->evicted) {  // (destroyed by pipe_evict: built again)
             pp->evicted = false;
+            schedule_pipeline_build(pp, keep);
+        } else if (pp->retry_s && g_exec_s >= pp->retry_s && atomic_load(&pp->state) == 2) {  // (out of memory before)
+            static int nlog;
+            if (nlog++ < 20) LOG("[vk] graphics pipeline vs %llx fs %llx: built again (out of memory before)\n",
+                                 (unsigned long long)pp->k.prog->code[0], (unsigned long long)pp->k.prog->code[1]);
+            pp->retry_s = 0;
+            atomic_store(&pp->state, 0);
             schedule_pipeline_build(pp, keep);
         }
         // Verification rebuilds the original key to detect missing invalidations during later device tests.
@@ -9061,6 +9434,9 @@ static void draw_(CmdRec *r, bool indexed) {
         last_pipeline = pp;
         pipeline_dirty = false;
     }
+#ifdef __ANDROID__
+    if (pp->prewarmed) prewarm_first_draw(pp);
+#endif
     if (keep) wait_built_job(&pp->state, NULL, pp, pp->k.prog ? pp->k.prog->code[1] : 0);
     if (atomic_load(&pp->state) != 1) {
         if (g_debug_frame) LOG("[draw]   skipped: pipeline %s\n", atomic_load(&pp->state) ? "failed" : "still building");
@@ -10953,6 +11329,9 @@ void vk_execute_now(uint64_t handle) {
 #else
 void backend_execute(uint64_t handle) {
 #endif
+#ifdef __ANDROID__
+    if (prewarm_enabled()) prewarm_tick();
+#endif
     PROF_T0();
 #ifdef __ANDROID__
     game_pending = true;  // (renderer_fence_seq)
@@ -10973,6 +11352,7 @@ void backend_execute(uint64_t handle) {
     else renderer_submit();
 #ifdef __ANDROID__
     game_pending = false;
+    if (prewarm_enabled()) prewarm_tick();
 #endif
 }
 

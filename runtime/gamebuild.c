@@ -812,10 +812,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
 #endif
 #ifdef __ANDROID__
             char lm[1200];  // (the runtime functions it calls: libmain.so as its DT_NEEDED)
-            // (an encrypted build has its library decrypted to LARECOMP_LIBMAIN, the path it was loaded from)
-            const char *libmain = getenv("LARECOMP_LIBMAIN");
-            if (libmain && *libmain) snprintf(lm, sizeof lm, "%s", libmain);
-            else snprintf(lm, sizeof lm, "%s/libmain.so", getenv("LARECOMP_NATIVE_LIB_DIR"));
+            snprintf(lm, sizeof lm, "%s/libmain.so", getenv("LARECOMP_NATIVE_LIB_DIR"));
             add(&a, lm);
 #endif
         }
