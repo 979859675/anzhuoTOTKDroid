@@ -44,6 +44,11 @@ public class LoginActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        String problem = Integrity.problem(this);
+        if (problem != null) {  // not the app that was built (Integrity.java): no login, no game
+            setContentView(blockedScreen(problem));
+            return;
+        }
         setContentView(buildScreen());
         if (Auth.token(this) != null) {
             setBusy(true, "正在校验登录…");
@@ -64,6 +69,13 @@ public class LoginActivity extends Activity {
                 });
             }).start();
         }
+    }
+
+    private View blockedScreen(String code) {
+        TextView t = text("应用校验未通过，无法启动。\n请从官方渠道重新安装。\n（代码 " + code + "）", 16, WARN, false);
+        t.setBackgroundColor(Color.BLACK);
+        t.setPadding(dp(24), dp(24), dp(24), dp(24));
+        return t;
     }
 
     // The game's background (assets/res, from the repository's artwork) under a dark shade, the window in the middle.

@@ -1,4 +1,5 @@
 import java.util.Properties
+import java.security.KeyStore
 import java.security.MessageDigest
 
 plugins {
@@ -15,13 +16,48 @@ val gen = layout.buildDirectory.dir("generated/totkrecompandroid")
 // keyPassword); without it, release builds are signed with the debug key
 val releaseKey: File = File(System.getProperty("user.home"), ".totkrecompandroid/keystore.properties")
 
+// The certificate the release build is signed with (the debug key unless keystore.properties exists). Its SHA-256 goes into
+// the app (BuildConfig.EXPECTED_CERT_SHA256); Integrity.java checks that the running APK is signed with it.
+fun certSha256(store: File, password: String, alias: String): String? {
+    for (type in listOf("PKCS12", "JKS")) {
+        try {
+            val ks = KeyStore.getInstance(type)
+            store.inputStream().use { ks.load(it, password.toCharArray()) }
+            val cert = ks.getCertificate(alias) ?: continue
+            return MessageDigest.getInstance("SHA-256").digest(cert.encoded).joinToString("") { "%02x".format(it) }
+        } catch (e: Exception) {
+            // (not this store type: the next one)
+        }
+    }
+    return null
+}
+val signer: Triple<File, String, String> = if (releaseKey.exists()) {
+    val p = Properties().apply { releaseKey.inputStream().use { load(it) } }
+    Triple(file(p.getProperty("storeFile")), p.getProperty("storePassword"), p.getProperty("keyAlias"))
+} else {
+    Triple(File(System.getProperty("user.home"), ".android/debug.keystore"), "android", "androiddebugkey")
+}
+if (!releaseKey.exists() && !signer.first.exists()) {  // the debug key: the build tools make it on first use; make the same one
+    signer.first.parentFile.mkdirs()
+    ProcessBuilder("keytool", "-genkeypair", "-keystore", signer.first.path, "-storepass", signer.second,
+        "-keypass", signer.second, "-alias", signer.third, "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
+        "-dname", "CN=Android Debug,O=Android,C=US").inheritIO().start().waitFor()
+}
+val expectedCert: String = certSha256(signer.first, signer.second, signer.third)
+    ?: throw GradleException("no signing certificate in ${signer.first} (alias ${signer.third})")
+
 android {
     namespace = "com.totkrecompandroid"
     compileSdk = 36
     ndkVersion = "30.0.16248370"
 
+    buildFeatures {
+        buildConfig = true  // BuildConfig.EXPECTED_CERT_SHA256 (Integrity.java)
+    }
+
     defaultConfig {
         applicationId = "com.totkrecompandroid"
+        buildConfigField("String", "EXPECTED_CERT_SHA256", "\"$expectedCert\"")
         minSdk = 30
         targetSdk = 36
         versionCode = 13
