@@ -104,7 +104,7 @@ jobs:
           BC=$(find android/totkrecompandroid/app/build/generated -name BuildConfig.java -path '*release*' | head -n 1)
           EXP=$(grep -o 'EXPECTED_CERT_SHA256 = "[0-9a-f]*"' "$BC" | grep -o '[0-9a-f]\{64\}' || true)
           APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n 1)
-          GOT=$("$APKSIGNER" verify --print-certs "$APK" | awk -F': ' '/SHA-256 digest/{print $2; exit}' | tr -d ': ' | tr 'A-F' 'a-f')
+          GOT=$("$APKSIGNER" verify --print-certs "$APK" | awk '/SHA-256 digest/{print $NF; exit}' | tr -d ': ' | tr 'A-F' 'a-f')
           EXP=$(echo "$EXP" | tr -d ': ' | tr 'A-F' 'a-f')
           echo "built-in: $EXP"
           echo "signed:   $GOT"
