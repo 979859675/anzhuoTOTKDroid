@@ -81,7 +81,10 @@ android {
 
     buildTypes {
         getByName("release") {
-            isMinifyEnabled = false
+            // R8: the Java side shrunk and renamed (proguard-rules.pro keeps what the native code and the manifest name).
+            // proguard-android.txt (shrink and rename only, no optimization): fewer surprises at runtime.
+            isMinifyEnabled = true
+            proguardFiles(getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro")
             signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
