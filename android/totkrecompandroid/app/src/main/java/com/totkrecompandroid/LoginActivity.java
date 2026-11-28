@@ -2,34 +2,49 @@ package com.totkrecompandroid;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
+import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
-/** The first screen of the app (the launcher, and the target of the shortcuts): it checks the login with the account
- *  server, and only then starts the game (TOTKRecompAndroidActivity, not exported). Without a valid login - or without
- *  the network to check it - the login form is shown. */
+import java.io.IOException;
+import java.io.InputStream;
+
+/** The first screen of the app (the launcher, and the target of the shortcuts): landscape, the game's background and a
+ *  login window in the middle. It checks the login with the account server, and only then starts the game
+ *  (TOTKRecompAndroidActivity, not exported). Without a valid login - or without the network to check it - the login
+ *  window stays. */
 public class LoginActivity extends Activity {
+    // the start screen's look: gold on the dark sky
+    private static final int GOLD = 0xFFD9B26A, PANEL = 0xE6101418, FIELD = 0xFF1E2227, EDGE = 0xFF4A5159,
+            MUTED = 0xFFB8BEC6, WARN = 0xFFFFAA6E, INK = 0xFF101418;
+    private static final int MATCH = ViewGroup.LayoutParams.MATCH_PARENT, WRAP = ViewGroup.LayoutParams.WRAP_CONTENT;
+
     private final Handler ui = new Handler(Looper.getMainLooper());
     private EditText user, pass, phrase;
     private TextView status;
     private Button primary, toggle;
     private boolean registerMode, busy;
-    private LinearLayout form;
 
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
-        buildForm();
+        setContentView(buildScreen());
         if (Auth.token(this) != null) {
             setBusy(true, "正在校验登录…");
             new Thread(() -> {
@@ -51,36 +66,71 @@ public class LoginActivity extends Activity {
         }
     }
 
-    private void buildForm() {
-        ScrollView scroll = new ScrollView(this);
-        form = new LinearLayout(this);
-        form.setOrientation(LinearLayout.VERTICAL);
-        form.setGravity(Gravity.CENTER_HORIZONTAL);
-        int pad = dp(32);
-        form.setPadding(pad, pad, pad, pad);
-        form.setBackgroundColor(Color.BLACK);
+    // The game's background (assets/res, from the repository's artwork) under a dark shade, the window in the middle.
+    // In a ScrollView, so the window scrolls up when the keyboard covers it.
+    private View buildScreen() {
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(Color.BLACK);
+        Bitmap art = background();
+        if (art != null) {
+            ImageView bg = new ImageView(this);
+            bg.setImageBitmap(art);
+            bg.setScaleType(ImageView.ScaleType.CENTER_CROP);
+            root.addView(bg, new FrameLayout.LayoutParams(MATCH, MATCH));
+        }
+        View shade = new View(this);
+        shade.setBackgroundColor(0x99000000);
+        root.addView(shade, new FrameLayout.LayoutParams(MATCH, MATCH));
 
-        form.addView(text("TOTKDroid 登录", 22, Color.WHITE));
-        form.addView(text("QQ 群：" + Auth.GROUP, 15, Color.LTGRAY));
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        LinearLayout column = new LinearLayout(this);
+        column.setOrientation(LinearLayout.VERTICAL);
+        column.setGravity(Gravity.CENTER);
+        column.setPadding(dp(16), dp(12), dp(16), dp(12));
+        column.addView(panel(), new LinearLayout.LayoutParams(panelWidth(), WRAP));
+        scroll.addView(column, new FrameLayout.LayoutParams(MATCH, MATCH));
+        root.addView(scroll, new FrameLayout.LayoutParams(MATCH, MATCH));
+        return root;
+    }
+
+    private LinearLayout panel() {
+        LinearLayout p = new LinearLayout(this);
+        p.setOrientation(LinearLayout.VERTICAL);
+        p.setGravity(Gravity.CENTER_HORIZONTAL);
+        p.setPadding(dp(24), dp(18), dp(24), dp(20));
+        p.setBackground(box(PANEL, GOLD, 14));
+
+        p.addView(text("TOTKDroid", 26, GOLD, true), margin(0));
+        p.addView(text("账号登录", 15, MUTED, false), margin(2));
+        p.addView(text("QQ 群：" + Auth.GROUP, 13, MUTED, false), margin(2));
 
         user = field("用户名（字母、数字、下划线，3-20 位）", false);
         pass = field("密码（6-72 位）", true);
         phrase = field("注册口令（由管理员提供）", false);
         phrase.setVisibility(View.GONE);
-        form.addView(user);
-        form.addView(pass);
-        form.addView(phrase);
+        p.addView(user, margin(14));
+        p.addView(pass, margin(10));
+        p.addView(phrase, margin(10));
 
-        status = text("", 14, Color.rgb(255, 170, 110));
-        form.addView(status);
+        status = text("", 13, WARN, false);
+        p.addView(status, margin(8));
 
         primary = new Button(this);
         primary.setText("登录");
+        primary.setAllCaps(false);
+        primary.setTextSize(16);
+        primary.setTextColor(INK);
+        primary.setBackground(box(GOLD, GOLD, 10));
         primary.setOnClickListener(v -> submit());
-        form.addView(primary);
+        p.addView(primary, margin(10));
 
         toggle = new Button(this);
         toggle.setText("没有账号？注册");
+        toggle.setAllCaps(false);
+        toggle.setTextSize(14);
+        toggle.setTextColor(GOLD);
+        toggle.setBackground(box(0x00000000, 0x00000000, 10));
         toggle.setOnClickListener(v -> {
             registerMode = !registerMode;
             phrase.setVisibility(registerMode ? View.VISIBLE : View.GONE);
@@ -88,10 +138,8 @@ public class LoginActivity extends Activity {
             toggle.setText(registerMode ? "已有账号？登录" : "没有账号？注册");
             showStatus("");
         });
-        form.addView(toggle);
-
-        scroll.addView(form);
-        setContentView(scroll);
+        p.addView(toggle, margin(4));
+        return p;
     }
 
     private void submit() {
@@ -178,13 +226,37 @@ public class LoginActivity extends Activity {
         status.setText(s);
     }
 
-    private TextView text(String s, int sp, int color) {
+    private Bitmap background() {
+        try (InputStream in = getAssets().open("res/launcher-background.png")) {
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inSampleSize = 2;  // (a login screen does not need the full picture in memory)
+            return BitmapFactory.decodeStream(in, null, o);
+        } catch (IOException e) {
+            return null;  // (no picture: the black background)
+        }
+    }
+
+    // the window's width: 400 dp, or the screen less a margin on each side
+    private int panelWidth() {
+        int screen = getResources().getDisplayMetrics().widthPixels;
+        return Math.min(dp(400), screen - dp(32));
+    }
+
+    private GradientDrawable box(int fill, int stroke, int radiusDp) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(fill);
+        g.setCornerRadius(dp(radiusDp));
+        g.setStroke(dp(1), stroke);
+        return g;
+    }
+
+    private TextView text(String s, int sp, int color, boolean bold) {
         TextView t = new TextView(this);
         t.setText(s);
         t.setTextSize(sp);
         t.setTextColor(color);
         t.setGravity(Gravity.CENTER);
-        t.setPadding(0, dp(10), 0, dp(10));
+        if (bold) t.setTypeface(null, Typeface.BOLD);
         return t;
     }
 
@@ -192,11 +264,21 @@ public class LoginActivity extends Activity {
         EditText e = new EditText(this);
         e.setHint(hint);
         e.setSingleLine(true);
+        e.setTextSize(16);
         e.setTextColor(Color.WHITE);
-        e.setHintTextColor(Color.GRAY);
+        e.setHintTextColor(0xFF7D8590);
+        e.setBackground(box(FIELD, EDGE, 10));
+        e.setPadding(dp(12), dp(10), dp(12), dp(10));
         e.setInputType(password ? InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD
                                 : InputType.TYPE_CLASS_TEXT);
         return e;
+    }
+
+    // a full-width child with a top margin of v dp
+    private LinearLayout.LayoutParams margin(int v) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(MATCH, WRAP);
+        lp.topMargin = dp(v);
+        return lp;
     }
 
     private int dp(int v) {
